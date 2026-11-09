@@ -36,6 +36,9 @@ jobs:
       - name: Check RTL and Western digits
         run: npm run guard
 
+      - name: Validate content model
+        run: npm run content:validate
+
       - name: TypeScript typecheck
         run: npm run typecheck
 
