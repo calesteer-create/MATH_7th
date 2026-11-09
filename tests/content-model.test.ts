@@ -320,6 +320,68 @@ describe("empty tree", () => {
   });
 });
 
+describe("canonical filenames and duplicate targets", () => {
+  it("rejects a leading-zero unit filename instead of aliasing id 1", () => {
+    fs.writeFileSync(
+      path.join(tmp, "content", "units", "01.json"),
+      fs.readFileSync(path.join(tmp, "content", "units", "2.json")),
+    );
+    const result = tree();
+    expect(result.errors.some((i) => i.code === "FILENAME_NOT_CANONICAL" && i.path.includes("01.json"))).toBe(true);
+    // 01.json declares id 2, so this is an id collision with the real 2.json, not a silent swap
+    expect(result.errors.some((i) => i.code === "DUPLICATE_ID")).toBe(true);
+  });
+
+  it("rejects a leading-zero lesson filename", () => {
+    fs.writeFileSync(
+      path.join(tmp, "content", "lessons", "01.json"),
+      fs.readFileSync(path.join(tmp, "content", "lessons", "1.json")),
+    );
+    const result = tree();
+    expect(result.errors.some((i) => i.code === "FILENAME_NOT_CANONICAL" && i.path.includes("01.json"))).toBe(true);
+    expect(result.errors.some((i) => i.code === "DUPLICATE_ID")).toBe(true);
+  });
+
+  it("rejects two quizzes for the same lesson even across filename spellings", () => {
+    fs.copyFileSync(
+      path.join(tmp, "content", "quizzes", "lesson-1.json"),
+      path.join(tmp, "content", "quizzes", "lesson-01.json"),
+    );
+    const result = tree();
+    expect(result.errors.some((i) => i.code === "FILENAME_NOT_CANONICAL" && i.path.includes("lesson-01.json"))).toBe(true);
+    expect(result.errors.some((i) => i.code === "QUIZ_DUPLICATE_TARGET" && i.message.includes("lesson 1"))).toBe(true);
+  });
+
+  it("rejects a leading-zero quiz filename on its own", () => {
+    fs.renameSync(
+      path.join(tmp, "content", "quizzes", "lesson-1.json"),
+      path.join(tmp, "content", "quizzes", "lesson-01.json"),
+    );
+    expect(codes(tree())).toContain("FILENAME_NOT_CANONICAL");
+  });
+
+  it("keeps the first record and reports both files on an id collision (never drops silently)", () => {
+    fs.writeFileSync(
+      path.join(tmp, "content", "units", "01.json"),
+      fs.readFileSync(path.join(tmp, "content", "units", "2.json")),
+    );
+    const result = tree();
+    const duplicate = result.errors.find((i) => i.code === "DUPLICATE_ID");
+    expect(duplicate).toBeDefined();
+    expect(duplicate!.message).toContain("2.json");
+    expect(duplicate!.message).toContain("01.json");
+    // the canonical record still participates in the tree (cross-checks still run)
+    expect(result.stats.units).toBe(2);
+  });
+
+  it("canonical filenames pass without the new codes", () => {
+    const result = tree();
+    expect(result.errors.filter((i) => i.code === "FILENAME_NOT_CANONICAL")).toEqual([]);
+    expect(result.errors.filter((i) => i.code === "QUIZ_DUPLICATE_TARGET")).toEqual([]);
+    expect(result.errors.filter((i) => i.code === "DUPLICATE_ID")).toEqual([]);
+  });
+});
+
 describe("validateUnit (unit seeded shape)", () => {
   it("defaults a missing accent to teal", () => {
     const raw = { ...exampleUnit(1) } as Record<string, unknown>;

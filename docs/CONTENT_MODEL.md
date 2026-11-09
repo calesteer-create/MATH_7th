@@ -28,7 +28,8 @@ public/
 قواعد الأسماء (ينفذها `npm run content:validate`):
 
 - `units/3.json` يجب أن يحمل `id: 3`. ينطبق الشيء نفسه على الدروس.
-- ملفات الاختبار `lesson-7.json` يجب أن تكون `scope: "lesson"` و`lessonId: 7`.
+- **الأسماء canonical دائمًا**: عدد صحيح موجب **دون أصفار بادئة** (`1.json` وليس `01.json`). الاسم غير الـ canonical يُرفض بخطأ `FILENAME_NOT_CANONICAL` ولا يُدمج مع معرّف موجود بصمت أبدًا، واصطدام معرّفين يُبلَّغ بـ `DUPLICATE_ID` مع اسمَي الملفين (السجل الأول يبقى — لا يُسقط أي سجل بصمت).
+- ملفات الاختبار `lesson-7.json` يجب أن تكون `scope: "lesson"` و`lessonId: 7`، ويحظر وجود أكثر من اختبار واحد للهدف نفسه (scope + target) عبر فحص `QUIZ_DUPLICATE_TARGET` مهما اختلفت صيغة التسمية.
 - اسم ملف الصورة: `^[a-z0-9][a-z0-9-]{0,60}\.webp$` — بلا مجلدات، بلا حروف كبيرة،
   بلا مسافات. هذا يستبعد `../` وأي هروب من مجلد الوسائط بنيويًا.
 - `thumb` دائمًا `thumbs/<file>` (مشتق من الاسم — لا مسار حر).
@@ -214,7 +215,8 @@ npm run content:stats                    # ملخص عددي سريع
 `PUBLISHED_NEEDS_PUBLISHED_AT` · `IMAGE_FILE_INVALID` · `IMAGE_THUMB_MISMATCH` ·
 `IMAGE_SHA256_INVALID` · `IMAGE_POSITION_DUPLICATE` · `IMAGE_NOT_FOUND` ·
 `IMAGE_THUMB_NOT_FOUND` · `IMAGE_NOT_WEBP` · `IMAGE_HASH_MISMATCH` ·
-`QUIZ_FILENAME_INVALID` · `QUIZ_SCOPE_INVALID` · `QUIZ_SCOPE_MISMATCH` ·
+`QUIZ_FILENAME_INVALID` · `FILENAME_NOT_CANONICAL` · `DUPLICATE_ID` · `QUIZ_DUPLICATE_TARGET` ·
+`QUIZ_SCOPE_INVALID` · `QUIZ_SCOPE_MISMATCH` ·
 `QUIZ_TARGET_INVALID` · `QUIZ_TARGET_NOT_FOUND` · `QUIZ_FINGERPRINT_INVALID` ·
 `QUIZ_ACTIVE_VERSION_INVALID` · `QUIZ_VERSION_DUPLICATE` ·
 `QUIZ_QUESTION_POSITION_DUPLICATE` · `GRADING_MODE_INVALID` ·

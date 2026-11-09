@@ -168,11 +168,22 @@ function unknownFields(
   }
 }
 
-function fileIdFromName(name: string): number | null {
+const CANONICAL_ID_RE = /^[1-9]\d{0,8}$/;
+const LOOSE_ID_RE = /^\d{1,9}$/;
+
+/**
+ * Filenames are canonical: a positive integer without leading zeros
+ * ("1.json", never "01.json"). Returns null for names that do not look like a
+ * number at all (caller reports FILE_ID_MISMATCH); flags non-canonical numeric
+ * names via `canonical: false` (caller reports FILENAME_NOT_CANONICAL) so the
+ * problem is surfaced loudly instead of silently aliasing the same id.
+ */
+function parseFileId(name: string): { id: number; canonical: boolean } | null {
   const base = name.replace(/\.json$/i, "");
-  if (!/^\d{1,9}$/.test(base)) return null;
+  if (!LOOSE_ID_RE.test(base)) return null;
   const id = Number(base);
-  return Number.isInteger(id) && id >= 1 ? id : null;
+  if (!Number.isInteger(id) || id < 1) return null;
+  return { id, canonical: CANONICAL_ID_RE.test(base) };
 }
 
 /* ── per-file validators ───────────────────────────────────────────────── */
@@ -763,14 +774,27 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
       error("INVALID_JSON", label, "file does not contain valid JSON");
       continue;
     }
-    const fileId = fileIdFromName(file);
+    const parsed = parseFileId(file);
+    if (parsed && !parsed.canonical) {
+      error(
+        "FILENAME_NOT_CANONICAL",
+        label,
+        `filename must be a canonical positive integer without leading zeros ("${parsed.id}.json")`,
+      );
+    }
+    const fileId = parsed?.id ?? null;
     const { value, issues } = validateUnit(raw, label);
     errors.push(...issues);
     if (!value) continue;
     if (fileId !== value.id) {
       error("FILE_ID_MISMATCH", label, `filename implies id ${fileId ?? "?"} but the file declares id ${value.id}`);
     }
-    units.set(value.id, { unit: value, file: label });
+    const previous = units.get(value.id);
+    if (previous) {
+      error("DUPLICATE_ID", label, `unit id ${value.id} is declared by both ${previous.file} and ${label}; neither was dropped — fix one filename or id`);
+    } else {
+      units.set(value.id, { unit: value, file: label });
+    }
   }
   const unitPositions = new Map<number, number>();
   for (const { unit, file } of units.values()) {
@@ -790,14 +814,27 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
       error("INVALID_JSON", label, "file does not contain valid JSON");
       continue;
     }
-    const fileId = fileIdFromName(file);
+    const parsed = parseFileId(file);
+    if (parsed && !parsed.canonical) {
+      error(
+        "FILENAME_NOT_CANONICAL",
+        label,
+        `filename must be a canonical positive integer without leading zeros ("${parsed.id}.json")`,
+      );
+    }
+    const fileId = parsed?.id ?? null;
     const { value, issues } = validateLesson(raw, label);
     errors.push(...issues);
     if (!value) continue;
     if (fileId !== value.id) {
       error("FILE_ID_MISMATCH", label, `filename implies id ${fileId ?? "?"} but the file declares id ${value.id}`);
     }
-    lessons.set(value.id, { lesson: value, file: label });
+    const previous = lessons.get(value.id);
+    if (previous) {
+      error("DUPLICATE_ID", label, `lesson id ${value.id} is declared by both ${previous.file} and ${label}; neither was dropped — fix one filename or id`);
+    } else {
+      lessons.set(value.id, { lesson: value, file: label });
+    }
   }
   const lessonPositions = new Map<string, number>();
   const lastInUnit = new Map<number, number>();
@@ -845,6 +882,13 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
       continue;
     }
     const [, fileScope, fileTargetRaw] = nameMatch;
+    if (fileTargetRaw && !CANONICAL_ID_RE.test(fileTargetRaw)) {
+      error(
+        "FILENAME_NOT_CANONICAL",
+        label,
+        `filename must use a canonical positive integer without leading zeros ("${fileScope}-${Number(fileTargetRaw)}.json")`,
+      );
+    }
     const fileTarget = Number(fileTargetRaw);
     const { value, issues } = validateQuiz(raw, label);
     errors.push(...issues);
@@ -863,6 +907,27 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
       error("QUIZ_TARGET_NOT_FOUND", `${label}#/unitId`, `quiz references missing unit ${value.unitId}`);
     }
     quizzes.push({ quiz: value, file: label });
+  }
+
+  /* At most one quiz per (scope, target) — even across different spellings. */
+  const quizzesByTarget = new Map<string, string[]>();
+  for (const { quiz, file } of quizzes) {
+    const target = quiz.scope === "lesson" ? quiz.lessonId : quiz.unitId;
+    if (target === null) continue;
+    const key = `${quiz.scope}:${target}`;
+    const files = quizzesByTarget.get(key) ?? [];
+    files.push(file);
+    quizzesByTarget.set(key, files);
+  }
+  for (const [key, files] of quizzesByTarget) {
+    if (files.length > 1) {
+      const [scope, target] = key.split(":");
+      error(
+        "QUIZ_DUPLICATE_TARGET",
+        files.join(", "),
+        `more than one quiz targets ${scope} ${target}: ${files.join(", ")} — keep exactly one`,
+      );
+    }
   }
 
   /* Media checks: existence, WebP magic bytes, sha256 of stored files. */
