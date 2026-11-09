@@ -17,4 +17,5 @@ data/uploads/
 *.log
 .DS_Store
 next-env.d.ts
-.tsbuildinfo
+*.tsbuildinfo
+tsconfig.tsbuildinfo
