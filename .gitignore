@@ -1,0 +1,21 @@
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Runtime data — database and uploaded textbook scans. Never committed.
+data/*.db
+data/*.db-*
+data/uploads/
+!data/uploads/.gitkeep
+
+.env
+.env*.local
+!.env.example
+
+*.log
+.DS_Store
+next-env.d.ts
+*.tsbuildinfo
+tsconfig.tsbuildinfo
