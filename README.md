@@ -19,6 +19,7 @@
 | رفع صور الدرس دفعة واحدة + ترتيب + حذف + معاينة | ✅ منفَّذ ومُختبَر |
 | عارض الدرس (تكبير/تحريك/تنقّل/لمس) | ✅ منفَّذ |
 | تحديد «آخر درس في الوحدة» | ✅ منفَّذ |
+| **تصدير ثابت لـ GitHub Pages** (`/MATH_7th/`) | ✅ منفَّذ ومُختبَر — [docs/STATIC_EXPORT.md](docs/STATIC_EXPORT.md) |
 | **توليد الاختبارات آليًا** | ⏳ المرحلة التالية |
 | **حل الاختبارات والتصحيح** | ⏳ المرحلة التالية |
 
@@ -56,12 +57,14 @@ npm run dev               # http://localhost:3000
 
 ```bash
 npm run dev           # خادم التطوير
-npm run build         # بناء الإنتاج
+npm run build         # بناء الإنتاج (خادم كامل: API + لوحة الإدارة + الوسائط)
+npm run build:static  # تصدير ثابت إلى out/ لـ GitHub Pages (انظر docs/STATIC_EXPORT.md)
+npm run preview:static # معاينة التصدير محليًا كما يخدمه GitHub Pages — ‎http://localhost:4173/MATH_7th/
 npm start             # تشغيل الإنتاج
 npm run check         # الحارس + فحص الأنواع + الاختبارات
 npm run guard         # منع خصائص الاتجاه الفيزيائية ونداءات التنسيق الخام
 npm run typecheck     # tsc --noEmit
-npm test              # vitest
+npm test              # vitest (يتضمّن اختباري التصدير الثابت ووضع الخادم)
 npm run db:migrate    # تطبيق ملفات الترحيل
 npm run db:seed-admin # إنشاء/تحديث حساب المالك
 npm run content:validate  # التحقق من نموذج المحتوى (content/ + public/media)
@@ -96,6 +99,7 @@ node scripts/dev-fixture.cjs --clear  # إزالته
 - **لا SDK للذكاء الاصطناعي**: نداء `fetch` واحد إلى واجهة متوافقة مع OpenAI، فيمكن تغيير المزوّد بمتغيرات بيئة فقط.
 - **التخزين على القرص**: بلا خدمة تخزين سحابي في الإصدار الأول؛ الصور في `data/uploads` ولا تُخدَم إلا عبر مسار يفحص الصلاحية.
 - **الدخول عبر مسار API قياسي** (`/api/admin/login`) لا Server Action، حتى يكون تدفّق المصادقة قابلًا للاختبار خارج المتصفح.
+- **بناء واحد بوضعين** (PR 4): ملفات المسارات التي تحتاج خادمًا تحمل لاحقة `.srv` ويحدّد `pageExtensions` أيها يُبنى في كل وضع، والصفحات العامة تستدعي `renderPerRequest()` فتُعرض حيًّا على الخادم (سلوك لم يتغيّر) وتُثبَّت مرة واحدة عند تصدير GitHub Pages — التفاصيل في [docs/STATIC_EXPORT.md](docs/STATIC_EXPORT.md).
 
 ---
 
@@ -109,16 +113,19 @@ src/
 │  │  ├─ units/                 الوحدات وصفحة كل وحدة
 │  │  ├─ lessons/[lessonId]/    عارض الدرس
 │  │  ├─ quizzes/               تبويبا اختبارات الدروس والوحدات
-│  │  └─ admin/                 لوحة المالك
-│  ├─ api/admin/                login · logout · upload
-│  └─ media/i/[imageId]/[variant]   خدمة الصور مع فحص الصلاحية
+│  │  └─ admin/                 لوحة المالك (ملفات `.srv` — لا تُصدَّر مع GitHub Pages)
+│  ├─ api/admin/                login · logout · upload (`.srv`)
+│  └─ media/i/[imageId]/[variant]   خدمة الصور مع فحص الصلاحية (`.srv`)
 ├─ components/
 │  ├─ lesson/page-viewer.tsx    العارض: تكبير وتحريك وتنقّل ولمس
 │  ├─ admin/image-manager.tsx   الرفع الدفعي والترتيب
 │  └─ ui/ar-text.tsx            وسم المحتوى العربي بلغته داخل أي واجهة
 ├─ db/                          schema.ts + migrations/ (SQL يدوي)
 ├─ i18n/                        routing · request · messages/{ar,en}.json
-└─ lib/                         auth · format · images · storage · queries
+└─ lib/                         auth · format · images · storage · queries · base-path · render-mode
+
+scripts/                        build-static · preview-static · clean-stale-types · guard · migrate
+docs/                           CONTENT_MODEL.md · STATIC_EXPORT.md (التصدير لـ GitHub Pages)
 ```
 
 ---
@@ -153,12 +160,23 @@ tests/password.test.ts   التجزئة والتحقق
 tests/auth-token.test.ts توقيع الجلسة ورفض التزوير والانتهاء
 tests/images.test.ts     كشف الصيغة + المعالجة + حذف EXIF
 tests/content-model.test.ts  التحقق من نموذج المحتوى JSON (علاقات، وسائط، اختبارات)
+tests/static-export.test.ts  بناء التصدير الثابت فعليًا (محتوى فارغ + مزروع) +
+                             سلامة المسارات والأصول تحت /MATH_7th/ + زحف روابط
+                             كامل عبر preview:static + إخفاء المسودات + 404
+tests/server-mode.test.ts    بناء الخادم وتشغيله: Proxy · عرض فوري بعد الإدخال ·
+                             404 والمسودات · الدخول وrequireOwner · الرفع والوسائط ·
+                             تنفيذ Server Action ورفضه بلا جلسة
+tests/render-mode.test.ts    علامات الوضع: BASE_PATH وrenderPerRequest في الوضعين
 ```
 
 ```
-Test Files  5 passed (5)
-     Tests  23 passed (23)
+Test Files  9 passed (9)
+     Tests  93 passed (93)
 ```
+
+ملفّا `static-export` و`server-mode` يبنيان ويُشغِّلان Next فعليًا داخل الاختبار
+(ضمن مسارات مؤقتة — لا يمسّان `data/` في المستودع)، لذلك يُشغَّل ملفات
+الاختبار تسلسليًا (`fileParallelism: false` في `vitest.config.ts`).
 
 ---
 
