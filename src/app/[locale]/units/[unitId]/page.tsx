@@ -4,17 +4,42 @@ import { Link } from "@/i18n/navigation";
 import { SiteShell } from "@/components/site-shell";
 import { Badge, EmptyState, buttonClass } from "@/components/ui/primitives";
 import { formatCount } from "@/lib/format";
-import { getUnit, listLessons, unitIsComplete } from "@/lib/queries";
+import { getUnit, listLessons, listUnits, unitIsComplete } from "@/lib/queries";
 import { accentVar, cx } from "@/lib/utils";
 import { Ar } from "@/components/ui/ar-text";
+import { renderPerRequest } from "@/lib/render-mode";
 
-export const dynamic = "force-dynamic";
+/**
+ * Static export: one page per unit that exists at build time. On the server
+ * the page stays per-request (renderPerRequest below), so unknown ids still
+ * render on demand.
+ */
+export function generateStaticParams() {
+  let ids: number[];
+  try {
+    ids = listUnits().map((unit) => unit.id);
+  } catch {
+    // Fresh checkout without a migrated database: nothing to pre-render;
+    // the server build renders on demand once the database exists.
+    ids = [];
+  }
+  if (ids.length > 0) return ids.map((id) => ({ unitId: String(id) }));
+  // Never return an empty list: `output: export` refuses it outright, and in
+  // server builds an empty list classifies the route as SSG with no paths,
+  // which makes on-demand renders fail with DYNAMIC_SERVER_USAGE (HTTP 500)
+  // instead of rendering dynamically. One placeholder id keeps the route
+  // on-demand (the page answers notFound() for it): no real unit page exists
+  // until content does, on either host.
+  return [{ unitId: "0" }];
+}
 
 export default async function UnitPage({
   params,
 }: {
   params: Promise<{ locale: string; unitId: string }>;
 }) {
+  // Server builds: fresh DB reads per request (see src/lib/render-mode.ts).
+  renderPerRequest();
   const { locale, unitId } = await params;
   setRequestLocale(locale);
   const t = await getTranslations({ locale, namespace: "unit" });

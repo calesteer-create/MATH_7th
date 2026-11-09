@@ -3,6 +3,7 @@ import { NextIntlClientProvider, hasLocale } from "next-intl";
 import { getTranslations, setRequestLocale } from "next-intl/server";
 import { notFound } from "next/navigation";
 import { dirFor, routing } from "@/i18n/routing";
+import { BASE_PATH } from "@/lib/base-path";
 import "../globals.css";
 
 export function generateStaticParams() {
@@ -19,7 +20,9 @@ export async function generateMetadata({
   return {
     title: { default: t("title"), template: `%s — ${t("title")}` },
     description: t("description"),
-    alternates: { languages: { ar: "/ar", en: "/en" } },
+    // Prefixed with BASE_PATH so the exported hreflang links point at
+    // /MATH_7th/ar … on GitHub Pages instead of the domain root.
+    alternates: { languages: { ar: `${BASE_PATH}/ar`, en: `${BASE_PATH}/en` } },
   };
 }
 

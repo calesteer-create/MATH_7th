@@ -5,10 +5,11 @@ import { UnitCard } from "@/components/unit-card";
 import { EmptyState, buttonClass } from "@/components/ui/primitives";
 import { formatCount } from "@/lib/format";
 import { listUnits, overviewStats } from "@/lib/queries";
-
-export const dynamic = "force-dynamic";
+import { renderPerRequest } from "@/lib/render-mode";
 
 export default async function HomePage({ params }: { params: Promise<{ locale: string }> }) {
+  // Server builds: fresh DB reads per request (see src/lib/render-mode.ts).
+  renderPerRequest();
   const { locale } = await params;
   setRequestLocale(locale);
   const t = await getTranslations({ locale, namespace: "home" });

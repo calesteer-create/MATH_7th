@@ -5,17 +5,43 @@ import { SiteShell } from "@/components/site-shell";
 import { PageViewer, type ViewerPage } from "@/components/lesson/page-viewer";
 import { Badge, EmptyState, buttonClass } from "@/components/ui/primitives";
 import { dirFor } from "@/i18n/routing";
-import { getLessonWithUnit, listLessonImages } from "@/lib/queries";
+import { getLessonWithUnit, listLessonImages, listPublishedLessonIds } from "@/lib/queries";
 import { accentVar } from "@/lib/utils";
 import { Ar } from "@/components/ui/ar-text";
+import { renderPerRequest } from "@/lib/render-mode";
+import { BASE_PATH } from "@/lib/base-path";
 
-export const dynamic = "force-dynamic";
+/**
+ * Static export: one page per published lesson. Drafts are excluded — they
+ * are invisible to students, and the page below answers `notFound()` for
+ * them, exactly as it does on the server.
+ */
+export function generateStaticParams() {
+  let ids: number[];
+  try {
+    ids = listPublishedLessonIds();
+  } catch {
+    // Fresh checkout without a migrated database: nothing to pre-render;
+    // the server build renders on demand once the database exists.
+    ids = [];
+  }
+  if (ids.length > 0) return ids.map((id) => ({ lessonId: String(id) }));
+  // Never return an empty list: `output: export` refuses it outright, and in
+  // server builds an empty list classifies the route as SSG with no paths,
+  // which makes on-demand renders fail with DYNAMIC_SERVER_USAGE (HTTP 500)
+  // instead of rendering dynamically. One placeholder id keeps the route
+  // on-demand (the page answers notFound() for it): no real lesson page
+  // exists until content does, on either host. Drafts stay excluded above.
+  return [{ lessonId: "0" }];
+}
 
 export default async function LessonPage({
   params,
 }: {
   params: Promise<{ locale: string; lessonId: string }>;
 }) {
+  // Server builds: fresh DB reads per request (see src/lib/render-mode.ts).
+  renderPerRequest();
   const { locale, lessonId } = await params;
   setRequestLocale(locale);
   const t = await getTranslations({ locale, namespace: "lesson" });
@@ -33,10 +59,12 @@ export default async function LessonPage({
   const accent = accentVar(unit.accent);
   const dir = dirFor(locale);
 
+  // Raw <img> URLs bypass the router, so the GitHub Pages prefix must be
+  // added explicitly (BASE_PATH is "" on the server, "/MATH_7th" on export).
   const pages: ViewerPage[] = images.map((img) => ({
     id: img.id,
-    thumbSrc: `/media/i/${img.id}/thumb`,
-    src: `/media/i/${img.id}/web`,
+    thumbSrc: `${BASE_PATH}/media/i/${img.id}/thumb`,
+    src: `${BASE_PATH}/media/i/${img.id}/web`,
     width: img.width ?? 1600,
     height: img.height ?? 2200,
   }));

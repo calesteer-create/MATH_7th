@@ -3,10 +3,11 @@ import { SiteShell } from "@/components/site-shell";
 import { UnitCard } from "@/components/unit-card";
 import { EmptyState, SectionHeading } from "@/components/ui/primitives";
 import { listUnits } from "@/lib/queries";
-
-export const dynamic = "force-dynamic";
+import { renderPerRequest } from "@/lib/render-mode";
 
 export default async function UnitsPage({ params }: { params: Promise<{ locale: string }> }) {
+  // Server builds: fresh DB reads per request (see src/lib/render-mode.ts).
+  renderPerRequest();
   const { locale } = await params;
   setRequestLocale(locale);
   const t = await getTranslations({ locale, namespace: "units" });

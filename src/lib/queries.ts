@@ -43,6 +43,17 @@ export function getLesson(lessonId: number): Lesson | undefined {
   return getDb().select().from(schema.lessons).where(eq(schema.lessons.id, lessonId)).get();
 }
 
+/** Ids of every published lesson — the static export pre-renders these pages. */
+export function listPublishedLessonIds(): number[] {
+  return getDb()
+    .select({ id: schema.lessons.id })
+    .from(schema.lessons)
+    .where(eq(schema.lessons.status, "published"))
+    .orderBy(asc(schema.lessons.id))
+    .all()
+    .map((row) => row.id);
+}
+
 export function getLessonWithUnit(
   lessonId: number,
 ): { lesson: Lesson; unit: Unit; siblings: Lesson[] } | undefined {

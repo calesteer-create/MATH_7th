@@ -4,8 +4,11 @@
   "private": true,
   "description": "MATH 7TH — منصة رياضيات تفاعلية للصف السابع (المنهاج السوري)",
   "scripts": {
+    "predev": "node scripts/clean-stale-types.mjs",
     "dev": "next dev -H 0.0.0.0 -p 3000",
     "build": "next build",
+    "build:static": "node scripts/build-static.mjs",
+    "preview:static": "node scripts/preview-static.mjs",
     "start": "next start -H 0.0.0.0 -p 3000",
     "guard": "node scripts/guard.mjs",
     "content:validate": "tsx scripts/content-validate.ts",
