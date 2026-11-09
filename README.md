@@ -64,6 +64,8 @@ npm run typecheck     # tsc --noEmit
 npm test              # vitest
 npm run db:migrate    # تطبيق ملفات الترحيل
 npm run db:seed-admin # إنشاء/تحديث حساب المالك
+npm run content:validate  # التحقق من نموذج المحتوى (content/ + public/media)
+npm run content:stats     # ملخص عددي للمحتوى
 node scripts/dev-fixture.cjs          # عنصر نائب للعرض (ليس محتوى منهاج)
 node scripts/dev-fixture.cjs --clear  # إزالته
 ```
@@ -150,6 +152,7 @@ tests/schema.test.ts     تطابق SQL مع Drizzle + قيود المنهاج
 tests/password.test.ts   التجزئة والتحقق
 tests/auth-token.test.ts توقيع الجلسة ورفض التزوير والانتهاء
 tests/images.test.ts     كشف الصيغة + المعالجة + حذف EXIF
+tests/content-model.test.ts  التحقق من نموذج المحتوى JSON (علاقات، وسائط، اختبارات)
 ```
 
 ```

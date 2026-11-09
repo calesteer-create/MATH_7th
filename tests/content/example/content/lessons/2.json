@@ -1,0 +1,15 @@
+{
+  "id": 2,
+  "unitId": 1,
+  "position": 2,
+  "titleAr": "مثال مرجعي: الدرس الأخير (مسودة)",
+  "titleEn": "Reference example: sample last lesson (draft)",
+  "pageLabel": "مثال-2",
+  "status": "draft",
+  "isLastInUnit": true,
+  "publishedAt": null,
+  "contentUpdatedAt": "2026-11-03T10:00:00.000Z",
+  "createdAt": "2026-11-01T10:00:00.000Z",
+  "updatedAt": "2026-11-03T10:00:00.000Z",
+  "images": []
+}

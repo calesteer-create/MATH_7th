@@ -1,0 +1,66 @@
+{
+  "scope": "lesson",
+  "lessonId": 1,
+  "unitId": null,
+  "status": "draft",
+  "activeVersion": 1,
+  "sourceFingerprint": "7a7e05e72dc3278f97e570c4e4d0b170a0ea1d34e4df74dd18c1827852d1e474",
+  "lastError": null,
+  "createdAt": "2026-11-03T10:00:00.000Z",
+  "updatedAt": "2026-11-03T10:00:00.000Z",
+  "versions": [
+    {
+      "versionNumber": 1,
+      "status": "approved",
+      "provider": "reference",
+      "model": "reference-model-1",
+      "notes": "نسخة مثال مرجعي لاختبار نموذج المحتوى — ليست من محتوى المنهاج.",
+      "generatorLog": [
+        "stage: read-images",
+        "stage: draft-questions",
+        "stage: validate"
+      ],
+      "createdAt": "2026-11-03T10:00:00.000Z",
+      "approvedAt": "2026-11-03T11:00:00.000Z",
+      "questions": [
+        {
+          "position": 1,
+          "type": "numeric",
+          "promptAr": "مثال مرجعي: احسب ناتج جمع 1 + 2",
+          "promptEn": "Reference example: compute 1 + 2",
+          "parts": [],
+          "answer": {
+            "value": "3",
+            "tolerance": 0
+          },
+          "explanationAr": "خطوات الجمع موضحة في صفحة المثال. نموذج للتحقق فقط.",
+          "explanationEn": "The page shows the addition steps. Example for validation only.",
+          "points": 1,
+          "gradingMode": "auto_numeric",
+          "sourceImage": "page-01.webp",
+          "sourceRef": "صفحة 1",
+          "confidence": "unverified",
+          "needsReview": true
+        },
+        {
+          "position": 2,
+          "type": "essay",
+          "promptAr": "مثال مرجعي: وضّح بكلماتك لماذا رتّبنا الخطوات بهذا الشكل",
+          "promptEn": "Reference example: explain in your own words why the steps are ordered this way",
+          "parts": [],
+          "answer": {
+            "model": "حل نموذجي للتمثيل فقط"
+          },
+          "explanationAr": "سؤال مقالي يُصحَّح بمقارنة الحل النموذجي.",
+          "explanationEn": "Essay question graded against the model answer.",
+          "points": 2,
+          "gradingMode": "self_assessed",
+          "sourceImage": null,
+          "sourceRef": "",
+          "confidence": "unverified",
+          "needsReview": true
+        }
+      ]
+    }
+  ]
+}

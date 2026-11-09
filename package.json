@@ -8,6 +8,8 @@
     "build": "next build",
     "start": "next start -H 0.0.0.0 -p 3000",
     "guard": "node scripts/guard.mjs",
+    "content:validate": "tsx scripts/content-validate.ts",
+    "content:stats": "tsx scripts/content-stats.ts",
     "check": "npm run guard && npm run typecheck && npm run test",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
