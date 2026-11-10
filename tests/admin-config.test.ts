@@ -241,8 +241,10 @@ describe("repository guard — drafts only", () => {
 
   it("never generates a config for the public repository", () => {
     expect(() => currentAdminOptions({ DRAFT_REPO: PUBLIC_REPO })).toThrow(/PUBLIC repository/);
-    expect(() => buildAdminConfig({ repo: PUBLIC_REPO })).not.toThrow(); // the builder is dumb…
-    // …but every entry point that produces a file goes through the guard.
+    // The builder refuses too: no caller can emit a config that points the CMS
+    // at the public site, even by calling the low-level function directly.
+    expect(() => buildAdminConfig({ repo: PUBLIC_REPO })).toThrow(/PUBLIC repository/);
+    expect(() => buildAdminConfig({ repo: "Calesteer-Create/MATH_7TH" })).toThrow(/PUBLIC repository/);
     expect(() => currentAdminOptions({ DRAFT_REPO: "not a repo" })).toThrow(/owner\/name/);
   });
 

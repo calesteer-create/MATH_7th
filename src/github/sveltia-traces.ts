@@ -146,11 +146,49 @@ export interface TraceOptions {
   probeContent?: string;
   /** Read this file from the base branch before writing. */
   samplePath?: string;
+  /**
+   * Called immediately after `createBranch` succeeds, before anything else
+   * touches the branch, so ownership is recorded even if a later step throws.
+   */
+  onCreateBranch?: (claim: ProbeBranchClaim) => void;
   /** Delete the probe branch at the end (default true). */
   cleanupBranch?: boolean;
   /** Delete the probe file with a second commit instead of dropping a branch. */
   deleteProbeFile?: boolean;
   onStep?: (result: TraceStepResult) => void;
+}
+
+/**
+ * Proof that *this run* created the scratch branch.
+ *
+ * A branch name alone is never evidence of ownership — it is guessable and it
+ * may already exist. This record is only produced after GitHub confirmed a
+ * successful `POST /git/refs` from this process, and it pins the base commit
+ * and the empty commit it started from, so cleanup can re-verify both before
+ * deleting anything.
+ */
+export interface ProbeBranchClaim {
+  owner: string;
+  repo: string;
+  branch: string;
+  /** Head of the base branch the scratch branch was created from. */
+  baseOid: string;
+  /** Head of the scratch branch right after creation (=== baseOid). */
+  createdOid: string;
+  /** Epoch ms, for the report only. */
+  createdAt: number;
+}
+
+/** Identity of the probe commit this run intends to create. */
+export interface ProbeCommitProof {
+  /** Path of the probe file. */
+  path: string;
+  /** Commit message headline. */
+  message: string;
+  /** Head the commit was based on. */
+  parentOid: string;
+  /** Head produced by the commit. */
+  commitOid: string;
 }
 
 export interface TraceStepResult {
@@ -167,8 +205,12 @@ export interface TraceReport {
   steps: TraceStepResult[];
   /** Extra observations worth telling the owner about. */
   findings: string[];
-  /** Set when the repository looks like the public site. */
+  /** Set when the run was refused before writing anything. */
   blockedReason?: string;
+  /** Ownership proof, only present when this run created the branch. */
+  claim?: ProbeBranchClaim;
+  /** The commit this run created, when the write step succeeded. */
+  commit?: ProbeCommitProof;
   /** Filled in by the CLI after it drops the scratch branch. */
   cleanup?: string;
 }
@@ -203,10 +245,19 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
   let defaultBranch = "";
   let createdBranch = false;
   let blockedReason: string | undefined;
+  let claim: ProbeBranchClaim | undefined;
+  let commitProof: ProbeCommitProof | undefined;
 
   /** Builds the report; declared first so every early return can use it. */
   function finish(): TraceReport {
-    return { ok: steps.every((result) => result.ok) && !blockedReason, steps, findings, blockedReason };
+    return {
+      ok: steps.every((result) => result.ok) && !blockedReason,
+      steps,
+      findings,
+      ...(blockedReason ? { blockedReason } : {}),
+      ...(claim ? { claim } : {}),
+      ...(commitProof ? { commit: commitProof } : {}),
+    };
   }
 
   const stepById = (id: string): TraceStep => {
@@ -275,26 +326,41 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
   );
   if (!repoInfo) return finish();
   defaultBranch = repoInfo.default_branch;
-  if (!repoInfo.private) {
-    findings.push(
-      "The repository is PUBLIC. This does not prove Sveltia works with a private repository — requirement 6 is not satisfied by this result.",
-    );
-  }
+
+  /* Hard block #1 — never write to the public site repository, whatever its
+     visibility says. Checked by name so a misreported flag cannot help. */
   if (repoInfo.full_name.toLowerCase() === "calesteer-create/math_7th") {
     blockedReason =
-      "This is the PUBLIC site repository. Refusing to write a probe file there (requirement 5). Point the script at MATH_7th-drafts.";
+      "This is the PUBLIC site repository. Refusing to create any branch or commit there (requirement 5). Point the script at MATH_7th-drafts.";
     findings.push(blockedReason);
     return finish();
   }
-  if (repoInfo.permissions?.push !== true) {
-    findings.push("The token can read this repository but cannot push, so the write steps will fail.");
+
+  /* Hard block #2 — the repository must be PRIVATE. A public repository is
+     readable by the whole world, so writing drafts into it would publish them.
+     There is deliberately no flag, argument or environment variable that can
+     downgrade this to a warning: `private !== true` (including a missing or
+     non-boolean field) stops the run before the first branch or commit. */
+  if (repoInfo.private !== true) {
+    blockedReason =
+      `refusing to write to ${repoInfo.full_name}: GitHub reports private=${String(repoInfo.private)}, ` +
+      "and draft content is only ever written to a PRIVATE repository. Nothing was created. " +
+      "This cannot be overridden with --yes or any other option; use the private drafts repository instead.";
+    findings.push(blockedReason);
+    return finish();
   }
 
+  /* Hard block #3 — the branch the probe writes to must not be the branch
+     GitHub serves as the repository's default. */
   const branch = options.branch;
   if (branch === defaultBranch || branch.toLowerCase() === "main") {
     blockedReason = `refusing to probe branch "${branch}": the probe only writes to a scratch branch, never to ${defaultBranch}.`;
     findings.push(blockedReason);
     return finish();
+  }
+
+  if (repoInfo.permissions?.push !== true) {
+    findings.push("The token can read this repository but cannot push, so the write steps will fail.");
   }
 
   await run(
@@ -350,11 +416,14 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
     findings.push(`Could not resolve the head of ${defaultBranch}; skipping the write steps.`);
     return finish();
   }
+  /* Pre-flight: an existing branch is never reused, never overwritten and
+     never deleted. We refuse before any write so a pre-existing branch stays
+     byte-identical — even one that happens to look like ours. */
   const existingBranches = await listBranches(client, options.owner, options.repo).catch(
     (): string[] => [],
   );
   if (existingBranches.includes(branch)) {
-    blockedReason = `scratch branch "${branch}" already exists; delete it or pass --branch with a fresh name.`;
+    blockedReason = `scratch branch "${branch}" already exists; it is left untouched. Delete it yourself or pass --branch with a fresh name.`;
     findings.push(blockedReason);
     return finish();
   }
@@ -363,7 +432,19 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
     "create-ref",
     async () => {
       const ref = await createBranch(client, options.owner, options.repo, branch, baseHead);
+      // Record ownership the instant GitHub confirms the creation. If a later
+      // step throws, cleanup still knows this run — and only this run — made
+      // the branch.
+      claim = {
+        owner: options.owner,
+        repo: options.repo,
+        branch,
+        baseOid: baseHead,
+        createdOid: ref.object.sha,
+        createdAt: Date.now(),
+      };
       createdBranch = true;
+      options.onCreateBranch?.(claim);
       return ref;
     },
     (ref) => `created scratch branch ${ref.ref} at ${ref.object.sha.slice(0, 7)}`,
@@ -375,16 +456,32 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
     findings.push("Could not read the scratch branch head; skipping the commit steps.");
     return finish();
   }
+  /* The branch must still be exactly where we created it. If somebody else
+     moved it between creation and now, it is no longer our scratch branch. */
+  if (headAfterCreate !== claim?.createdOid) {
+    blockedReason =
+      `scratch branch "${branch}" moved after creation (${claim?.createdOid.slice(0, 7) ?? "?"} → ` +
+      `${headAfterCreate.slice(0, 7)}); refusing to commit to it.`;
+    findings.push(blockedReason);
+    return finish();
+  }
 
+  const commitMessage = "chore: admin probe (MATH 7TH)";
   const commit = await run(
     "write",
     () =>
-      commitOnBranch(client, options.owner, options.repo, branch, headAfterCreate, "chore: admin probe (MATH 7TH)", {
+      commitOnBranch(client, options.owner, options.repo, branch, headAfterCreate, commitMessage, {
         additions: [{ path: probePath, contents: probeContent }],
       }),
     (value) => `committed ${value.oid.slice(0, 7)} to ${branch}`,
   );
   if (!commit) return finish();
+  commitProof = {
+    path: probePath,
+    message: commitMessage,
+    parentOid: headAfterCreate,
+    commitOid: commit.oid,
+  };
 
   /* concurrency: the same expectedHeadOid must now be rejected.
      A rejection is the PASS here; acceptance is the finding we report. */
@@ -428,33 +525,118 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
 
 /**
  * Cleanup, run explicitly by the caller so its result can be reported.
- * Safe to call twice; a missing branch is not an error.
+ *
+ * Deleting a branch is the single destructive action in this whole PR, so it
+ * requires proof rather than a name:
+ *
+ *   1  a `ProbeBranchClaim` — written only after GitHub confirmed this run's
+ *      `POST /git/refs` — must exist and match repo/branch;
+ *   2  the live branch head must still be the head we created from, or the
+ *      commit we created on top of it;
+ *   3  the run must not be pointing at the default branch.
+ *
+ * If any check fails, nothing is deleted and the caller is told why. A branch
+ * that already existed, or one whose head we cannot account for, is left
+ * exactly as it is.
  */
+export type CleanupReason =
+  | "deleted"
+  | "absent"
+  | "not-owned"
+  | "head-mismatch"
+  | "error"
+  | "refused-default";
+
+export interface CleanupResult {
+  /** True when nothing of ours is left behind. */
+  ok: boolean;
+  deleted: boolean;
+  reason: CleanupReason;
+  note: string;
+}
+
 export async function cleanupProbeBranch(
   client: GithubClient,
   owner: string,
   repo: string,
   branch: string,
   defaultBranch: string,
-): Promise<{ ok: boolean; note: string }> {
+  claim?: ProbeBranchClaim,
+  commit?: ProbeCommitProof,
+): Promise<CleanupResult> {
+  const refuse = (reason: CleanupReason, note: string): CleanupResult => ({
+    ok: reason !== "error",
+    deleted: false,
+    reason,
+    note,
+  });
+
   if (branch === defaultBranch || branch.toLowerCase() === "main") {
-    return { ok: false, note: `refusing to delete "${branch}": it is the default branch` };
+    return refuse("refused-default", `refusing to delete "${branch}": it is the default branch`);
   }
+  if (
+    claim &&
+    (claim.branch !== branch ||
+      claim.owner.toLowerCase() !== owner.toLowerCase() ||
+      claim.repo.toLowerCase() !== repo.toLowerCase())
+  ) {
+    return refuse(
+      "not-owned",
+      `refusing to delete "${branch}": the ownership record belongs to ${claim.owner}/${claim.repo}@${claim.branch}`,
+    );
+  }
+
   const started = Date.now();
   try {
     const branches = await listBranches(client, owner, repo);
     if (!branches.includes(branch)) {
-      return { ok: true, note: `nothing to clean up (branch ${branch} was not created)` };
+      return { ok: true, deleted: false, reason: "absent", note: `nothing to clean up (branch ${branch} is already gone)` };
     }
+    if (!claim) {
+      return refuse(
+        "not-owned",
+        `branch "${branch}" exists but this run did not create it — left untouched`,
+      );
+    }
+
+    /* Re-verify the head before the one destructive call. */
+    const head = await getBranchHead(client, owner, repo, branch);
+    const expected = [claim.createdOid, commit?.commitOid].filter((oid): oid is string => Boolean(oid));
+    if (!head) {
+      return refuse("error", `could not delete "${branch}": its head could not be read to confirm ownership`);
+    }
+    if (!expected.includes(head)) {
+      return refuse(
+        "head-mismatch",
+        `refusing to delete "${branch}": its head ${head.slice(0, 7)} is not the commit this run created ` +
+          `(expected ${expected.map((oid) => oid.slice(0, 7)).join(" or ")}). Someone else is using it — left untouched`,
+      );
+    }
+
     const removed = await deleteBranch(client, owner, repo, branch);
     return {
       ok: true,
+      deleted: removed,
+      reason: removed ? "deleted" : "absent",
       note: removed
         ? `deleted scratch branch ${branch} (${Date.now() - started} ms)`
         : `scratch branch ${branch} was already gone`,
     };
   } catch (error) {
     const advice = error instanceof GithubError ? error.advice : (error as Error).message;
-    return { ok: false, note: `could not delete ${branch}: ${advice}` };
+    // Never retry a destructive call; report and let the owner finish by hand.
+    return {
+      ok: false,
+      deleted: false,
+      reason: "error",
+      note: `could not delete ${branch}: ${advice}`,
+    };
   }
+}
+/**
+ * Whether the run left a branch behind that it created. Used by the CLI to
+ * decide between "clean" and "needs your attention" without ever guessing.
+ */
+export function needsAttention(cleanup: CleanupResult): boolean {
+  return cleanup.reason === "error" || cleanup.reason === "head-mismatch";
 }

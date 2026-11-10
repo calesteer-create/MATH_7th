@@ -209,3 +209,35 @@ describe("no secrets, no accidental credentials", () => {
     expect(leaks).toEqual([]);
   });
 });
+
+describe("visibility is checked, not assumed (fix 2)", () => {
+  it("checkWritableRepo requires GitHub to say private === true", async () => {
+    const { checkWritableRepo } = await import("@/media/repo-guard");
+    const name = "calesteer-create/notes-and-plans";
+    expect(checkWritableRepo(name, { full_name: name, private: true }).writable).toBe(true);
+    for (const value of [false, null, 0, "true", undefined] as unknown[]) {
+      const verdict = checkWritableRepo(name, {
+        full_name: name,
+        private: value as boolean | null,
+      });
+      expect(verdict.writable).toBe(false);
+      expect(verdict.problem).toMatch(/PRIVATE|private=/);
+    }
+  });
+
+  it("the CMS config builder refuses the public repository instead of relying on callers", async () => {
+    const { buildAdminConfig } = await import("@/media/cms-config");
+    expect(() => buildAdminConfig({ repo: PUBLIC_REPO })).toThrow(/PUBLIC repository/);
+    expect(() => buildAdminConfig({ repo: "Calesteer-Create/MATH_7TH" })).toThrow(/PUBLIC repository/);
+    expect(() => buildAdminConfig({ repo: DRAFT_REPO_DEFAULT })).not.toThrow();
+  });
+
+  it("the committed config and the panel never name a public drafts target", () => {
+    const config = fs.readFileSync(path.join(ROOT, "public/admin/config.yml"), "utf8");
+    const backendRepo = /repo:\s*(\S+)/.exec(config)?.[1]?.replace(/"/g, "");
+    expect(backendRepo).toBe(DRAFT_REPO_DEFAULT);
+    const html = fs.readFileSync(path.join(ROOT, "public/admin/index.html"), "utf8");
+    expect(html).not.toMatch(/repo:\s*calesteer-create\/MATH_7th\b(?!-drafts)/);
+    expect(html).toMatch(/PRIVATE|خاص/i);
+  });
+});

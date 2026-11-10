@@ -102,6 +102,22 @@ export interface RestRequest {
   allowNotFound?: boolean;
 }
 
+/**
+ * API root for the verification CLI.
+ *
+ * Production default is the real api.github.com. `GITHUB_API_ROOT` exists for
+ * the test suite only and is accepted **only** when it points at the local
+ * machine: a token must never be sent to a host chosen by an environment
+ * variable, so any other value is ignored rather than honoured.
+ */
+export function resolveApiRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const candidate = env["GITHUB_API_ROOT"];
+  if (!candidate) return GITHUB_API_ROOT;
+  return /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?\/?$/i.test(candidate)
+    ? candidate.replace(/\/$/, "")
+    : GITHUB_API_ROOT;
+}
+
 export class GithubClient {
   private readonly apiRoot: string;
   private readonly graphqlRoot: string;

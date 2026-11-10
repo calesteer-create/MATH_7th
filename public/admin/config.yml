@@ -6,6 +6,10 @@
 #
 # The backend below points at the PRIVATE DRAFTS repository. Committing here
 # never publishes anything: there is no publish workflow in this PR.
+#
+# Only a repository GitHub confirms as PRIVATE is ever a drafts target. The
+# verification script refuses a public repository outright (no flag overrides
+# it), so a public repository can never receive draft commits.
 
 backend:
   name: "github"

@@ -16,7 +16,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { GithubClient, getBranchHead, listBranches, readFileAtRef } from "@/github/client";
+import { GithubClient, createBranch, getBranchHead, listBranches, readFileAtRef } from "@/github/client";
 import { defaultFixture, startMockGithub, type MockGithubServer } from "@/github/mock-server";
 import {
   PROBE_FILE_DEFAULT,
@@ -25,6 +25,7 @@ import {
   cleanupProbeBranch,
   runSveltiaTrace,
 } from "@/github/sveltia-traces";
+import { fixtureWithRepos } from "@/github/mock-server";
 
 const DRAFTS = { owner: "calesteer-create", repo: "MATH_7th-drafts" };
 const PUBLIC = { owner: "calesteer-create", repo: "MATH_7th" };
@@ -41,8 +42,8 @@ afterAll(async () => {
   await server.close();
 });
 
-function client(token = WRITE_TOKEN): GithubClient {
-  return new GithubClient({ token, apiRoot: server.url, graphqlRoot: server.graphqlUrl, retryDelayMs: 0 });
+function client(token = WRITE_TOKEN, apiRoot = server.url): GithubClient {
+  return new GithubClient({ token, apiRoot, graphqlRoot: `${apiRoot}/graphql`, retryDelayMs: 0 });
 }
 
 async function probe(token = WRITE_TOKEN, branch = "admin-verification-test") {
@@ -52,12 +53,15 @@ async function probe(token = WRITE_TOKEN, branch = "admin-verification-test") {
     repo: DRAFTS.repo,
     branch,
   });
+  // Cleanup only receives what the trace can prove it created.
   const cleanup = await cleanupProbeBranch(
     draftClient,
     DRAFTS.owner,
     DRAFTS.repo,
     branch,
     "main",
+    report.claim,
+    report.commit,
   );
   return { report, cleanup, client: draftClient };
 }
@@ -133,7 +137,8 @@ describe("runSveltiaTrace against the simulator", () => {
     const createRef = report.steps.find((step) => step.step.id === "create-ref")!;
     expect(createRef.error?.kind).toBe("forbidden");
     expect(report.findings.join(" ")).toMatch(/cannot push/);
-    expect(cleanup.ok).toBe(true); // nothing existed, nothing to delete
+    expect(cleanup.deleted).toBe(false); // nothing was created, nothing to delete
+    expect(cleanup.reason).toBe("absent");
   });
 
   it("cannot even see the private repository with a token from another owner", async () => {
@@ -156,6 +161,7 @@ describe("runSveltiaTrace against the simulator", () => {
 
   it("refuses to write to the PUBLIC repository (requirement 5)", async () => {
     const draftClient = client();
+    const writesBefore = server.state.requests.filter((entry) => entry.method !== "GET").length;
     const report = await runSveltiaTrace(draftClient, {
       owner: PUBLIC.owner,
       repo: PUBLIC.repo,
@@ -163,9 +169,12 @@ describe("runSveltiaTrace against the simulator", () => {
     });
     expect(report.ok).toBe(false);
     expect(report.blockedReason).toMatch(/PUBLIC/);
+    expect(report.claim).toBeUndefined();
     // No branch was created in the public repository.
     expect(await listBranches(client(), PUBLIC.owner, PUBLIC.repo)).toEqual(["main"]);
     expect(draftClient.calls).toBeLessThan(4);
+    // Nothing was written: no refs created, no commit attempted.
+    expect(server.state.requests.filter((entry) => entry.method !== "GET").length).toBe(writesBefore);
   });
 
   it("refuses to probe `main` even when asked explicitly", async () => {
@@ -179,7 +188,7 @@ describe("runSveltiaTrace against the simulator", () => {
     expect(report.blockedReason).toMatch(/refusing to probe branch/);
   });
 
-  it("refuses to reuse an existing scratch branch", async () => {
+  it("refuses to reuse an existing scratch branch and leaves it untouched", async () => {
     const draftClient = client();
     const head = await getBranchHead(draftClient, DRAFTS.owner, DRAFTS.repo, "main");
     await draftClient.rest(`${draftClient.repoPath(DRAFTS.owner, DRAFTS.repo)}/git/refs`, {
@@ -193,7 +202,33 @@ describe("runSveltiaTrace against the simulator", () => {
     });
     expect(report.ok).toBe(false);
     expect(report.blockedReason).toMatch(/already exists/);
-    await cleanupProbeBranch(draftClient, DRAFTS.owner, DRAFTS.repo, "admin-verification-taken", "main");
+    // No ownership claim exists for a branch this run did not create…
+    expect(report.claim).toBeUndefined();
+    // …so cleanup refuses, even when handed the very same name.
+    const cleanup = await cleanupProbeBranch(
+      draftClient,
+      DRAFTS.owner,
+      DRAFTS.repo,
+      "admin-verification-taken",
+      "main",
+    );
+    expect(cleanup.deleted).toBe(false);
+    expect(cleanup.reason).toBe("not-owned");
+    // The pre-existing branch is still there, at the same commit.
+    expect(await listBranches(draftClient, DRAFTS.owner, DRAFTS.repo)).toContain(
+      "admin-verification-taken",
+    );
+    expect(await getBranchHead(draftClient, DRAFTS.owner, DRAFTS.repo, "admin-verification-taken")).toBe(
+      head,
+    );
+
+    // A matching-looking claim still cannot delete it through this helper:
+    // the point of the test is that the *run* produced no claim, which is what
+    // the CLI passes. Clean the fixture up directly instead.
+    await draftClient.rest(
+      `${draftClient.repoPath(DRAFTS.owner, DRAFTS.repo)}/git/refs/heads/admin-verification-taken`,
+      { method: "DELETE" },
+    );
   });
 
   it("warns when the target repository is public, and does not claim verification", async () => {
@@ -225,7 +260,7 @@ describe("admin-verify-github CLI over real HTTP", () => {
         ["--import", "tsx", "scripts/admin-verify-github.ts", ...args],
         {
           cwd: process.cwd(),
-          env: { ...process.env, ...env, GITHUB_API_ROOT: server.url },
+          env: { ...process.env, ...env, GITHUB_API_ROOT: env["GITHUB_API_ROOT"] ?? server.url },
           stdio: ["pipe", "pipe", "pipe"],
         },
       );
@@ -297,5 +332,119 @@ describe("admin-verify-github CLI over real HTTP", () => {
     );
     expect(result.code).toBe(2);
     expect(result.stderr).toMatch(/never writes to main/);
+  });
+
+  /* ── End-to-end refusal over real HTTP against a second simulator ──────────
+     These use the CLI's own process, its own argument parsing and its own
+     exit codes, so a regression in the CLI (not just in the library) fails
+     here. GITHUB_API_ROOT is only honoured for a localhost URL. */
+  describe("public repositories are refused end to end", () => {
+    let other: MockGithubServer;
+
+    beforeAll(async () => {
+      other = await startMockGithub(
+        fixtureWithRepos({
+          repos: [
+            { owner: "calesteer-create", name: "site-assets", isPrivate: false },
+            { owner: "calesteer-create", name: "private-but-renamed", isPrivate: true },
+          ],
+        }),
+      );
+    });
+    afterAll(async () => {
+      await other.close();
+    });
+
+    function runAgainst(args: string[], stdin: string) {
+      return runCli(args, stdin, { GITHUB_API_ROOT: other.url });
+    }
+
+    it("refuses a public repo whose name is not the site repo, even with --yes", async () => {
+      const result = await runAgainst(
+        ["--repo", "calesteer-create/site-assets", "--branch", "admin-verification-e2e", "--token-stdin", "--yes"],
+        WRITE_TOKEN,
+      );
+      expect(result.code).toBe(3);
+      expect(result.stderr).toMatch(/private=false/);
+      expect(result.stderr).toMatch(/cannot be overridden with --yes/);
+      // No verdict, no token, and — the point — nothing written anywhere.
+      expect(result.stdout).not.toContain(WRITE_TOKEN);
+      expect(result.stderr).not.toContain(WRITE_TOKEN);
+      expect(
+        other.state.requests.filter((entry) => entry.method !== "GET"),
+      ).toEqual([]);
+    });
+
+    it("succeeds on a renamed PRIVATE repository, proving the rule is visibility not name", async () => {
+      const result = await runAgainst(
+        [
+          "--repo",
+          "calesteer-create/private-but-renamed",
+          "--branch",
+          "admin-verification-e2e-private",
+          "--token-stdin",
+          "--yes",
+          "--json",
+          "skip",
+        ],
+        WRITE_TOKEN,
+      );
+      expect(result.code).toBe(0);
+      expect(result.stdout).toMatch(/is PRIVATE/);
+      // The branch it created was removed again by the same run.
+      expect(result.stdout).toMatch(/deleted scratch branch/);
+      const branches = await listBranches(client(WRITE_TOKEN, other.url), "calesteer-create", "private-but-renamed");
+      expect(branches).toEqual(["main"]);
+    }, 60_000);
+
+    it("leaves a pre-existing scratch branch untouched and exits 2", async () => {
+      const target = { owner: "calesteer-create", repo: "private-but-renamed" };
+      const head = (await getBranchHead(client(WRITE_TOKEN, other.url), target.owner, target.repo, "main"))!;
+      await createBranch(client(WRITE_TOKEN, other.url), target.owner, target.repo, "admin-verification-e2e-taken", head);
+      const before = await getBranchHead(client(WRITE_TOKEN, other.url), target.owner, target.repo, "admin-verification-e2e-taken");
+      // Count from here: the setup above is this test's own bookkeeping.
+      /* GraphQL is POST by nature; what matters is that no *mutation* ran.
+         REST writes and any graphql call after this point both count. */
+      /* Only requests made by this CLI invocation are examined. */
+      const since = other.state.requests.length;
+      const restWrites = (): number =>
+        other.state.requests
+          .slice(since)
+          .filter((entry) => entry.path !== "/graphql" && entry.method !== "GET").length;
+      const writesBefore = restWrites();
+
+      const result = await runAgainst(
+        [
+          "--repo",
+          "calesteer-create/private-but-renamed",
+          "--branch",
+          "admin-verification-e2e-taken",
+          "--token-stdin",
+          "--yes",
+          "--json",
+          "skip",
+        ],
+        WRITE_TOKEN,
+      );
+
+      expect(result.code).toBe(2);
+      expect(result.stderr).toMatch(/already exists/);
+      expect(result.stderr).toMatch(/left untouched/);
+      // Still there, at the same commit, with no probe file added.
+      expect(
+        await getBranchHead(client(WRITE_TOKEN, other.url), target.owner, target.repo, "admin-verification-e2e-taken"),
+      ).toBe(before);
+      /* The only REST writes allowed are read-only-post GraphQL calls; no
+         REST create/delete of any kind may appear. */
+      expect(restWrites()).toBe(writesBefore);
+      /* No ref was created or deleted: the only /git/refs traffic permitted is
+         the read the CLI performs to discover the branch already exists. */
+      const refWrites = other.state.requests.slice(since).filter(
+        (entry) =>
+          /\/git\/refs/.test(entry.path) &&
+          (entry.method === "POST" || entry.method === "DELETE" || entry.method === "PATCH"),
+      );
+      expect(refWrites).toEqual([]);
+    }, 60_000);
   });
 });

@@ -32,13 +32,18 @@ import {
   GithubError,
   describeScopes,
   listBranches,
+  resolveApiRoot,
   type RepoInfo,
 } from "../src/github/client";
 import {
   PROBE_FILE_DEFAULT,
   SVELTIA_CMS_VERSION,
   cleanupProbeBranch,
+  needsAttention,
   runSveltiaTrace,
+  type CleanupResult,
+  type ProbeBranchClaim,
+  type ProbeCommitProof,
   type TraceReport,
 } from "../src/github/sveltia-traces";
 import { DRAFT_BRANCH, PUBLIC_REPO, classifyRepo, normalizeRepo, resolveDraftRepo } from "../src/media/repo-guard";
@@ -109,12 +114,30 @@ function printHelp(): void {
 
 The token is never stored or printed. Use a fine-grained PAT limited to the
 drafts repository with Contents: Read and write (Metadata: Read is automatic).
+
+Hard rules (there is no option to override them):
+  • the target repository must be PRIVATE per GitHub; a public repository is
+    refused before any branch or commit is created — --yes does not bypass it;
+  • the public site repository is always refused, as is the default branch;
+  • an existing scratch branch is rejected, never reused and never deleted;
+  • only a branch this run provably created is ever deleted.
 `);
 }
 
+/** Exit 2 = the request was refused before anything was attempted. */
 function fail(message: string): never {
   console.error(`✗ ${message}`);
   process.exit(2);
+}
+
+/**
+ * Exit 3 = GitHub itself told us the target is not safe (not private), or the
+ * run was blocked after metadata. Kept separate from 2 so scripts can tell
+ * "you asked for the wrong thing" from "the repository is not private".
+ */
+function blocked(message: string): never {
+  console.error(`✗ ${message}`);
+  process.exit(3);
 }
 
 /** Hidden TTY prompt; falls back to stdin when there is no terminal. */
@@ -208,7 +231,9 @@ interface Verdict {
   token: { kind: string; scopes: string; permissions: string };
   steps: Array<{ id: string; action: string; ok: boolean; note: string; error?: string }>;
   findings: string[];
-  cleanup: string;
+  cleanup: { reason: string; note: string; deleted: boolean };
+  /** Branch this run created, when it did. */
+  scratchBranch: { name: string; created: boolean; baseOid: string | null };
   blockedReason?: string;
   at: string;
 }
@@ -227,6 +252,10 @@ async function main(): Promise<void> {
     );
   }
 
+  /* The API root is api.github.com unless a localhost-only test override is
+     set; a token is never sent to an arbitrary host (src/github/client.ts). */
+  const apiRoot = resolveApiRoot();
+  const endpoint = apiRoot === "https://api.github.com" ? "GitHub" : `LOCAL TEST ENDPOINT ${apiRoot}`;
   const token = options.tokenStdin ? await readStdinToken() : await promptToken();
   const problem = sanityCheckToken(token);
   if (problem) fail(problem);
@@ -240,9 +269,11 @@ async function main(): Promise<void> {
   console.log(`  cms:    @sveltia/cms@${SVELTIA_CMS_VERSION}`);
   console.log(`  repo:   ${resolution.repo}${classifyRepo(resolution.repo) === "draft" ? "" : " (non-default name)"}`);
   console.log(`  branch: ${branch} (scratch; never ${DRAFT_BRANCH})`);
-  console.log(`  token:  not logged, not saved\n`);
+  console.log(`  token:  not logged, not saved`);
+  if (apiRoot !== "https://api.github.com") console.log(`  ⚠ endpoint: ${endpoint} (test override, localhost only)\n`);
+  else console.log("");
 
-  const client = new GithubClient({ token });
+  const client = new GithubClient({ token, apiRoot });
   const findings: string[] = [];
   let repoInfo: RepoInfo | null = null;
   let tokenKind = "unknown";
@@ -268,7 +299,9 @@ async function main(): Promise<void> {
   // Classic tokens report scopes in a header; fine-grained ones do not. The
   // classification below is informational — permissions are what matter.
   try {
-    const response = await fetch("https://api.github.com/user", {
+    // Same host the token was configured for: a token must never be sent to a
+    // host other than the one this run targets.
+    const response = await fetch(`${apiRoot}/user`, {
       headers: { Authorization: `token ${token}`, "User-Agent": "math-7th-admin-probe" },
     });
     scopes = describeScopes(response.headers.get("x-oauth-scopes"));
@@ -277,11 +310,22 @@ async function main(): Promise<void> {
     scopes = "unavailable";
   }
 
-  console.log(`✓ ${repoInfo.full_name} is ${repoInfo.private ? "PRIVATE" : "PUBLIC"}`);
-  if (!repoInfo.private) {
-    findings.push(
-      "⚠ The repository is public. That does NOT prove private-repository support (requirement 6).",
+  /* HARD STOP — draft content is only ever written to a private repository.
+     This check runs before the confirmation prompt, before any branch is
+     created and before any commit. `--yes` is a prompt-skipper, not an
+     override: it cannot get past this. */
+  if (repoInfo.private !== true) {
+    blocked(
+      `refusing to verify ${repoInfo.full_name}: GitHub reports private=${String(repoInfo.private)}.\n` +
+        "  Draft content is only ever written to a PRIVATE repository; a public one would publish it.\n" +
+        "  Nothing was created and nothing was changed. This cannot be overridden with --yes.\n" +
+        "  Point --repo (or $DRAFT_REPO) at the private drafts repository instead.",
     );
+  }
+
+  console.log(`✓ ${repoInfo.full_name} is PRIVATE`);
+  if (repoInfo.full_name.toLowerCase() === PUBLIC_REPO.toLowerCase()) {
+    blocked("that is the public site repository — refusing. Nothing was created.");
   }
   console.log(`  default branch: ${repoInfo.default_branch}`);
   console.log(`  token kind:     ${tokenKind} (scopes: ${scopes})`);
@@ -289,6 +333,18 @@ async function main(): Promise<void> {
   console.log(
     `  push/maintain/admin: ${String(perms?.push ?? false)} / ${String(perms?.maintain ?? false)} / ${String(perms?.admin ?? false)}`,
   );
+
+  /* Refuse a pre-existing scratch branch up front: it belongs to someone else
+     (or to an earlier interrupted run) and must not be reused or deleted. */
+  const presentBranches = await listBranches(client, owner, repoName).catch(() => [] as string[]);
+  if (presentBranches.includes(branch)) {
+    console.error(
+      `✗ scratch branch "${branch}" already exists in ${resolution.repo}.\n` +
+        "  It is left untouched: this script only ever deletes branches it created itself.\n" +
+        "  Delete it yourself if it is yours, or pass --branch with a fresh name.\n",
+    );
+    process.exit(2);
+  }
 
   if (!options.yes) {
     const proceed = await confirm(
@@ -302,11 +358,16 @@ async function main(): Promise<void> {
     }
   }
 
-  const report: TraceReport = await runTraceAndCleanup(token, owner, repoName, branch, options, repoInfo);
+  const { report, cleanup: cleanupResult } = await runTraceAndCleanup(token, owner, repoName, branch, options, repoInfo, apiRoot);
+  const cleanupVerdict = {
+    reason: cleanupResult.reason,
+    note: cleanupResult.note,
+    deleted: cleanupResult.deleted,
+  };
 
   const verdict: Verdict = {
     cms: `@sveltia/cms@${SVELTIA_CMS_VERSION}`,
-    verified: report.ok && repoInfo.private === true,
+    verified: report.ok && repoInfo.private === true && report.claim !== undefined,
     repo: repoInfo.full_name,
     private: repoInfo.private,
     token: { kind: tokenKind, scopes, permissions: `push=${String(perms?.push ?? false)}` },
@@ -318,7 +379,12 @@ async function main(): Promise<void> {
       ...(step.error ? { error: `${step.error.kind}: ${step.error.message}` } : {}),
     })),
     findings: [...findings, ...report.findings],
-    cleanup: report.cleanup ?? "not attempted",
+    cleanup: cleanupVerdict,
+    scratchBranch: {
+      name: branch,
+      created: report.claim !== undefined,
+      baseOid: report.claim?.baseOid ?? null,
+    },
     at: new Date().toISOString(),
     ...(report.blockedReason ? { blockedReason: report.blockedReason } : {}),
   };
@@ -339,41 +405,74 @@ async function runTraceAndCleanup(
   branch: string,
   options: CliOptions,
   repoInfo: RepoInfo,
-): Promise<TraceReport & { cleanup?: string }> {
-  const client = new GithubClient({ token });
-  let report: TraceReport & { cleanup?: string };
+  apiRoot?: string,
+): Promise<{ report: TraceReport; cleanup: CleanupResult }> {
+  const client = new GithubClient({ token, ...(apiRoot ? { apiRoot } : {}) });
+  const emptyReport: TraceReport = { ok: false, steps: [], findings: [] };
+  /** Ownership proof, filled the moment GitHub confirms our branch creation. */
+  let claim: ProbeBranchClaim | undefined;
+  let commit: ProbeCommitProof | undefined;
+  let report: TraceReport = emptyReport;
+  let thrown: unknown;
+
   try {
     report = await runSveltiaTrace(client, {
       owner,
       repo: repoName,
       branch,
+      onCreateBranch: (proof) => {
+        claim = proof;
+      },
       onStep: (result) => {
         const mark = result.ok ? "✓" : "✗";
         console.log(`  ${mark} ${result.step.action} — ${result.note}`);
         if (result.error) console.log(`      ${result.error.advice}`);
       },
     });
-  } finally {
-    if (options.keepBranch) {
-      const branches = await listBranches(client, owner, repoName).catch(() => [] as string[]);
-      const note = branches.includes(branch)
-        ? `kept scratch branch ${branch} (--keep-branch). Delete it with: gh api -X DELETE repos/${owner}/${repoName}/git/refs/heads/${branch}`
-        : `nothing to clean up (branch ${branch} was not created)`;
-      console.log(`\n  ${note}`);
-      (report ??= { ok: false, steps: [], findings: [] }).cleanup = note;
-    } else {
-      const cleanup = await cleanupProbeBranch(client, owner, repoName, branch, repoInfo.default_branch);
-      console.log(`\n  ${cleanup.ok ? "✓" : "✗"} ${cleanup.note}`);
-      (report ??= { ok: false, steps: [], findings: [] }).cleanup = cleanup.note;
-      if (!cleanup.ok) {
-        console.error(
-          `\n  ⚠ Could not remove the scratch branch. Delete it manually before re-running:\n` +
-            `    gh api -X DELETE repos/${owner}/${repoName}/git/refs/heads/${branch}\n`,
-        );
-      }
+    claim ??= report.claim;
+    commit = report.commit;
+  } catch (error) {
+    thrown = error;
+  }
+
+  /* Cleanup runs even when the trace threw. It only ever sees a claim that was
+     produced by a confirmed createRef from this process; without one it refuses
+     to delete anything. */
+  let cleanup: CleanupResult;
+  if (options.keepBranch) {
+    const note =
+      claim === undefined
+        ? `no branch to keep: this run did not create ${branch}`
+        : `kept scratch branch ${branch} (--keep-branch). Delete it with: ` +
+          `gh api -X DELETE repos/${owner}/${repoName}/git/refs/heads/${branch}`;
+    console.log(`\n  ${note}`);
+    cleanup = { ok: true, deleted: false, reason: "absent", note };
+  } else {
+    cleanup = await cleanupProbeBranch(
+      client,
+      owner,
+      repoName,
+      branch,
+      repoInfo.default_branch,
+      claim,
+      commit,
+    );
+    console.log(`\n  ${cleanup.ok && !needsAttention(cleanup) ? "✓" : "!"} ${cleanup.note}`);
+    if (needsAttention(cleanup)) {
+      console.error(
+        `\n  ⚠ The scratch branch may still exist and could not be removed safely:\n` +
+          `    ${cleanup.note}\n` +
+          `    Inspect it before deleting anything by hand:\n` +
+          `      gh api repos/${owner}/${repoName}/branches/${branch}\n` +
+          `    Then, only if you are sure it is the probe branch:\n` +
+          `      gh api -X DELETE repos/${owner}/${repoName}/git/refs/heads/${branch}\n` +
+          `    No destructive retry was attempted by this script.\n`,
+      );
     }
   }
-  return report;
+
+  if (thrown !== undefined) throw thrown;
+  return { report, cleanup };
 }
 
 function confirm(question: string): Promise<boolean> {
@@ -393,7 +492,7 @@ function printReport(verdict: Verdict): void {
   console.log("─────────────────────────────────────────────");
   for (const finding of verdict.findings) console.log(`  • ${finding}`);
   if (verdict.blockedReason) console.log(`  ✗ blocked: ${verdict.blockedReason}`);
-  console.log(`  cleanup: ${verdict.cleanup}`);
+  console.log(`  cleanup: ${verdict.cleanup.note}`);
   if (verdict.verified) {
     console.log(
       "\nNext step (still required before calling Sveltia verified): open /admin/ in a browser,\n" +

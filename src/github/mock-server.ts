@@ -597,6 +597,37 @@ export const SAMPLE_LESSON = JSON.stringify(
   2,
 );
 
+/**
+ * A fixture shaped like `defaultFixture()` with extra repositories appended and
+ * selected tokens that keep access to them. Used by the safety tests to model
+ * "a public repository with a different name", "a private repo that GitHub
+ * reports oddly", etc.
+ */
+export function fixtureWithRepos(options: {
+  repos?: Array<{ owner: string; name: string; isPrivate: boolean; files?: Record<string, string> }>;
+}): MockGithubState {
+  const state = defaultFixture();
+  const extra = (options.repos ?? []).filter(
+    (candidate) =>
+      !state.repos.some(
+        (repo) =>
+          repo.owner.toLowerCase() === candidate.owner.toLowerCase() &&
+          repo.name.toLowerCase() === candidate.name.toLowerCase(),
+      ),
+  );
+  for (const candidate of extra) {
+    state.repos.push(
+      createRepo({
+        owner: candidate.owner,
+        name: candidate.name,
+        isPrivate: candidate.isPrivate,
+        files: candidate.files ?? { "content/README.md": "# fixture\n" },
+      }),
+    );
+  }
+  return state;
+}
+
 export function defaultFixture(options: FixtureOptions = {}): MockGithubState {
   const files: Record<string, string> = {
     "content/README.md": "# drafts\n",
