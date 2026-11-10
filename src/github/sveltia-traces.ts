@@ -44,6 +44,7 @@ import {
   readFileAtRef,
   viewerCanPush,
   type GithubClient,
+  type RepoInfo,
 } from "./client";
 import { isSameRepo, verifyWritePreconditions } from "../media/repo-guard";
 
@@ -82,6 +83,13 @@ export const SVELTIA_TRACE: readonly TraceStep[] = [
     action: "Ask GitHub whether this user may push to the branch",
     evidence: "extracted",
     detail: "YIe(): ref(qualifiedName){ refUpdateRule { viewerCanPush } } — used to decide whether editing is read-only.",
+  },
+  {
+    id: "repo-refresh",
+    action: "Re-read repository metadata immediately before writing",
+    evidence: "documented",
+    detail:
+      "REST GET /repos/{owner}/{repo} again, after all reads: visibility, name and permissions are the ones that decide the write, never the earlier cached answer.",
   },
   {
     id: "branch-ref",
@@ -447,23 +455,121 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
     findings.push(`Could not resolve the head of ${defaultBranch}; skipping the write steps.`);
     return finish();
   }
-  /* Final pre-write gate. The branch question is answered by an *exact* ref
-     lookup, never by a branch listing and never by swallowing an error:
-       - confirmed 404  → absent, we may create it;
-       - present        → somebody's branch: refused, left untouched;
-       - anything else  → unknown: refused, because an API error is not proof
-                          of absence.
-     This runs immediately before `createRef`, and `runSveltiaTrace` re-checks
-     the same policy through `verifyWritePreconditions()`. */
+  /* ── Final pre-write gate ────────────────────────────────────────────────
+     Everything that decides this write is re-fetched here, as late as possible,
+     so no cached answer can authorise a write that the current state forbids:
+
+       1. repository metadata is re-read (TOCTOU: the repository may have been
+          made public since the first read);
+       2. the exact scratch-branch ref is re-checked — confirmed 404 means
+          absent, anything else means "not proven";
+       3. `verifyWritePreconditions()` runs once more with *that* evidence.
+
+     A failed or incomplete refresh is a refusal: a stale success is never
+     carried forward. */
+
+  /* 1 — fresh metadata. No `run()` step wrapper: a failure must block, not be
+     recorded as a soft finding. */
+  let freshInfo: RepoInfo | undefined;
+  try {
+    freshInfo = await getRepo(client, options.owner, options.repo);
+  } catch (error) {
+    freshInfo = undefined;
+    const advice = error instanceof GithubError ? error.advice : (error as Error).message;
+    findings.push(`The final repository re-read failed: ${advice}`);
+  }
+  const freshStep = stepById("repo-refresh");
+  const freshStarted = Date.now();
+  const freshIncomplete =
+    !freshInfo ||
+    typeof freshInfo.full_name !== "string" ||
+    freshInfo.full_name.length === 0 ||
+    typeof freshInfo.private !== "boolean" ||
+    typeof freshInfo.default_branch !== "string";
+  const freshResult: TraceStepResult = freshIncomplete || !freshInfo
+    ? {
+        step: freshStep,
+        ok: false,
+        ms: Date.now() - freshStarted,
+        note: "metadata could not be re-read at the write boundary",
+        error: {
+          kind: "stale-response",
+          status: 0,
+          message: "the final repository re-read failed or was incomplete",
+          advice:
+            "Refusing to write on stale repository evidence. Check connectivity/permissions and re-run.",
+        },
+      }
+    : {
+        step: freshStep,
+        ok: freshInfo.private === true,
+        ms: Date.now() - freshStarted,
+        note: `${freshInfo.full_name} (${freshInfo.private ? "private" : "PUBLIC"}, push=${String(freshInfo.permissions?.push ?? false)})`,
+        ...(freshInfo.private === true
+          ? {}
+          : {
+              error: {
+                kind: "public-repository",
+                status: 0,
+                message: `${freshInfo.full_name} is no longer private (private=${String(freshInfo.private)})`,
+                advice:
+                  "Drafts are never written to a public repository. Nothing was created.",
+              },
+            }),
+      };
+  steps.push(freshResult);
+  options.onStep?.(freshResult);
+
+  if (freshIncomplete) {
+    blockedReason =
+      "could not re-read the repository immediately before writing; a cached check is not permission to continue. Nothing was created.";
+    findings.push(blockedReason);
+    return finish();
+  }
+  const fresh = freshInfo as RepoInfo;
+  if (fresh.private !== true) {
+    blockedReason =
+      `${fresh.full_name} reports private=${String(fresh.private)} at the write boundary ` +
+      "(it may have been made public since the first read). Refusing to write. Nothing was created.";
+    findings.push(blockedReason);
+    return finish();
+  }
+  if (!isSameRepo(fresh.full_name, requested)) {
+    blockedReason =
+      `the repository answered for ${fresh.full_name} at the write boundary, not ${requested}. Nothing was created.`;
+    findings.push(blockedReason);
+    return finish();
+  }
+  if (fresh.default_branch !== defaultBranch) {
+    blockedReason =
+      `the default branch changed from ${defaultBranch} to ${fresh.default_branch} during the run; ` +
+      "refusing to write. Nothing was created.";
+    findings.push(blockedReason);
+    return finish();
+  }
+
+  const freshAccess = fresh.permissions
+    ? {
+        full_name: fresh.full_name,
+        push: fresh.permissions.push === true,
+        pull: fresh.permissions.pull,
+        reported: true,
+      }
+    : null;
+
+  /* 2 — exact ref evidence, taken after the refresh so it is the freshest fact
+     in the run. Confirmed 404 only; anything else is "not proven". */
   const branchEvidence = await probeBranchExistence(client, options.owner, options.repo, branch);
   options.onBranchEvidence?.(branchEvidence);
+
+  /* 3 — the same single policy, with fresh evidence and nothing cached. */
   const writeVerdict = verifyWritePreconditions({
     requestedRepo: requested,
-    visibility: repoInfo,
-    access,
+    visibility: { full_name: fresh.full_name, private: fresh.private },
+    access: freshAccess,
     branchExistence: branchEvidence,
     branch,
-    defaultBranch,
+    defaultBranch: fresh.default_branch,
   });
   if (!writeVerdict.writable) {
     blockedReason =

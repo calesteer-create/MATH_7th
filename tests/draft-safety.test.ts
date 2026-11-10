@@ -779,3 +779,154 @@ describe("branch lookup fails closed (finding 3)", () => {
     }
   });
 });
+
+describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
+  const DRAFTS_REPO = { owner: "calesteer-create", repo: "MATH_7th-drafts" };
+
+  function writesIn(state: ReturnType<typeof fixtureWithRepos>, since: number): string[] {
+    return state.requests
+      .slice(since)
+      .filter(
+        (entry) =>
+          entry.path !== "/graphql" &&
+          (entry.method === "POST" || entry.method === "DELETE" || entry.method === "PATCH"),
+      )
+      .map((entry) => `${entry.method} ${entry.path}`);
+  }
+
+  it("refuses to write when the repository becomes public between the first read and the gate", async () => {
+    const state = fixtureWithRepos({});
+    const server = await startMockGithub(state);
+    try {
+      const client = makeClient(server);
+      const since = state.requests.length;
+
+      /* Flip the repository to public after GitHub has answered the repository
+         metadata request (the first read) but before the write boundary. The
+         trace's cached `repoInfo` still says private; only a fresh read at the
+         gate can catch this. */
+      let flipped = false;
+      state.afterRequest = (entry, repoName) => {
+        if (
+          !flipped &&
+          entry.method === "GET" &&
+          repoName === DRAFTS_REPO.repo &&
+          /^\/repos\/[^/]+\/[^/]+$/.test(entry.path)
+        ) {
+          flipped = true;
+          const repo = state.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo)!;
+          repo.private = false;
+        }
+      };
+
+      const report = await runSveltiaTrace(client, {
+        owner: DRAFTS_REPO.owner,
+        repo: DRAFTS_REPO.repo,
+        branch: "admin-verification-toctou-public",
+      });
+
+      expect(flipped).toBe(true); // the flip really happened mid-run
+      expect(report.ok).toBe(false);
+      expect(report.blockedReason).toMatch(/private=false/);
+      // No ownership claim, no branch, no commit.
+      expect(report.claim).toBeUndefined();
+      expect(report.commit).toBeUndefined();
+      expect(writesIn(state, since)).toEqual([]);
+      expect(state.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo)!.branches.has(
+        "admin-verification-toctou-public",
+      )).toBe(false);
+      // The refresh step is what caught it, and it is visible in the report.
+      const refresh = report.steps.find((step) => step.step.id === "repo-refresh");
+      expect(refresh?.ok).toBe(false);
+      expect(report.steps.some((step) => step.step.id === "create-ref")).toBe(false);
+    } finally {
+      state.afterRequest = undefined;
+      await server.close();
+    }
+  });
+
+  it("refuses to write when the final metadata refresh fails", async () => {
+    const state = fixtureWithRepos({});
+    const server = await startMockGithub(state);
+    try {
+      const client = makeClient(server);
+      const since = state.requests.length;
+      // Let the first metadata read through, then break every later metadata read.
+      let firstReadDone = false;
+      state.afterRequest = (entry, repoName) => {
+        if (
+          entry.method === "GET" &&
+          repoName === DRAFTS_REPO.repo &&
+          /^\/repos\/[^/]+\/[^/]+$/.test(entry.path)
+        ) {
+          firstReadDone = true;
+        }
+      };
+      let metadataReads = 0;
+      state.failOn = (entry) => {
+        if (entry.method !== "GET" || !/^\/repos\/[^/]+\/[^/]+$/.test(entry.path)) return false;
+        metadataReads += 1;
+        return firstReadDone && metadataReads > 1;
+      };
+
+      const report = await runSveltiaTrace(client, {
+        owner: DRAFTS_REPO.owner,
+        repo: DRAFTS_REPO.repo,
+        branch: "admin-verification-toctou-refresh-fails",
+      });
+
+      expect(report.ok).toBe(false);
+      expect(report.blockedReason).toMatch(/could not re-read the repository/);
+      expect(report.claim).toBeUndefined();
+      expect(report.commit).toBeUndefined();
+      expect(writesIn(state, since)).toEqual([]);
+      expect(report.steps.find((step) => step.step.id === "repo-refresh")?.ok).toBe(false);
+    } finally {
+      state.afterRequest = undefined;
+      state.failOn = undefined;
+      await server.close();
+    }
+  });
+
+  it("refuses when the refresh reports a different repository", async () => {
+    const state = fixtureWithRepos({});
+    const server = await startMockGithub(state);
+    try {
+      const client = makeClient(server);
+      const since = state.requests.length;
+      let firstReadDone = false;
+      state.afterRequest = (entry, repoName) => {
+        if (
+          entry.method === "GET" &&
+          repoName === DRAFTS_REPO.repo &&
+          /^\/repos\/[^/]+\/[^/]+$/.test(entry.path)
+        ) {
+          firstReadDone = true;
+        }
+      };
+      state.failOn = (entry) => false;
+      // Answer the second metadata read with a *renamed* repository by hijacking
+      // the repo's own name in the fixture after the first read.
+      const original = state.afterRequest;
+      state.afterRequest = (entry, repoName) => {
+        original?.(entry, repoName);
+        if (firstReadDone) {
+          const repo = state.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo);
+          if (repo) repo.fullNameOverride = "calesteer-create/somewhere-else";
+        }
+      };
+
+      const report = await runSveltiaTrace(client, {
+        owner: DRAFTS_REPO.owner,
+        repo: DRAFTS_REPO.repo,
+        branch: "admin-verification-toctou-renamed",
+      });
+      expect(report.ok).toBe(false);
+      expect(report.blockedReason).toMatch(/not calesteer-create\/MATH_7th-drafts|answered for/);
+      expect(writesIn(state, since)).toEqual([]);
+    } finally {
+      state.afterRequest = undefined;
+      await server.close();
+    }
+  });
+});

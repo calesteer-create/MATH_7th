@@ -50,6 +50,11 @@ export interface MockRepo {
   owner: string;
   name: string;
   private: boolean;
+  /**
+   * Lets a test make GitHub answer with a different `full_name` than the one
+   * requested (a rename/redirect), to prove the write gate compares identity.
+   */
+  fullNameOverride?: string;
   defaultBranch: string;
   /** branch → path → utf8 content */
   branches: Map<string, Map<string, string>>;
@@ -102,6 +107,13 @@ export interface MockGithubState {
    * which is the case the probe must not mistake for proof of write access.
    */
   reportUserPush?: boolean;
+  /**
+   * Runs after a request has been served, with the resolved repository (when the
+   * path named one). Used by tests to change state *between* two calls — for
+   * example flippnig a repository from private to public after the first
+   * metadata read and before the write boundary.
+   */
+  afterRequest?: (entry: { method: string; path: string }, repoName: string | null) => void;
   /**
    * Deterministic failure injection: when it returns true, that request answers
    * 500 (before the retry budget is consumed). Used to fail one specific call
@@ -240,8 +252,15 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
     state.requests.push(entry);
     const extra: Record<string, string> = { ...headers };
     if (state.rateLimited) extra["x-ratelimit-remaining"] = "0";
-    if (raw !== undefined) return text(res, status, raw, extra);
-    return json(res, status, body, extra);
+    if (raw !== undefined) {
+      text(res, status, raw, extra);
+    } else {
+      json(res, status, body, extra);
+    }
+    if (state.afterRequest) {
+      const match = /^\/repos\/([^/]+)\/([^/]+)/.exec(entry.path);
+      state.afterRequest({ method: entry.method, path: entry.path }, match?.[2] ?? null);
+    }
   };
 
   const body = await readBody(req);
@@ -436,7 +455,7 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
     return respond(
       200,
       {
-        full_name: `${repo.owner}/${repo.name}`,
+        full_name: repo.fullNameOverride ?? `${repo.owner}/${repo.name}`,
         private: repo.private,
         default_branch: repo.defaultBranch,
         visibility: repo.private ? "private" : "public",

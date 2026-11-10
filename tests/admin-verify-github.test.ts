@@ -100,6 +100,7 @@ describe("runSveltiaTrace against the simulator", () => {
       "file-list",
       "read-entry",
       "read-blob",
+      "repo-refresh",
       "branch-ref",
       "create-ref",
       "write",
