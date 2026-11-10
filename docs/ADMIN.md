@@ -27,9 +27,30 @@
 ## 2. كيف تعمل اللوحة
 
 ```
-public/admin/index.html   صفحة ثابتة: بانر «تجريبي»، شرح التوكن، ثم Sveltia
+public/admin/index.html   صفحة ثابتة: بانر «تجريبي»، شرح التوكن، ثم محرر Sveltia
 public/admin/config.yml   مولَّد من src/media/cms-config.ts (لا يُحرَّر يدويًا)
 ```
+
+### نقطة التركيب (mount point)
+
+Sveltia 0.262.1 تُركَّب على `#nc-root` إن وُجد، وعلى `<body>` إن غاب:
+
+```js
+// services/api/methods/init.js — من مصدر الحزمة المثبَّتة
+mount(App, { target: document.querySelector('#nc-root') ?? document.body, props: { config } });
+```
+
+- الصفحة تحمل `<div id="nc-root"></div>` **خارج** `<main class="notice">`، لأن
+  المحرر يستبدل محتوى هدفه — فلو كان داخلها لابتلع بانر التحذير.
+- المعرّف السابق `#cms-mount` **لا معنى له**: لا يظهر في الحزمة إطلاقًا، فكان
+  المحرر يسقط إلى `<body>`. وتركيب `<body>` يغطّي الشاشة كلها ويضيف
+  `body:not(:has(#nc-root)) { overflow: hidden }` (في `components/app.svelte`)،
+  فكان البانر يُغطّى ويُقفل تمرير الصفحة. الآن `<body>` يحتفظ بتمريره،
+  و`#nc-root > .sui.app-shell` بموضع `absolute` داخل صندوقه، فيبقى التحذير مقروءًا.
+- شاشات أصغر من `40rem`: البانر يتمرّر بعيدًا ويأخذ المحرر الشاشة كاملة.
+- **لا تهيئة يدوية**: وسم `<script>` كلاسيكي ينتهي بـ`/sveltia-cms.js` يُقلع
+  تلقائيًا (`lib/main.js`). إضافة `type="module"` تُعطّل ذلك، و`CMS.init()` غير
+  مستخدمة هنا. `tests/admin-config.test.ts` يثبّت هذا كله.
 
 - الخادم (backend) هو `github`، والمستودع هو **مستودع المسودات الخاص**، وهو
   **مثبَّت**: `calesteer-create/MATH_7th-drafts` ولا شيء غيره.
@@ -65,7 +86,9 @@ public/admin/config.yml   مولَّد من src/media/cms-config.ts (لا يُح
 ### الحالات
 
 - الوحدة: لا حالة نشر لها في النموذج (تظهر إذا كان فيها درس منشور) — لذلك لا
-  تحمل حقل حالة.
+  تحمل حقل حالة، **ولا تحمل `view_groups`**: التجميع يفلتر بقيمة حقل، ولا حقل
+  حالة/أرشفة موجود. (كان في الإعداد الأول `view_groups` يشير إلى `archived` غير
+  المعرَّف؛ وهذا **خطأ قاتل** لا تحذير — انظر «التحقق من أسماء الحقول» أدناه.)
 - الدرس: `status: draft | published`، و`publishedAt`، و`isLastInUnit`.
   «منشور» هنا **يعني جاهزًا للنشر في المسودات**، ولا ينشر شيئًا تلقائيًا.
 
@@ -138,6 +161,61 @@ npm run media:import -- --lesson 3 --from ~/scans/lesson-3 --dry-run
    وكل كتابة تستخدم علم `wx` فلا يُستبدل ملف قائم أبدًا.
 7. **تحديث ملف الدرس** بالحقول المشتقة (الموضع، الاسم، الأبعاد، sha256).
 8. **لا حذف**: الصور القديمة التي لم تعد في الدرس تُبلَّغ فقط.
+
+### حذف السجلات من المحرر
+
+`delete: false` في مجموعتَي الوحدات والدروس خيار **مدعوم وموثّق** في
+`@sveltia/cms@0.262.1`، لا زخرفة:
+
+```yaml
+# مخطط الحزمة (schema/sveltia-cms.json → EntryCollection.properties.delete)
+delete:
+  type: boolean
+  description: Whether to allow users to delete entries in the collection. Default: `true`.
+```
+
+والوقت التشغيلي يحترمه في ثلاثة مواضع:
+
+| الموضع | السطر |
+|---|---|
+| `services/contents/collection/view/index.js` | `const canDelete = !readonly && (_selectedCollection.delete ?? true);` |
+| `services/contents/editor/toolbar.js` | `const canDelete = !(collection?._type === 'entry' && collection.delete === false);` |
+| `components/workflow/workflow-entry-card.svelte` | `collection?._type === 'entry' ? collection.delete !== false : true` |
+
+فالنتيجة: زر الحذف يُخفى في قائمة السجلات وفي شريط المحرر. لكن **الحد الصادق**:
+هذا يمنع الحذف *من واجهة CMS* فقط. من يملك التوكن يستطيع حذف ملف عبر GitHub
+مباشرة، أو عبر `createCommitOnBranch` — وGitHub ينفّذ ما يسمح به التوكن. الحماية
+هنا تمنع الخطأ البشري، لا تمنع صاحب الصلاحية. (لا توجد حماية من الحذف على مستوى
+الفرع في هذا المستودع: `rulesets` فارغة، والحماية الحقيقية هي قصر التوكن على
+مستودع المسودات فقط.)
+
+### التحقق من أسماء الحقول (لماذا كان `archived` قاتلًا)
+
+Sveltia تتحقق من `view_groups` و`sortable_fields` **عند التحميل**، وتُبلّغ عن اسم
+حقل غير موجود كـ**خطأ** لا تحذير:
+
+```
+parseCmsConfig → parseCollections → parseEntryCollection
+  → checkViewOptions (services/config/parser/collections/views.js)
+  → addMessage() بنوعه الافتراضي 'error'  (parser/utils/validator.js:30)
+  → collectors.errors
+  → initCmsConfig يرمي «Errors found in configuration»  (services/config/init.js:112)
+  ⇒ صفحة الدخول تُستبدل بقائمة الأخطاء، ولا يُركَّب المحرر إطلاقًا.
+```
+
+مخطط JSON الرسمي **لا يكشف هذا**: `view_groups[].field` و`sortable_fields[]`
+نصوص حرّة فيه، فيمرّ التحقق بالمخطط بينما اللوحة معطّلة. لذلك:
+
+- `buildAdminConfig()` يرفض التوليد إن وُجد أي اسم غير مُعرَّف
+  (`undefinedFieldReferences` في `src/media/cms-config.ts`)، فلا يُكتب ملف معطوب.
+- `tests/admin-config.test.ts` يفحص الملف **المُلتزَم** لا المولّد فقط، ويفشل إن
+  أُعيد الخطأ. (مُثبَت: إعادة `archived` تُفشل 5 اختبارات.)
+
+**ما لا يُفحص عن قصد** لأنه لا يُفحص بأمان: `relation.value_field` و
+`display_fields` قوالب لا مسارات حقول، و`summary`/`slug.template` كذلك،
+والمسارات المتشعّبة (`images.0.file`) تُقارن بأسمائها العليا فقط. ومفاتيح Sveltia
+الخاصة المسموح بها دون حقل (`_summary`, `_manual`, `slug`, `commit_author`,
+`commit_date`) مسرودة صراحةً في `NON_FIELD_SORT_KEYS`.
 
 ### الحذف
 
@@ -219,7 +297,11 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
 2. أنشئ **Fine-grained PAT** مقصورًا على ذلك المستودع بصلاحية
    `Contents: Read and write` (و`Metadata: Read` تُضاف تلقائيًا). لا تشاركني إياه.
 3. شغّل `npm run admin:verify-github` وارفع/احفظ الناتج عندك.
-4. افتح `/admin/` (محليًا عبر `npm run dev` على `/admin/` أو على نسخة static)،
+4. افتح النسخة الثابتة: `npm run build:static && npm run preview:static` ثم
+   `http://localhost:4173/MATH_7th/admin/`. (على خادم Next لا يوجد مسار `/admin/`
+   للوحة Sveltia: الـmiddleware يحوّله إلى `/{locale}/admin` أي لوحة الخادم
+   المختلفة. الصفحة الثابتة متاحة هناك على `/admin/index.html` فقط، وتقرأ
+   الإعداد من `public/admin/config.yml` نفسه — وهو مناسب للفحص لا للتجربة الكاملة.)
    سجّل الدخول بالتوكن، وافتح وحدة واحدة، **عدّلها واحفظها**.
 5. تأكد أن commit ظهر في `MATH_7th-drafts` على `main`، وأن الصور وصلت WebP.
 6. شغّل `npm run media:sync -- --check` على شجرة المسودات.
@@ -289,7 +371,7 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
 | `tests/media-format.test.ts` | فحص النوع من البايتات، حدود الأبعاد، الأسماء الآمنة، توافقها مع `IMAGE_FILE_RE` |
 | `tests/media-pipeline.test.ts` | تحويل WebP فعلي، حذف EXIF/GPS من البايتات، عدم الكتابة خارج الجذر، `wx`، إعادة الاستخدام، منطق منع الحذف |
 | `tests/media-sync.test.ts` | إصلاح ما يرفعه المتصفح، idempotency، `--check`، `--dry-run`، اليتيم لا يُحذف |
-| `tests/admin-config.test.ts` | صلاحية YAML + مخطط Sveltia الرسمي، تطابق الحقول مع النموذج، حارس المستودع، صفحة `/admin/` |
+| `tests/admin-config.test.ts` | صلاحية YAML + مخطط Sveltia الرسمي، تطابق الحقول مع النموذج، **حلّ أسماء الحقول في `view_groups`/`sortable_fields`** (يفشل إن أُعيد `archived`)، حارس المستودع، نقطة التركيب `#nc-root`، ومطابقة بصمة SRI للحزمة المثبَّتة |
 | `tests/github-client.test.ts` | 401/403/404/409/422، المستودع الخاص، الصلاحيات، commits، تعارض `expectedHeadOid`، retry، rate limit |
 | `tests/admin-verify-github.test.ts` | تسلسل Sveltia كاملًا على المحاكي، عدم لمس `main`، رفض المستودع العام، تنظيف الفرع، CLI |
 | `tests/draft-safety.test.ts` | ملكية الفرع، رفض أي مستودع `private !== true`، عدم قابلية التجاوز، شروط الكتابة، وست حالات لدليل الفرع: غياب مؤكد / فرع موجود / 403 / 5xx أو شبكة / إجابة ناقصة / لا كتابة في كل الحالات الفاشلة |

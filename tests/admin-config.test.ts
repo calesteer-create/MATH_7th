@@ -1,13 +1,19 @@
 /**
  * The generated Sveltia config (PR 5).
  *
- * Three properties matter and are all tested here:
+ * What is tested here:
  *   1. the YAML is valid and accepted by Sveltia's own published JSON schema;
  *   2. every field maps onto the content model — no invented fields, no
- *      silently missing required ones (requirement 1);
- *   3. the backend can only ever point at the drafts repository, never at the
- *      public site (requirement 5).
+ *      silently missing required ones;
+ *   3. every name `view_groups`/`sortable_fields` refers to resolves to a real
+ *      field — Sveltia treats a dangling name as a fatal error, not a warning,
+ *      so the editor refuses to mount (the `archived` regression);
+ *   4. the backend can only ever point at the drafts repository, never at the
+ *      public site;
+ *   5. `public/admin/index.html` uses the mount element the CMS actually looks
+ *      for (`#nc-root`), self-initializes, and pins the installed bundle by SRI.
  */
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -16,10 +22,15 @@ import YAML from "yaml";
 import {
   ADMIN_CONFIG_PATH,
   ADMIN_STATUS,
+  CMS_MOUNT_ID,
   buildAdminConfig,
   currentAdminOptions,
+  declaredFieldNames,
   renderAdminConfig,
+  sortableFieldKeys,
   toYaml,
+  undefinedFieldReferences,
+  viewGroupFields,
 } from "@/media/cms-config";
 import { DRAFT_REPO_DEFAULT, PUBLIC_REPO, classifyRepo, resolveDraftRepo } from "@/media/repo-guard";
 
@@ -248,9 +259,118 @@ describe("content-model parity", () => {
   });
 
   it("disables deletion of content collections (no accidental data loss)", () => {
+    // `delete: false` is a documented per-collection option in Sveltia 0.262.1
+    // ("Whether to allow users to delete entries in the collection. Default:
+    // true."). The runtime honours it in three places:
+    //   - contents/collection/view/index.js:  canDelete = !readonly && (delete ?? true)
+    //   - contents/editor/toolbar.js:          canDelete = !(entry && delete === false)
+    //   - components/workflow/workflow-entry-card.svelte
+    // This pins both halves — the flag and the widget options it needs to be
+    // offered at all — so a generator edit cannot quietly re-enable deletion.
     for (const name of ["units", "lessons"]) {
       expect(collection(config, name)["delete"]).toBe(false);
+      expect(collection(config, name)["create"]).toBe(true);
     }
+  });
+});
+
+/**
+ * The `archived` regression (F1).
+ *
+ * Sveltia 0.262.1 treats `view_groups`/`sortable_fields` naming an undefined
+ * field as a **fatal** config error (`views.js` → `addMessage()` default type
+ * `error` → `collectors.errors` → `initCmsConfig` throws → the entrance page
+ * shows the error list instead of the sign-in form; the editor never mounts).
+ * The published JSON schema accepts any string there, so schema validation
+ * alone passed while the panel was unusable.
+ *
+ * These tests compare every such name against the collection's own `fields`,
+ * which is the same lookup Sveltia performs, so the regression cannot return.
+ */
+describe("field references resolve (the F1 regression)", () => {
+  const config = committedConfig();
+  const collections = (): Collection[] =>
+    (config["collections"] as Collection[]).filter((entry) => !entry.divider);
+
+  it("has no view group or sort key pointing at an undefined field", () => {
+    const offenders = collections()
+      .map((entry) => ({ name: String(entry.name), missing: undefinedFieldReferences(entry) }))
+      .filter(({ missing }) => missing.length > 0);
+
+    expect(offenders, `Sveltia would refuse to mount: ${JSON.stringify(offenders)}`).toEqual([]);
+  });
+
+  it("has no view groups on the units collection at all", () => {
+    // The content model gives units no publish/archive state (docs/CONTENT_MODEL.md
+    // §2, docs/ADMIN.md §2 «الحالات»), so there is no field a group could filter on.
+    const units = collection(config, "units");
+    expect(units["view_groups"]).toBeUndefined();
+    expect(viewGroupFields(units)).toEqual([]);
+  });
+
+  it("keeps the lesson groups, which do refer to a real field", () => {
+    const lessons = collection(config, "lessons");
+    expect(viewGroupFields(lessons)).toEqual(["status", "status"]);
+    expect(declaredFieldNames(lessons)).toContain("status");
+  });
+
+  it("catches the exact `archived` mistake when it is reintroduced", () => {
+    const units = collection(config, "units");
+    const regressed: Collection = {
+      ...units,
+      view_groups: {
+        groups: [
+          { name: "published", label: "منشورة", field: "archived", eq: false },
+          { name: "archived", label: "مؤرشفة", field: "archived", eq: true },
+        ],
+      },
+    };
+    expect(undefinedFieldReferences(regressed)).toContain("archived");
+    // …and the pre-fix committed YAML is caught too, not just the generator.
+    const previousYaml = [
+      "collections:",
+      "  - name: units",
+      "    folder: content/units",
+      "    fields:",
+      '      - { name: "id", widget: number }',
+      "    view_groups:",
+      "      groups:",
+      '        - { name: published, field: archived, eq: false }',
+    ].join("\n");
+    const parsed = YAML.parse(previousYaml) as { collections: Collection[] };
+    expect(undefinedFieldReferences(parsed.collections[0]!)).toEqual(["archived"]);
+  });
+
+  it("flags an undefined key in sortable_fields but allows Sveltia's own keys", () => {
+    const units = collection(config, "units");
+    expect(undefinedFieldReferences({ ...units, sortable_fields: ["position", "nope"] })).toEqual([
+      "nope",
+    ]);
+    // `_summary`, `_manual`, `slug`, `commit_author`, `commit_date` are resolved
+    // without a field definition (parser/utils/fields.js `isNonFieldSortKey`,
+    // table-keys.js `SUMMARY_COLUMN_KEY`), so they must not be reported.
+    expect(
+      undefinedFieldReferences({
+        ...units,
+        sortable_fields: ["position", "_summary", "_manual", "slug", "commit_author", "commit_date"],
+      }),
+    ).toEqual([]);
+  });
+
+  it("reads both accepted shapes of view_groups and sortable_fields", () => {
+    const units = collection(config, "units");
+    expect(viewGroupFields({ ...units, view_groups: [{ field: "titleAr" }] })).toEqual(["titleAr"]);
+    expect(
+      sortableFieldKeys({ ...units, sortable_fields: { default: "position", fields: ["position"] } }),
+    ).toEqual(["position"]);
+    // A group with no `field` is not a field reference at all.
+    expect(viewGroupFields({ ...units, view_groups: { groups: [{ name: "x" }] } })).toEqual([]);
+  });
+
+  it("does not report nested relation templates as missing fields", () => {
+    // Deliberately out of scope: `value_field`/`display_fields` are templates.
+    const lessons = collection(config, "lessons");
+    expect(undefinedFieldReferences(lessons)).toEqual([]);
   });
 });
 
@@ -341,6 +461,36 @@ describe("public/admin/index.html", () => {
     expect(integrity?.[1]).not.toContain("REPLACE");
   });
 
+  it("pins the SRI hash of the CMS bundle that is actually installed", () => {
+    // The `integrity` attribute and node_modules must agree: if the pinned
+    // version is ever bumped without recomputing the hash, the browser blocks
+    // the script and the panel is dead — while every other test still passes.
+    const bundle = path.join(
+      process.cwd(),
+      "node_modules",
+      "@sveltia",
+      "cms",
+      "dist",
+      "sveltia-cms.js",
+    );
+    if (!fs.existsSync(bundle)) {
+      // `npm ci` always installs it; skip loudly rather than pass silently.
+      throw new Error(`cannot verify SRI: ${bundle} is missing`);
+    }
+    const digest = createHash("sha384").update(fs.readFileSync(bundle)).digest("base64");
+    const integrity = /integrity="(sha384-[A-Za-z0-9+/=]+)"/.exec(html)?.[1];
+    expect(integrity).toBe(`sha384-${digest}`);
+
+    // …and the pinned URL's version is the installed version.
+    const installed = JSON.parse(
+      fs.readFileSync(
+        path.join(process.cwd(), "node_modules", "@sveltia", "cms", "package.json"),
+        "utf8",
+      ),
+    ) as { version: string };
+    expect(html).toContain(`@sveltia/cms@${installed.version}/dist/sveltia-cms.js`);
+  });
+
   it("declares the experimental status and the drafts-only destination", () => {
     expect(html).toContain("EXPERIMENTAL");
     expect(html).toContain("MATH_7th-drafts");
@@ -356,5 +506,60 @@ describe("public/admin/index.html", () => {
   it("does not load any other third-party script", () => {
     const scripts = [...html.matchAll(/<script[^>]*src="([^"]+)"/g)].map((match) => match[1]);
     expect(scripts).toEqual(["https://unpkg.com/@sveltia/cms@0.262.1/dist/sveltia-cms.js"]);
+  });
+});
+
+/**
+ * The mount point (F2/F3).
+ *
+ * Sveltia 0.262.1 mounts on `#nc-root` or, failing that, on `<body>`
+ * (services/api/methods/init.js). `#cms-mount` — what this page used to carry —
+ * appears nowhere in the bundle, so the CMS fell back to `<body>`, was pinned
+ * to the whole viewport and added `overflow: hidden` to `<body>`, covering the
+ * experimental warning.
+ */
+describe("public/admin/index.html — Sveltia mount point", () => {
+  const html = fs.readFileSync(path.join(process.cwd(), "public", "admin", "index.html"), "utf8");
+  /** Where `#nc-root` sits in the document, as source offsets. */
+  const mountIndex = html.indexOf(`id="${CMS_MOUNT_ID}"`);
+
+  it("declares the mount element Sveltia actually looks for", () => {
+    expect(CMS_MOUNT_ID).toBe("nc-root");
+    expect(mountIndex).toBeGreaterThan(-1);
+    expect(html).toContain(`<div id="${CMS_MOUNT_ID}"></div>`);
+  });
+
+  it("no longer carries the id the CMS ignores", () => {
+    // `#cms-mount` was never a Sveltia mount point; only a comment may mention it.
+    expect(html).not.toMatch(/id="cms-mount"/);
+    expect(html).not.toContain("<div id=\"cms-mount\"");
+  });
+
+  it("keeps the mount element outside the notice, so the warning survives", () => {
+    const mainOpen = html.indexOf('<main class="notice">');
+    const mainClose = html.indexOf("</main>");
+    expect(mainOpen).toBeGreaterThan(-1);
+    expect(mainClose).toBeGreaterThan(mainOpen);
+    // Outside <main>…</main>: the CMS replaces its target's content, so a
+    // nested mount point would delete the experimental banner.
+    expect(mountIndex).toBeGreaterThan(mainClose);
+  });
+
+  it("still loads the CMS so it can initialize on its own", () => {
+    // A classic script ending in /sveltia-cms.js self-initializes (lib/main.js);
+    // `type="module"` would turn that off, and manual init is not used here.
+    // Comments are dropped first: they are allowed to *mention* these names,
+    // they just must not be code.
+    const code = html.replace(/<!--[\s\S]*?-->/g, "");
+    expect(code).not.toMatch(/<script[^>]*type="module"/);
+    expect(code).not.toContain("CMS_MANUAL_INIT");
+    expect(code).not.toContain("CMS.init");
+    expect(code).toMatch(/<script[^>]*src="https:\/\/unpkg\.com\/@sveltia\/cms@0\.262\.1\/dist\/sveltia-cms\.js"/);
+  });
+
+  it("keeps the experimental warning on the page after the fixes", () => {
+    expect(html).toContain("EXPERIMENTAL");
+    expect(html).toContain("MATH_7th-drafts");
+    expect(html).toContain("role=\"status\"");
   });
 });
