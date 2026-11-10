@@ -100,6 +100,7 @@ describe("runSveltiaTrace against the simulator", () => {
       "file-list",
       "read-entry",
       "read-blob",
+      "branch-ref",
       "create-ref",
       "write",
       "write",
@@ -189,7 +190,7 @@ describe("runSveltiaTrace against the simulator", () => {
       branch: "main",
     });
     expect(report.ok).toBe(false);
-    expect(report.blockedReason).toMatch(/refusing to probe branch/);
+    expect(report.blockedReason).toMatch(/refusing to probe "main"/);
   });
 
   it("refuses to reuse an existing scratch branch and leaves it untouched", async () => {
@@ -449,6 +450,105 @@ describe("admin-verify-github CLI over real HTTP", () => {
           (entry.method === "POST" || entry.method === "DELETE" || entry.method === "PATCH"),
       );
       expect(refWrites).toEqual([]);
+    }, 60_000);
+
+
+    it("exits 4 when the branch lookup cannot confirm absence (403 / 5xx)", async () => {
+      // (a) the lookup itself is forbidden
+      other.state.denyRefReads = true;
+      const forbidden = await runAgainst(
+        [
+          "--repo",
+          "calesteer-create/private-but-renamed",
+          "--branch",
+          "admin-verification-e2e-lookup-403",
+          "--token-stdin",
+          "--yes",
+          "--json",
+          "skip",
+        ],
+        WRITE_TOKEN,
+      );
+      other.state.denyRefReads = false;
+      expect(forbidden.code).toBe(4);
+      expect(forbidden.stderr).toMatch(/could not confirm whether/);
+      expect(forbidden.stderr).toMatch(/not proof that the branch is missing/);
+
+      // (b) the lookup keeps failing at the server
+      other.state.failOn = (entry) => entry.path.includes("/git/ref/heads/");
+      const failing = await runAgainst(
+        [
+          "--repo",
+          "calesteer-create/private-but-renamed",
+          "--branch",
+          "admin-verification-e2e-lookup-500",
+          "--token-stdin",
+          "--yes",
+          "--json",
+          "skip",
+        ],
+        WRITE_TOKEN,
+      );
+      other.state.failOn = undefined;
+      expect(failing.code).toBe(4);
+
+      // Neither attempt created anything (other branches may exist from other
+      // tests in this file; only these two names matter here).
+      const branches = await listBranches(client(WRITE_TOKEN, other.url), "calesteer-create", "private-but-renamed");
+      expect(branches).not.toContain("admin-verification-e2e-lookup-403");
+      expect(branches).not.toContain("admin-verification-e2e-lookup-500");
+    }, 120_000);
+
+    it("a read-only PAT is refused before writing when GitHub reports push=false, without claiming scopes were checked", async () => {
+      const result = await runAgainst(
+        [
+          "--repo",
+          "calesteer-create/private-but-renamed",
+          "--branch",
+          "admin-verification-e2e-readonly-pat",
+          "--token-stdin",
+          "--yes",
+          "--json",
+          "skip",
+        ],
+        READ_TOKEN,
+      );
+      expect(result.code).toBe(2);
+      expect(result.stderr).toMatch(/authenticated user/);
+      // The refusal must not pretend the token's scopes were inspected.
+      expect(result.stderr).not.toMatch(/token scopes|token permissions|Contents is read/i);
+      const branches = await listBranches(client(WRITE_TOKEN, other.url), "calesteer-create", "private-but-renamed");
+      expect(branches).not.toContain("admin-verification-e2e-readonly-pat");
+    }, 60_000);
+
+    it("when GitHub reports push=true for a read-only PAT, the write itself is the proof and it fails safely", async () => {
+      /* The ambiguity that matters: `permissions.push` may describe the user, so
+         a read-only PAT can pass the preflight. Then `createRef` is the only
+         honest proof — it must fail with 403, report that, and leave nothing
+         behind. This is the documented limitation, encoded. */
+      other.state.reportUserPush = true;
+      try {
+        const result = await runAgainst(
+          [
+            "--repo",
+            "calesteer-create/private-but-renamed",
+            "--branch",
+            "admin-verification-e2e-readonly-pat2",
+            "--token-stdin",
+            "--yes",
+            "--json",
+            "skip",
+          ],
+          READ_TOKEN,
+        );
+        expect(result.code).toBe(1);
+        expect(result.stdout).toMatch(/Create a scratch branch/i); // it got that far
+        expect(result.stdout + result.stderr).toMatch(/403|forbidden|Contents/i);
+      } finally {
+        other.state.reportUserPush = false;
+      }
+      const branches = await listBranches(client(WRITE_TOKEN, other.url), "calesteer-create", "private-but-renamed");
+      expect(branches).not.toContain("admin-verification-e2e-readonly-pat2");
     }, 60_000);
   });
 });

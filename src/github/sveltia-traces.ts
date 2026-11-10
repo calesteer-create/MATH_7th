@@ -36,6 +36,8 @@ import {
   getRepo,
   getViewer,
   listBranches,
+  probeBranchExistence,
+  type BranchExistence,
   listTree,
   commitOnBranch,
   readBlob,
@@ -43,7 +45,7 @@ import {
   viewerCanPush,
   type GithubClient,
 } from "./client";
-import { checkWritableRepo, isSameRepo } from "../media/repo-guard";
+import { isSameRepo, verifyWritePreconditions } from "../media/repo-guard";
 
 export const SVELTIA_CMS_VERSION = "0.262.1";
 
@@ -80,6 +82,13 @@ export const SVELTIA_TRACE: readonly TraceStep[] = [
     action: "Ask GitHub whether this user may push to the branch",
     evidence: "extracted",
     detail: "YIe(): ref(qualifiedName){ refUpdateRule { viewerCanPush } } — used to decide whether editing is read-only.",
+  },
+  {
+    id: "branch-ref",
+    action: "Confirm the scratch branch does not already exist",
+    evidence: "documented",
+    detail:
+      "GET /repos/{owner}/{repo}/git/ref/heads/{branch} — only a 404 counts as absent; any error blocks the write.",
   },
   {
     id: "file-list",
@@ -152,6 +161,8 @@ export interface TraceOptions {
    * touches the branch, so ownership is recorded even if a later step throws.
    */
   onCreateBranch?: (claim: ProbeBranchClaim) => void;
+  /** Reports the exact-ref evidence the run used to decide about the branch. */
+  onBranchEvidence?: (evidence: BranchExistence) => void;
   /** Delete the probe branch at the end (default true). */
   cleanupBranch?: boolean;
   /** Delete the probe file with a second commit instead of dropping a branch. */
@@ -217,6 +228,22 @@ export interface TraceReport {
 }
 
 export const PROBE_FILE_DEFAULT = "content/.admin-probe.json";
+
+/**
+ * Turns a `verifyWritePreconditions()` refusal into the sentence the report
+ * shows, suppressing the one condition a caller deliberately defers (the
+ * pre-creation call defers branch evidence, which is checked separately right
+ * before `createRef`). Returns null when the call may proceed.
+ */
+function explainPreflight(
+  verdict: { writable: boolean; problem: string | null },
+  deferred: "none" | "existence",
+): string | null {
+  if (verdict.writable) return null;
+  const problem = verdict.problem ?? "write preconditions were not met";
+  if (deferred === "existence" && /could not confirm whether/i.test(problem)) return null;
+  return problem;
+}
 
 /**
  * Runs Sveltia's request sequence against a real (or simulated) GitHub.
@@ -337,50 +364,35 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
     return finish();
   }
 
-  /* Hard block #2 — the repository GitHub answered for must be the one we
-     asked about. A renamed/redirected answer would mean writing somewhere the
-     caller never authorised. */
+  /* Hard blocks #2..#5 are the shared policy (`verifyWritePreconditions`),
+     evaluated here with live GitHub answers, minus the branch evidence which we
+     fetch below. Nothing is written before it passes. */
   const requested = `${options.owner}/${options.repo}`;
-  if (!isSameRepo(repoInfo.full_name, requested)) {
-    blockedReason =
-      `GitHub resolved ${requested} to ${repoInfo.full_name}; refusing to write anywhere but the repository you named.`;
+  const access = repoInfo.permissions
+    ? {
+        full_name: repoInfo.full_name,
+        push: repoInfo.permissions.push === true,
+        pull: repoInfo.permissions.pull,
+        reported: true,
+      }
+    : null;
+  const preflight = verifyWritePreconditions({
+    requestedRepo: requested,
+    visibility: repoInfo,
+    access,
+    // Branch evidence is evaluated below, immediately before the createRef.
+    branchExistence: { state: "unknown", ref: `refs/heads/${options.branch}`, reason: "not checked yet" },
+    branch: options.branch,
+    defaultBranch,
+  });
+  const preflightFailure = explainPreflight(preflight, "existence");
+  if (preflightFailure) {
+    blockedReason = `${preflightFailure} Nothing was created. This cannot be overridden with --yes or any other option.`;
     findings.push(blockedReason);
     return finish();
   }
 
-  /* Hard block #3 — the repository must be PRIVATE, per GitHub's own answer.
-     A public repository is readable by the whole world, so writing drafts into
-     it would publish them. The same gate the CMS generator uses is applied
-     here with live visibility; there is deliberately no flag, argument or
-     environment variable that can downgrade it to a warning. */
-  const targetVerdict = checkWritableRepo(requested, repoInfo, { destination: "verified" });
-  if (!targetVerdict.writable) {
-    blockedReason =
-      `${targetVerdict.problem}. Nothing was created. ` +
-      "This cannot be overridden with --yes or any other option.";
-    findings.push(blockedReason);
-    return finish();
-  }
-
-  /* Hard block #4 — the branch the probe writes to must not be the branch
-     GitHub serves as the repository's default. */
   const branch = options.branch;
-  if (branch === defaultBranch || branch.toLowerCase() === "main") {
-    blockedReason = `refusing to probe branch "${branch}": the probe only writes to a scratch branch, never to ${defaultBranch}.`;
-    findings.push(blockedReason);
-    return finish();
-  }
-
-  /* Hard block #5 — a token that cannot push must not start a probe: it would
-     fail halfway and leave a half-created branch behind. Only enforced when
-     GitHub actually reported a permissions block (private repos always do). */
-  if (repoInfo.permissions && repoInfo.permissions.push !== true) {
-    blockedReason =
-      `the token cannot push to ${repoInfo.full_name} (push=${String(repoInfo.permissions.push)}); ` +
-      "nothing was attempted. Use a token with Contents: Read and write on this repository.";
-    findings.push(blockedReason);
-    return finish();
-  }
 
   await run(
     "default-branch",
@@ -435,17 +447,40 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
     findings.push(`Could not resolve the head of ${defaultBranch}; skipping the write steps.`);
     return finish();
   }
-  /* Pre-flight: an existing branch is never reused, never overwritten and
-     never deleted. We refuse before any write so a pre-existing branch stays
-     byte-identical — even one that happens to look like ours. */
-  const existingBranches = await listBranches(client, options.owner, options.repo).catch(
-    (): string[] => [],
-  );
-  if (existingBranches.includes(branch)) {
-    blockedReason = `scratch branch "${branch}" already exists; it is left untouched. Delete it yourself or pass --branch with a fresh name.`;
+  /* Final pre-write gate. The branch question is answered by an *exact* ref
+     lookup, never by a branch listing and never by swallowing an error:
+       - confirmed 404  → absent, we may create it;
+       - present        → somebody's branch: refused, left untouched;
+       - anything else  → unknown: refused, because an API error is not proof
+                          of absence.
+     This runs immediately before `createRef`, and `runSveltiaTrace` re-checks
+     the same policy through `verifyWritePreconditions()`. */
+  const branchEvidence = await probeBranchExistence(client, options.owner, options.repo, branch);
+  options.onBranchEvidence?.(branchEvidence);
+  const writeVerdict = verifyWritePreconditions({
+    requestedRepo: requested,
+    visibility: repoInfo,
+    access,
+    branchExistence: branchEvidence,
+    branch,
+    defaultBranch,
+  });
+  if (!writeVerdict.writable) {
+    blockedReason =
+      `${writeVerdict.problem}. Nothing was created; the branch (if any) was left untouched.`;
     findings.push(blockedReason);
     return finish();
   }
+  steps.push({
+    step: stepById("branch-ref"),
+    ok: true,
+    ms: 0,
+    note:
+      branchEvidence.state === "absent"
+        ? `${branchEvidence.ref} confirmed absent (404 on the exact ref)`
+        : `unexpected branch evidence: ${branchEvidence.state}`,
+  });
+  options.onStep?.(steps[steps.length - 1]!);
 
   const created = await run(
     "create-ref",
@@ -607,7 +642,20 @@ export async function cleanupProbeBranch(
 
   const started = Date.now();
   try {
-    const branches = await listBranches(client, owner, repo);
+    // The listing is fine for reporting; absence is confirmed by the exact-ref
+    // path, and a failed delete below is reported, never retried.
+    let branches: string[];
+    try {
+      branches = await listBranches(client, owner, repo);
+    } catch (error) {
+      const advice = error instanceof GithubError ? error.advice : (error as Error).message;
+      return {
+        ok: false,
+        deleted: false,
+        reason: "error",
+        note: `could not list branches while cleaning up ${branch}: ${advice}`,
+      };
+    }
     if (!branches.includes(branch)) {
       return { ok: true, deleted: false, reason: "absent", note: `nothing to clean up (branch ${branch} is already gone)` };
     }

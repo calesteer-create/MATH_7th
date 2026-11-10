@@ -485,6 +485,12 @@ export async function deleteBranch(
   }
 }
 
+/**
+ * Lists branch names. **Not proof of absence**: the listing is paginated and can
+ * fail. Only use it for reporting; any decision about whether a scratch branch
+ * exists must use `probeBranchExistence()`, which asks GitHub about that exact
+ * ref and has an explicit "could not tell" outcome.
+ */
 export async function listBranches(
   client: GithubClient,
   owner: string,
@@ -494,6 +500,56 @@ export async function listBranches(
     `${client.repoPath(owner, repo)}/branches?per_page=100`,
   );
   return (branches ?? []).map((branch) => branch.name);
+}
+
+/**
+ * The result of asking GitHub about one exact branch.
+ *
+ * `absent` is only ever returned for a confirmed GitHub answer — a 404 on
+ * `GET /git/ref/heads/{branch}`. Every other outcome (401/403/5xx/rate limit/
+ * network/garbled body) is `unknown`, because an error is not evidence that a
+ * branch does not exist. `present` carries the head so the caller can reason
+ * about what it is about to touch.
+ */
+export type BranchExistence =
+  | { state: "present"; ref: string; head: string }
+  | { state: "absent"; ref: string }
+  | { state: "unknown"; ref: string; reason: string };
+
+/**
+ * Exact ref lookup: `GET /repos/{owner}/{repo}/git/ref/heads/{branch}`.
+ *
+ * GitHub answers 200 with the ref, or 404 when that single ref does not exist.
+ * Everything else is reported as `unknown` and must block writes.
+ */
+export async function probeBranchExistence(
+  client: GithubClient,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<BranchExistence> {
+  const ref = `refs/heads/${branch}`;
+  try {
+    const response = await client.rest<{ ref?: string; object?: { sha?: string } } | null>(
+      `${client.repoPath(owner, repo)}/git/ref/heads/${encodeURIComponent(branch)}`,
+    );
+    const head = response?.object?.sha;
+    if (!response || typeof response.ref !== "string" || typeof head !== "string" || head === "") {
+      return { state: "unknown", ref, reason: "GitHub answered but the ref body was incomplete" };
+    }
+    return { state: "present", ref, head };
+  } catch (error) {
+    if (error instanceof GithubError) {
+      // A confirmed 404 for this exact ref is the only accepted "absent".
+      if (error.kind === "not_found" && error.status === 404) return { state: "absent", ref };
+      return {
+        state: "unknown",
+        ref,
+        reason: `${error.kind} (${error.status}): ${error.detail.apiMessage ?? error.message}`,
+      };
+    }
+    return { state: "unknown", ref, reason: (error as Error).message };
+  }
 }
 
 /** Classic tokens expose scopes in this header; fine-grained tokens do not. */

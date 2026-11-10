@@ -86,6 +86,33 @@ export interface MockGithubState {
   failNext: number;
   /** When true, every response carries x-ratelimit-remaining: 0. */
   rateLimited: boolean;
+  /**
+   * Simulates a token that can read the repository but whose Contents
+   * permission is read-only: git ref endpoints answer 403 (writes) and
+   * `GET /git/ref/…` answers 403 too, exactly as a narrow fine-grained token
+   * behaves on some endpoints. Used to prove lookups never treat a 403 as
+   * "branch absent".
+   */
+  denyRefReads?: boolean;
+  /**
+   * Models the ambiguity of GitHub's `permissions` block: the REST docs call it
+   * "the permissions of the authenticated user", yet in practice it is computed
+   * against the token's own rights. When true, the simulator reports the
+   * *user's* repository access (so a read-only PAT still shows `push: true`),
+   * which is the case the probe must not mistake for proof of write access.
+   */
+  reportUserPush?: boolean;
+  /**
+   * Deterministic failure injection: when it returns true, that request answers
+   * 500 (before the retry budget is consumed). Used to fail one specific call
+   * instead of "the next N requests".
+   */
+  failOn?: (entry: { method: string; path: string }) => boolean;
+  /**
+   * Makes `GET /branches` look complete while omitting some branches — the
+   * "listing is not proof of absence" case. Keys are repository names.
+   */
+  truncateBranchListing?: string[];
 }
 
 const sha = (input: string): string => crypto.createHash("sha1").update(input).digest("hex");
@@ -219,6 +246,9 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
 
   const body = await readBody(req);
 
+  if (state.failOn?.(entry)) {
+    return respond(500, { message: "Server Error (simulated)" });
+  }
   if (state.failNext > 0) {
     state.failNext -= 1;
     return respond(500, { message: "Server Error (simulated)" });
@@ -413,7 +443,10 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
         permissions: {
           admin: canWrite(repo, token),
           maintain: canWrite(repo, token),
-          push: canWrite(repo, token),
+          // Two different questions, deliberately separable in the simulator.
+          push: state.reportUserPush
+            ? canSee(repo, token) && token.owner.toLowerCase() === repo.owner.toLowerCase()
+            : canWrite(repo, token),
           pull: token.permissions.contents !== "none",
         },
       },
@@ -473,6 +506,24 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
     return respond(201, { ref: `refs/heads/${branch}`, object: { sha: parsed.sha ?? "", type: "commit" } }, scopeHeaders);
   }
 
+  /* GET /git/ref/heads/{branch} — exact single-ref lookup (no pagination). */
+  const exactRefMatch = /^\/git\/ref\/heads\/([^/?]+)$/.exec(rest);
+  if (exactRefMatch && req.method === "GET") {
+    if (state.denyRefReads) {
+      return respond(403, { message: "Resource not accessible by personal access token" }, scopeHeaders);
+    }
+    const branch = exactRefMatch[1] ?? "";
+    if (!repo.branches.has(branch)) return respond(404, { message: "Not Found" }, scopeHeaders);
+    return respond(
+      200,
+      {
+        ref: `refs/heads/${branch}`,
+        object: { sha: repo.heads.get(branch) ?? "", type: "commit" },
+      },
+      scopeHeaders,
+    );
+  }
+
   const deleteRefMatch = /^\/git\/refs\/heads\/([^/?]+)$/.exec(rest);
   if (deleteRefMatch && req.method === "DELETE") {
     if (!canWrite(repo, token)) {
@@ -494,9 +545,12 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
   }
 
   if (rest.startsWith("/branches") && req.method === "GET") {
+    const hidden = (state.truncateBranchListing ?? []).includes(repo.name);
     return respond(
       200,
-      [...repo.branches.keys()].map((name) => ({ name })),
+      [...repo.branches.keys()]
+        .filter((name) => !(hidden && name.startsWith("admin-verification")))
+        .map((name) => ({ name })),
       scopeHeaders,
     );
   }

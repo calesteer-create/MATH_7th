@@ -21,6 +21,7 @@ import {
   GITHUB_API_ROOT,
   GithubClient,
   createBranch,
+  probeBranchExistence,
   resolveApiRoot,
   getBranchHead,
   listBranches,
@@ -489,22 +490,23 @@ describe("the CLI refuses before writing", () => {
 });
 
 describe("write preconditions before the probe touches anything", () => {
-  const ok = {
+  const absent = { state: "absent", ref: "refs/heads/admin-verification-preflight" } as const;
+  const base = {
     requestedRepo: DRAFT_REPO_DEFAULT,
     visibility: { full_name: DRAFT_REPO_DEFAULT, private: true },
-    token: { push: true, contents: "write" as const },
-    existingBranches: ["main"],
+    access: { full_name: DRAFT_REPO_DEFAULT, push: true, pull: true, reported: true },
+    branchExistence: absent,
     branch: "admin-verification-preflight",
     defaultBranch: "main",
   };
 
-  it("allows the normal case", () => {
-    expect(verifyWritePreconditions(ok).writable).toBe(true);
+  it("allows the normal case only with confirmed-absent branch evidence", () => {
+    expect(verifyWritePreconditions(base).writable).toBe(true);
   });
 
   it("refuses when GitHub answers for a different repository", () => {
     const verdict = verifyWritePreconditions({
-      ...ok,
+      ...base,
       visibility: { full_name: "someone/else-repo", private: true },
     });
     expect(verdict.writable).toBe(false);
@@ -513,34 +515,103 @@ describe("write preconditions before the probe touches anything", () => {
 
   it("refuses a public repository, even at the agreed name", () => {
     const verdict = verifyWritePreconditions({
-      ...ok,
+      ...base,
       visibility: { full_name: DRAFT_REPO_DEFAULT, private: false },
     });
     expect(verdict.writable).toBe(false);
     expect(verdict.problem).toMatch(/private=false/);
   });
 
-  it("refuses when the scratch branch already exists", () => {
-    const verdict = verifyWritePreconditions({ ...ok, existingBranches: ["main", ok.branch] });
+  /* ── the six branch-evidence cases ─────────────────────────────────────── */
+
+  it("1. confirmed absence allows the write", () => {
+    const verdict = verifyWritePreconditions(base);
+    expect(verdict.writable).toBe(true);
+    expect(verdict.problem).toBeNull();
+  });
+
+  it("2. an existing branch is refused and kept", () => {
+    const verdict = verifyWritePreconditions({
+      ...base,
+      branchExistence: { state: "present", ref: absent.ref, head: "a".repeat(40) },
+    });
     expect(verdict.writable).toBe(false);
     expect(verdict.problem).toMatch(/already exists/);
+    expect(verdict.problem).toMatch(/left untouched/);
+  });
+
+  it("3. a 403 on the branch lookup is never read as absence", () => {
+    const verdict = verifyWritePreconditions({
+      ...base,
+      branchExistence: { state: "unknown", ref: absent.ref, reason: "forbidden (403): nope" },
+    });
+    expect(verdict.writable).toBe(false);
+    expect(verdict.problem).toMatch(/could not confirm/);
+    expect(verdict.problem).toMatch(/not proof of absence/);
+  });
+
+  it("4. a 500 / network failure is never read as absence", () => {
+    for (const reason of ["server_error (500): boom", "network (0): socket hang up"]) {
+      const verdict = verifyWritePreconditions({
+        ...base,
+        branchExistence: { state: "unknown", ref: absent.ref, reason },
+      });
+      expect(verdict.writable).toBe(false);
+      expect(verdict.problem).toMatch(/could not confirm/);
+    }
+  });
+
+  it("5. incomplete evidence is never read as absence", () => {
+    const verdict = verifyWritePreconditions({
+      ...base,
+      branchExistence: {
+        state: "unknown",
+        ref: absent.ref,
+        reason: "GitHub answered but the ref body was incomplete",
+      },
+    });
+    expect(verdict.writable).toBe(false);
+    expect(verdict.problem).toMatch(/could not confirm/);
   });
 
   it("refuses the default branch and main", () => {
     for (const branch of ["main", "trunk"]) {
-      const verdict = verifyWritePreconditions({ ...ok, branch, defaultBranch: "trunk" });
+      const verdict = verifyWritePreconditions({ ...base, branch, defaultBranch: "trunk" });
       expect(verdict.writable).toBe(false);
       expect(verdict.problem).toMatch(/scratch branch/);
     }
   });
 
-  it("refuses a token without push or contents:write", () => {
-    const noPush = verifyWritePreconditions({ ...ok, token: { push: false, contents: "write" } });
-    expect(noPush.writable).toBe(false);
-    expect(noPush.problem).toMatch(/cannot push/);
-    const readOnly = verifyWritePreconditions({ ...ok, token: { push: true, contents: "read" } });
-    expect(readOnly.writable).toBe(false);
-    expect(readOnly.problem).toMatch(/contents permission/);
+  it("refuses when GitHub reports no permissions block at all", () => {
+    // Missing data must not be treated as "probably fine".
+    const verdict = verifyWritePreconditions({ ...base, access: null });
+    expect(verdict.writable).toBe(false);
+    expect(verdict.problem).toMatch(/did not report a permissions block/);
+    const unreported = verifyWritePreconditions({
+      ...base,
+      access: { full_name: DRAFT_REPO_DEFAULT, push: true, reported: false },
+    });
+    expect(unreported.writable).toBe(false);
+  });
+
+  it("refuses when the user's repository access does not allow pushing", () => {
+    const verdict = verifyWritePreconditions({
+      ...base,
+      access: { full_name: DRAFT_REPO_DEFAULT, push: false, pull: true, reported: true },
+    });
+    expect(verdict.writable).toBe(false);
+    expect(verdict.problem).toMatch(/cannot push/);
+    // The wording must not pretend this is a token-scope check.
+    expect(verdict.problem).toMatch(/authenticated user/);
+  });
+
+  it("does not claim to prove the token's Contents permission", () => {
+    // `access.push` describes the user. A read-only PAT owned by a user who can
+    // push passes this check, which is exactly why it is documented and why the
+    // probe's only real proof is a write GitHub accepts.
+    const verdict = verifyWritePreconditions({ ...base });
+    expect(verdict.writable).toBe(true);
+    expect(verdict).not.toHaveProperty("contentsProven");
   });
 
   it("is re-checked inside the trace, so a preflighted run cannot be tricked later", async () => {
@@ -551,7 +622,7 @@ describe("write preconditions before the probe touches anything", () => {
       // The repository is private at preflight time...
       expect(
         verifyWritePreconditions({
-          ...ok,
+          ...base,
           requestedRepo: `${NEUTRAL_PRIVATE.owner}/${NEUTRAL_PRIVATE.name}`,
           visibility: { full_name: `${NEUTRAL_PRIVATE.owner}/${NEUTRAL_PRIVATE.name}`, private: true },
         }).writable,
@@ -569,6 +640,142 @@ describe("write preconditions before the probe touches anything", () => {
       expect(report.claim).toBeUndefined();
     } finally {
       await server.close();
+    }
+  });
+});
+
+describe("branch lookup fails closed (finding 3)", () => {
+  const DRAFTS_REPO = { owner: "calesteer-create", repo: "MATH_7th-drafts" };
+
+  let stateAfter: ReturnType<typeof fixtureWithRepos>;
+
+  async function runAgainst(
+    arrange: (state: ReturnType<typeof fixtureWithRepos>) => void,
+    branch: string,
+  ) {
+    const state = fixtureWithRepos({});
+    arrange(state);
+    stateAfter = state;
+    const server = await startMockGithub(state);
+    try {
+      const client = makeClient(server);
+      const writesBefore = state.requests.filter(
+        (entry) => entry.path !== "/graphql" && entry.method !== "GET",
+      ).length;
+      const evidence: unknown[] = [];
+      const report = await runSveltiaTrace(client, {
+        owner: DRAFTS_REPO.owner,
+        repo: DRAFTS_REPO.repo,
+        branch,
+        onBranchEvidence: (value) => evidence.push(value),
+      });
+      const writesAfter = state.requests.filter(
+        (entry) => entry.path !== "/graphql" && entry.method !== "GET",
+      ).length;
+      return {
+        report,
+        state: stateAfter,
+        client,
+        evidence,
+        createdWrites: writesAfter - writesBefore,
+      };
+    } finally {
+      await server.close();
+    }
+  }
+
+  it("1. confirmed absence: the probe proceeds and creates the branch", async () => {
+    const { report, evidence, createdWrites } = await runAgainst(() => {}, "admin-verification-absent");
+    expect(evidence).toEqual([
+      { state: "absent", ref: "refs/heads/admin-verification-absent" },
+    ]);
+    expect(report.ok).toBe(true);
+    expect(createdWrites).toBeGreaterThan(0);
+    expect(report.claim?.branch).toBe("admin-verification-absent");
+  });
+
+  it("2. existing branch: refused, nothing created, branch untouched", async () => {
+    const branch = "admin-verification-exists";
+    const { report, evidence, createdWrites } = await runAgainst((state) => {
+      const repo = state.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo)!;
+      const head = repo.heads.get("main")!;
+      repo.branches.set(branch, new Map(repo.branches.get("main")!));
+      repo.heads.set(branch, head);
+      repo.commitCount.set(branch, 1);
+    }, branch);
+
+    expect(evidence).toEqual([expect.objectContaining({ state: "present" })]);
+    expect(report.ok).toBe(false);
+    expect(report.blockedReason).toMatch(/already exists/);
+    expect(createdWrites).toBe(0);
+    expect(report.claim).toBeUndefined();
+    // The branch is still in the simulator's state, at the commit it had.
+    const repoAfter = stateAfter.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo)!;
+    expect(repoAfter.branches.has(branch)).toBe(true);
+  });
+
+  it("3. 403 on the lookup: blocked, no write", async () => {
+    const { report, evidence, createdWrites } = await runAgainst((state) => {
+      state.denyRefReads = true;
+    }, "admin-verification-forbidden");
+    expect(evidence).toEqual([expect.objectContaining({ state: "unknown" })]);
+    expect(report.ok).toBe(false);
+    expect(report.blockedReason).toMatch(/could not confirm/);
+    expect(report.claim).toBeUndefined();
+    expect(createdWrites).toBe(0);
+  });
+
+  it("4. 500 / network failure on the lookup: blocked, no write", async () => {
+    const { report, evidence, createdWrites } = await runAgainst((state) => {
+      // Fail deterministically *at the lookup*: once the repo metadata has
+      // been read, every further request answers 500 (past the retry budget).
+      state.failOn = (entry) => entry.path.includes("/git/ref/heads/");
+    }, "admin-verification-server-error");
+    expect(evidence).toEqual([expect.objectContaining({ state: "unknown" })]);
+    expect(report.ok).toBe(false);
+    expect(report.blockedReason).toMatch(/could not confirm/);
+    expect(createdWrites).toBe(0);
+  });
+
+  it("5. incomplete answer: blocked, no write", async () => {
+    // A branch listing that hides our branch must not be consulted at all: the
+    // decision comes from the exact ref, so this run proceeds even though the
+    // listing would have said "absent".
+    const { report, evidence } = await runAgainst((state) => {
+      state.truncateBranchListing = [DRAFTS_REPO.repo];
+    }, "admin-verification-listing-hidden");
+    expect(evidence).toEqual([expect.objectContaining({ state: "absent" })]);
+    expect(report.ok).toBe(true);
+
+    // And a lookup that cannot reach GitHub is `unknown`, not absence.
+    const unreachable = new GithubClient({
+      token: WRITE_TOKEN,
+      apiRoot: "http://127.0.0.1:9",
+      graphqlRoot: "http://127.0.0.1:9/graphql",
+      retryDelayMs: 0,
+      maxRetries: 0,
+    });
+    const incomplete = await probeBranchExistence(
+      unreachable,
+      DRAFTS_REPO.owner,
+      DRAFTS_REPO.repo,
+      "admin-verification-unreachable",
+    );
+    expect(incomplete).toMatchObject({ state: "unknown" });
+  });
+
+  it("6. a lookup failure happens before any write, in every failing case", async () => {
+    for (const arrange of [
+      (state: ReturnType<typeof fixtureWithRepos>) => {
+        state.denyRefReads = true;
+      },
+      (state: ReturnType<typeof fixtureWithRepos>) => {
+        state.failOn = (entry) => entry.path.includes("/git/ref/heads/");
+      },
+    ]) {
+      const { report, createdWrites } = await runAgainst(arrange, "admin-verification-no-write");
+      expect(report.claim).toBeUndefined();
+      expect(createdWrites).toBe(0);
     }
   });
 });

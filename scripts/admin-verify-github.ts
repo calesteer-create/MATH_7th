@@ -31,7 +31,7 @@ import {
   GithubClient,
   GithubError,
   describeScopes,
-  listBranches,
+  probeBranchExistence,
   resolveApiRoot,
   type RepoInfo,
 } from "../src/github/client";
@@ -121,6 +121,14 @@ function printHelp(): void {
 
 The token is never stored or printed. Use a fine-grained PAT limited to the
 drafts repository with Contents: Read and write (Metadata: Read is automatic).
+
+Exit codes: 0 verified · 1 probe failed · 2 refused before any write ·
+            3 target is not private · 4 could not confirm the scratch branch is absent.
+
+Permission limitation, stated plainly: GitHub has no read-only endpoint that
+reports a fine-grained PAT's effective permissions. permissions.push below is
+YOUR repository access, not the token's. The only proof of Contents: write is a
+write GitHub accepts, which is why this probe writes to a throwaway branch.
 
 Hard rules (there is no option to override them):
   • the target repository must be PRIVATE per GitHub; a public repository is
@@ -353,35 +361,55 @@ async function main(): Promise<void> {
   console.log(`  token kind:     ${tokenKind} (scopes: ${scopes})`);
   const perms = repoInfo.permissions;
   console.log(
-    `  push/maintain/admin: ${String(perms?.push ?? false)} / ${String(perms?.maintain ?? false)} / ${String(perms?.admin ?? false)}`,
+    `  user access:    push=${String(perms?.push ?? false)} maintain=${String(perms?.maintain ?? false)} admin=${String(perms?.admin ?? false)}`,
+  );
+  console.log(
+    "  note: this block describes YOUR access to the repository, not the token's scopes;",
+  );
+  console.log(
+    "        GitHub exposes no read-only endpoint for a fine-grained PAT's effective permissions.",
   );
 
-  /* Refuse a pre-existing scratch branch up front: it belongs to someone else
-     (or to an earlier interrupted run) and must not be reused or deleted. */
-  const presentBranches = await listBranches(client, owner, repoName).catch(() => [] as string[]);
+  /* Exact-ref evidence about the scratch branch. Never a listing, never a
+     swallowed error: a confirmed 404 means absent, `present` means somebody's
+     branch, anything else means "unknown" and blocks the write. */
+  const branchEvidence = await probeBranchExistence(client, owner, repoName, branch);
 
-  /* One consolidated gate: name match, private, push permission, unused
-     scratch branch, not the default branch. Same function the trace re-checks
-     immediately before writing, so neither layer can be bypassed. */
+  /* One consolidated policy — the same function the trace re-applies right
+     before createRef. */
+  const access = perms
+    ? {
+        full_name: repoInfo.full_name,
+        push: perms.push === true,
+        pull: perms.pull,
+        reported: true,
+      }
+    : null;
   const preconditions = verifyWritePreconditions({
     requestedRepo,
     visibility: { full_name: repoInfo.full_name, private: repoInfo.private },
-    token: { push: perms?.push === true, contents: "unknown" },
-    existingBranches: presentBranches,
+    access,
+    branchExistence: branchEvidence,
     branch,
     defaultBranch: repoInfo.default_branch,
   });
   if (!preconditions.writable) {
-    const isExistingBranch = presentBranches.includes(branch);
     console.error(`✗ ${preconditions.problem}.\n`);
-    if (isExistingBranch) {
+    if (branchEvidence.state === "present") {
       console.error(
         "  The branch is left untouched: this script only ever deletes branches it created itself.\n" +
           "  Delete it yourself if it is yours, or pass --branch with a fresh name.\n",
       );
     }
-    process.exit(2);
+    if (branchEvidence.state === "unknown") {
+      console.error(
+        "  A failed branch lookup is not proof that the branch is missing.\n" +
+          "  Check the token's Contents permission and connectivity, then re-run.\n",
+      );
+    }
+    process.exit(branchEvidence.state === "unknown" ? 4 : 2);
   }
+  console.log(`  scratch branch: ${branch} confirmed absent (404 on the exact ref)`);
 
   if (!options.yes) {
     const proceed = await confirm(

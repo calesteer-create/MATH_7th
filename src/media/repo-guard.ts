@@ -218,21 +218,56 @@ export function isWritableTarget(
   return checkWritableRepo(repo, visibility, options).writable;
 }
 
-/** What GitHub told us about the token's own capabilities on the repository. */
-export interface TokenPermissions {
+/**
+ * What GitHub told us about the authenticated user's access to the repository.
+ *
+ * ⚠ IMPORTANT: GitHub does **not** expose a read-only endpoint that reports the
+ * effective permissions of a fine-grained PAT. `GET /repos/{o}/{r}` returns a
+ * `permissions` block describing the *authenticated user's* access to that
+ * repository (pull/push/admin), not the token's scopes. A user who can push
+ * with the web UI will still see `push: true` when the PAT itself is read-only.
+ * The API additionally documents that a token whose permissions are too narrow
+ * receives 403 or 404 depending on the endpoint.
+ *
+ * Consequences, which the probe is built around:
+ *   - `push: true` is necessary but **not sufficient** evidence of write access;
+ *   - the only trustworthy proof of `Contents: write` is a write that GitHub
+ *     accepts (or rejects with 403);
+ *   - therefore the probe keeps its write to a throwaway branch, and reports a
+ *     403 on `createRef` as "the token cannot write here", not as a mystery.
+ */
+export interface RepositoryAccess {
+  full_name: string;
+  /** GitHub's `permissions.push` — repository access of the *user*, not the token. */
   push: boolean;
-  contents: "none" | "read" | "write" | "unknown";
+  /** `permissions.pull`, when reported. */
+  pull?: boolean;
+  /** False when GitHub did not report a permissions block at all. */
+  reported: boolean;
 }
+
+/**
+ * Evidence about the scratch branch, from an exact ref lookup.
+ *
+ * Only `absent` — a confirmed 404 for that exact ref — may allow a write to
+ * proceed. `present` means somebody else's branch: never reused, never
+ * overwritten, never deleted. `unknown` (401/403/5xx/network/incomplete body)
+ * blocks the write, because an error is not proof that a branch is missing.
+ */
+export type BranchEvidence =
+  | { state: "absent"; ref: string }
+  | { state: "present"; ref: string; head: string }
+  | { state: "unknown"; ref: string; reason: string };
 
 export interface WritePreconditions {
   /** The repository the caller asked for (already resolved/validated). */
   requestedRepo: string;
   /** GitHub's `GET /repos/{o}/{r}` answer. */
   visibility: RepoVisibility;
-  /** GitHub's `permissions` block for this token, if reported. */
-  token?: TokenPermissions | null;
-  /** Branches that already exist in the repository. */
-  existingBranches: readonly string[];
+  /** GitHub's `permissions` block for the authenticated user, if reported. */
+  access: RepositoryAccess | null;
+  /** Exact-ref evidence about the scratch branch. */
+  branchExistence: BranchEvidence;
   /** The scratch branch the run intends to create. */
   branch: string;
   /** The repository's default branch, per GitHub. */
@@ -240,10 +275,20 @@ export interface WritePreconditions {
 }
 
 /**
- * Everything that must be true *before* the verification probe writes anything.
+ * **The write-precondition policy.** One function, used by the CLI *and*
+ * enforced again inside `runSveltiaTrace()` immediately before `createRef`.
  *
- * Both this and `checkWritableRepo` are enforced inside `runSveltiaTrace()` and
- * again in the CLI; a caller cannot opt out, and `--yes` only skips the prompt.
+ * Every condition is mandatory and every one fails closed:
+ *   1  the name must not be the public site repository;
+ *   2  GitHub must confirm `private === true` and answer for the same name;
+ *   3  the user's reported access must allow pushing (missing block = refuse);
+ *   4  the target must not be the default branch or `main`;
+ *   5  the exact branch ref must be confirmed absent — an error is not absence.
+ *
+ * Note what is *not* claimed here: (3) cannot prove the PAT has
+ * `Contents: write` (see `RepositoryAccess`). That is why the probe's write
+ * target is a throwaway branch and why a 403 on `createRef` is reported as a
+ * failed probe rather than silently retried.
  */
 export function verifyWritePreconditions(conditions: WritePreconditions): TargetVerdict {
   const repo = normalizeRepo(conditions.requestedRepo);
@@ -258,19 +303,19 @@ export function verifyWritePreconditions(conditions: WritePreconditions): Target
     };
   }
 
-  if (conditions.token && conditions.token.push !== true) {
+  if (!conditions.access || !conditions.access.reported) {
     return {
       writable: false,
       problem:
-        `the token cannot push to ${repo} (push=${String(conditions.token.push)}); ` +
-        "a read-only token would fail mid-probe, so nothing was attempted",
+        `GitHub did not report a permissions block for ${repo}, so write access is unproven; ` +
+        "refusing to start a probe that could fail halfway",
     };
   }
-  if (conditions.token && conditions.token.contents !== "write" && conditions.token.contents !== "unknown") {
+  if (conditions.access.push !== true) {
     return {
       writable: false,
       problem:
-        `the token's contents permission is "${conditions.token.contents}", not write; ` +
+        `the authenticated user cannot push to ${repo} (permissions.push=${String(conditions.access.push)}); ` +
         "nothing was attempted",
     };
   }
@@ -282,12 +327,26 @@ export function verifyWritePreconditions(conditions: WritePreconditions): Target
     };
   }
 
-  if (conditions.existingBranches.includes(conditions.branch)) {
-    return {
-      writable: false,
-      problem: `scratch branch "${conditions.branch}" already exists; it is left untouched — pass --branch with a fresh name`,
-    };
+  switch (conditions.branchExistence.state) {
+    case "present":
+      return {
+        writable: false,
+        problem:
+          `scratch branch "${conditions.branch}" already exists (head ` +
+          `${conditions.branchExistence.head.slice(0, 7)}); it is left untouched — pass --branch with a fresh name`,
+      };
+    case "unknown":
+      return {
+        writable: false,
+        problem:
+          `could not confirm whether "${conditions.branch}" already exists ` +
+          `(${conditions.branchExistence.reason}); an API error is not proof of absence, so nothing was written`,
+      };
+    case "absent":
+      return { writable: true, problem: null };
+    default: {
+      const exhaustive: never = conditions.branchExistence;
+      return { writable: false, problem: `unrecognised branch evidence: ${JSON.stringify(exhaustive)}` };
+    }
   }
-
-  return { writable: true, problem: null };
 }
