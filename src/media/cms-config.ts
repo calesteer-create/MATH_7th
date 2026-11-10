@@ -25,7 +25,7 @@
  *     metadata strip in docs/CONTENT_MODEL.md §6 holds for CMS uploads too.
  */
 
-import { DRAFT_BRANCH, checkWritableRepo, resolveDraftRepo } from "./repo-guard";
+import { DRAFT_BRANCH, DRAFT_REPO_DEFAULT, checkWritableRepo, resolveDraftRepo } from "./repo-guard";
 
 export const ADMIN_CONFIG_PATH = "public/admin/config.yml";
 export const ADMIN_INDEX_PATH = "public/admin/index.html";
@@ -57,13 +57,6 @@ interface CmsConfigOptions {
   /** `owner/name` of the private drafts repository. */
   repo: string;
   branch?: string;
-  /**
-   * Set by the generator when static code cannot prove the repository is
-   * private (a renamed target). The panel is then labelled as such, and the
-   * verification CLI still refuses to write anywhere GitHub does not confirm
-   * as private.
-   */
-  privacyUnproven?: boolean;
   /** Site URL shown in the CMS UI (the public Pages site). */
   siteUrl?: string;
 }
@@ -190,10 +183,12 @@ const derivedImageFields = [
 ];
 
 export function buildAdminConfig(options: CmsConfigOptions): YamlValue {
-  // The builder refuses the public repository too, so no caller — not the CLI,
-  // not a test, not a future script — can emit a config that points edits at
-  // the public site.
-  const verdict = checkWritableRepo(options.repo);
+  // The builder is strict, so no caller — not the CLI, not a test, not a future
+  // script — can emit a config that points the CMS at anything but the agreed
+  // private drafts destination. Offline there is no way to prove a *different*
+  // repository is private, so "another repository, probably private" is not an
+  // acceptable target either.
+  const verdict = checkWritableRepo(options.repo, null, { destination: "drafts" });
   if (!verdict.writable) {
     throw new Error(`refusing to generate an admin config for ${options.repo}: ${verdict.problem}`);
   }
@@ -503,6 +498,10 @@ export const ADMIN_CONFIG_BANNER = `# ⚠ AUTO-GENERATED — do not edit by hand
 # Only a repository GitHub confirms as PRIVATE is ever a drafts target. The
 # verification script refuses a public repository outright (no flag overrides
 # it), so a public repository can never receive draft commits.
+#
+# The destination is fixed to ${DRAFT_REPO_DEFAULT}: DRAFT_REPO
+# cannot redirect the panel to another repository, because a repository name
+# says nothing about its visibility.
 `;
 
 /** Full file text for public/admin/config.yml. */
@@ -510,15 +509,14 @@ export function renderAdminConfig(options: CmsConfigOptions): string {
   return `${ADMIN_CONFIG_BANNER}\n${toYaml(buildAdminConfig(options))}\n`;
 }
 
+/** The only repository the generated config may ever point at. */
+export const ADMIN_DRAFT_REPO = DRAFT_REPO_DEFAULT;
+
 /** Resolved config used by the generator, the tests and the docs. */
 export function currentAdminOptions(env: Record<string, string | undefined> = {}): CmsConfigOptions {
   const resolution = resolveDraftRepo(env);
   if (resolution.problem) {
     throw new Error(`refusing to generate the admin config: ${resolution.problem}`);
   }
-  return {
-    repo: resolution.repo,
-    branch: DRAFT_BRANCH,
-    ...(resolution.privacyProvable ? {} : { privacyUnproven: true }),
-  };
+  return { repo: resolution.repo, branch: DRAFT_BRANCH };
 }

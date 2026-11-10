@@ -41,7 +41,7 @@ npm run dev               # http://localhost:3000
 ### مسودات الإدارة والصور (PR 5)
 
 ```bash
-npm run admin:config            # يولّد public/admin/config.yml (لا تحرّره يدويًا)
+npm run admin:config            # يولّد public/admin/config.yml (الوجهة مثبتة، لا تحرّره يدويًا)
 npm run media:import -- --lesson 3 --from ~/scans/lesson-3   # WebP + بلا EXIF/GPS
 npm run media:sync              # يكمّل ما يرفعه المتصفح: sha256، الأبعاد، المصغّرات
 npm run admin:verify-github     # يتحقق من مستودع المسودات الخاص (أنت تشغّله)
@@ -49,6 +49,8 @@ npm run admin:verify-github     # يتحقق من مستودع المسودات 
 
 > ⚠️ تكامل Sveltia مع مستودع GitHub **الخاص** لم يُتحقَّق منه بعد. لا تعتمد على
 > `/admin/` لحفظ محتوى حقيقي قبل تنفيذ خطوات [docs/ADMIN.md §5](docs/ADMIN.md).
+> وجهة المسودات مثبتة في `calesteer-create/MATH_7th-drafts`: `DRAFT_REPO` لا
+> يستطيع تحويل اللوحة إلى مستودع آخر (اسم المستودع ليس دليلًا على أنه خاص).
 
 ### متغيرات البيئة
 

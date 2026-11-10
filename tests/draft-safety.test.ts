@@ -42,6 +42,7 @@ import {
   checkWritableRepo,
   isWritableTarget,
   resolveDraftRepo,
+  verifyWritePreconditions,
 } from "@/media/repo-guard";
 
 const WRITE_TOKEN = "github_pat_finegrained_contents_write";
@@ -90,7 +91,13 @@ describe("repository visibility gate (fix 2)", () => {
       private: false,
     });
     expect(verdict.writable).toBe(false);
-    expect(verdict.problem).toMatch(/PRIVATE/);
+    expect(verdict.problem).toMatch(/not the agreed drafts destination|PRIVATE/);
+    expect(
+      checkWritableRepo(`${NEUTRAL_PUBLIC.owner}/${NEUTRAL_PUBLIC.name}`, {
+        full_name: `${NEUTRAL_PUBLIC.owner}/${NEUTRAL_PUBLIC.name}`,
+        private: true,
+      }).problem,
+    ).toMatch(/not the agreed drafts destination/);
     expect(isWritableTarget(`${NEUTRAL_PUBLIC.owner}/${NEUTRAL_PUBLIC.name}`, {
       full_name: `${NEUTRAL_PUBLIC.owner}/${NEUTRAL_PUBLIC.name}`,
       private: false,
@@ -118,6 +125,29 @@ describe("repository visibility gate (fix 2)", () => {
     expect(verdict.problem).toMatch(/different repository/);
   });
 
+  it("refuses any foreign repository in the generator's destination mode", () => {
+    const foreign = `${NEUTRAL_PRIVATE.owner}/${NEUTRAL_PRIVATE.name}`;
+    // Even with GitHub-style proof of privacy, the generator destination mode
+    // only accepts the agreed repository: a name is not a destination contract.
+    expect(checkWritableRepo(foreign).writable).toBe(false);
+    expect(
+      checkWritableRepo(foreign, { full_name: foreign, private: true }).writable,
+    ).toBe(false);
+    expect(
+      isWritableTarget(foreign, { full_name: foreign, private: true }),
+    ).toBe(false);
+    // "verified" mode is what the CLI uses; it still needs live proof.
+    expect(checkWritableRepo(foreign, null, { destination: "verified" }).writable).toBe(false);
+    expect(
+      checkWritableRepo(foreign, { full_name: foreign, private: true }, { destination: "verified" })
+        .writable,
+    ).toBe(true);
+    expect(
+      checkWritableRepo(foreign, { full_name: foreign, private: false }, { destination: "verified" })
+        .writable,
+    ).toBe(false);
+  });
+
   it("still allows the configured private drafts repository", () => {
     expect(checkWritableRepo(DRAFT_REPO_DEFAULT).writable).toBe(true);
     expect(
@@ -125,12 +155,14 @@ describe("repository visibility gate (fix 2)", () => {
     ).toBe(true);
   });
 
-  it("marks a renamed target as privacy-unprovable instead of calling it private", () => {
+  it("refuses a renamed destination instead of calling it private", () => {
     const resolution = resolveDraftRepo({ DRAFT_REPO: `${NEUTRAL_PRIVATE.owner}/${NEUTRAL_PRIVATE.name}` });
-    expect(resolution.problem).toBeNull();
-    // Static code cannot know the visibility of a renamed repository.
+    expect(resolution.problem).toMatch(/not the agreed drafts destination/);
+    // Static code cannot know the visibility of a renamed repository, so it
+    // must never be treated as a destination.
     expect(resolution.privacyProvable).toBe(false);
-    // The default drafts repo is known to be private by configuration.
+    // The agreed destination is the only one that resolves without a problem.
+    expect(resolveDraftRepo({}).problem).toBeNull();
     expect(resolveDraftRepo({}).privacyProvable).toBe(true);
   });
 
@@ -254,7 +286,9 @@ describe("scratch-branch ownership (fix 1)", () => {
     });
     expect(report.ok).toBe(false);
     expect(report.claim).toBeUndefined();
-    expect(report.steps.find((step) => step.step.id === "create-ref")?.error?.kind).toBe("forbidden");
+    // A token that cannot push is refused before the write steps, not halfway.
+    expect(report.blockedReason).toMatch(/cannot push/);
+    expect(report.steps.some((step) => step.step.id === "create-ref")).toBe(false);
 
     // Cleanup with no claim refuses: a name we never created is "absent", and
     // a branch that exists but is not ours is "not-owned". Neither is deleted.
@@ -450,6 +484,91 @@ describe("the CLI refuses before writing", () => {
       expect(resolveApiRoot({ GITHUB_API_ROOT: loopback } as unknown as NodeJS.ProcessEnv)).toBe(
         loopback.replace(/\/$/, ""),
       );
+    }
+  });
+});
+
+describe("write preconditions before the probe touches anything", () => {
+  const ok = {
+    requestedRepo: DRAFT_REPO_DEFAULT,
+    visibility: { full_name: DRAFT_REPO_DEFAULT, private: true },
+    token: { push: true, contents: "write" as const },
+    existingBranches: ["main"],
+    branch: "admin-verification-preflight",
+    defaultBranch: "main",
+  };
+
+  it("allows the normal case", () => {
+    expect(verifyWritePreconditions(ok).writable).toBe(true);
+  });
+
+  it("refuses when GitHub answers for a different repository", () => {
+    const verdict = verifyWritePreconditions({
+      ...ok,
+      visibility: { full_name: "someone/else-repo", private: true },
+    });
+    expect(verdict.writable).toBe(false);
+    expect(verdict.problem).toMatch(/different repository/);
+  });
+
+  it("refuses a public repository, even at the agreed name", () => {
+    const verdict = verifyWritePreconditions({
+      ...ok,
+      visibility: { full_name: DRAFT_REPO_DEFAULT, private: false },
+    });
+    expect(verdict.writable).toBe(false);
+    expect(verdict.problem).toMatch(/private=false/);
+  });
+
+  it("refuses when the scratch branch already exists", () => {
+    const verdict = verifyWritePreconditions({ ...ok, existingBranches: ["main", ok.branch] });
+    expect(verdict.writable).toBe(false);
+    expect(verdict.problem).toMatch(/already exists/);
+  });
+
+  it("refuses the default branch and main", () => {
+    for (const branch of ["main", "trunk"]) {
+      const verdict = verifyWritePreconditions({ ...ok, branch, defaultBranch: "trunk" });
+      expect(verdict.writable).toBe(false);
+      expect(verdict.problem).toMatch(/scratch branch/);
+    }
+  });
+
+  it("refuses a token without push or contents:write", () => {
+    const noPush = verifyWritePreconditions({ ...ok, token: { push: false, contents: "write" } });
+    expect(noPush.writable).toBe(false);
+    expect(noPush.problem).toMatch(/cannot push/);
+    const readOnly = verifyWritePreconditions({ ...ok, token: { push: true, contents: "read" } });
+    expect(readOnly.writable).toBe(false);
+    expect(readOnly.problem).toMatch(/contents permission/);
+  });
+
+  it("is re-checked inside the trace, so a preflighted run cannot be tricked later", async () => {
+    const state = fixtureWithRepos({ repos: [{ ...NEUTRAL_PRIVATE }] });
+    const server = await startMockGithub(state);
+    try {
+      const client = makeClient(server);
+      // The repository is private at preflight time...
+      expect(
+        verifyWritePreconditions({
+          ...ok,
+          requestedRepo: `${NEUTRAL_PRIVATE.owner}/${NEUTRAL_PRIVATE.name}`,
+          visibility: { full_name: `${NEUTRAL_PRIVATE.owner}/${NEUTRAL_PRIVATE.name}`, private: true },
+        }).writable,
+      ).toBe(true);
+      // ...but if GitHub later says it is public, the trace still refuses.
+      const repo = state.repos.find((candidate) => candidate.name === NEUTRAL_PRIVATE.name)!;
+      repo.private = false;
+      const report = await runSveltiaTrace(client, {
+        owner: NEUTRAL_PRIVATE.owner,
+        repo: NEUTRAL_PRIVATE.name,
+        branch: "admin-verification-late-flip",
+      });
+      expect(report.ok).toBe(false);
+      expect(report.blockedReason).toMatch(/private=false/);
+      expect(report.claim).toBeUndefined();
+    } finally {
+      await server.close();
     }
   });
 });

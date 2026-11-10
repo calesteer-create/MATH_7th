@@ -10,6 +10,10 @@
 # Only a repository GitHub confirms as PRIVATE is ever a drafts target. The
 # verification script refuses a public repository outright (no flag overrides
 # it), so a public repository can never receive draft commits.
+#
+# The destination is fixed to calesteer-create/MATH_7th-drafts: DRAFT_REPO
+# cannot redirect the panel to another repository, because a repository name
+# says nothing about its visibility.
 
 backend:
   name: "github"

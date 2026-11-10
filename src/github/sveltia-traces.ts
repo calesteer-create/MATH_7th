@@ -43,6 +43,7 @@ import {
   viewerCanPush,
   type GithubClient,
 } from "./client";
+import { checkWritableRepo, isSameRepo } from "../media/repo-guard";
 
 export const SVELTIA_CMS_VERSION = "0.262.1";
 
@@ -336,21 +337,32 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
     return finish();
   }
 
-  /* Hard block #2 — the repository must be PRIVATE. A public repository is
-     readable by the whole world, so writing drafts into it would publish them.
-     There is deliberately no flag, argument or environment variable that can
-     downgrade this to a warning: `private !== true` (including a missing or
-     non-boolean field) stops the run before the first branch or commit. */
-  if (repoInfo.private !== true) {
+  /* Hard block #2 — the repository GitHub answered for must be the one we
+     asked about. A renamed/redirected answer would mean writing somewhere the
+     caller never authorised. */
+  const requested = `${options.owner}/${options.repo}`;
+  if (!isSameRepo(repoInfo.full_name, requested)) {
     blockedReason =
-      `refusing to write to ${repoInfo.full_name}: GitHub reports private=${String(repoInfo.private)}, ` +
-      "and draft content is only ever written to a PRIVATE repository. Nothing was created. " +
-      "This cannot be overridden with --yes or any other option; use the private drafts repository instead.";
+      `GitHub resolved ${requested} to ${repoInfo.full_name}; refusing to write anywhere but the repository you named.`;
     findings.push(blockedReason);
     return finish();
   }
 
-  /* Hard block #3 — the branch the probe writes to must not be the branch
+  /* Hard block #3 — the repository must be PRIVATE, per GitHub's own answer.
+     A public repository is readable by the whole world, so writing drafts into
+     it would publish them. The same gate the CMS generator uses is applied
+     here with live visibility; there is deliberately no flag, argument or
+     environment variable that can downgrade it to a warning. */
+  const targetVerdict = checkWritableRepo(requested, repoInfo, { destination: "verified" });
+  if (!targetVerdict.writable) {
+    blockedReason =
+      `${targetVerdict.problem}. Nothing was created. ` +
+      "This cannot be overridden with --yes or any other option.";
+    findings.push(blockedReason);
+    return finish();
+  }
+
+  /* Hard block #4 — the branch the probe writes to must not be the branch
      GitHub serves as the repository's default. */
   const branch = options.branch;
   if (branch === defaultBranch || branch.toLowerCase() === "main") {
@@ -359,8 +371,15 @@ export async function runSveltiaTrace(client: GithubClient, options: TraceOption
     return finish();
   }
 
-  if (repoInfo.permissions?.push !== true) {
-    findings.push("The token can read this repository but cannot push, so the write steps will fail.");
+  /* Hard block #5 — a token that cannot push must not start a probe: it would
+     fail halfway and leave a half-created branch behind. Only enforced when
+     GitHub actually reported a permissions block (private repos always do). */
+  if (repoInfo.permissions && repoInfo.permissions.push !== true) {
+    blockedReason =
+      `the token cannot push to ${repoInfo.full_name} (push=${String(repoInfo.permissions.push)}); ` +
+      "nothing was attempted. Use a token with Contents: Read and write on this repository.";
+    findings.push(blockedReason);
+    return finish();
   }
 
   await run(

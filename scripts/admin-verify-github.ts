@@ -46,7 +46,14 @@ import {
   type ProbeCommitProof,
   type TraceReport,
 } from "../src/github/sveltia-traces";
-import { DRAFT_BRANCH, PUBLIC_REPO, classifyRepo, normalizeRepo, resolveDraftRepo } from "../src/media/repo-guard";
+import {
+  DRAFT_BRANCH,
+  DRAFT_REPO_DEFAULT,
+  PUBLIC_REPO,
+  classifyRepo,
+  normalizeRepo,
+  verifyWritePreconditions,
+} from "../src/media/repo-guard";
 
 interface CliOptions {
   repo: string;
@@ -240,15 +247,28 @@ interface Verdict {
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
-  const resolution = resolveDraftRepo({ DRAFT_REPO: options.repo || process.env["DRAFT_REPO"] });
-  if (resolution.problem) fail(resolution.problem);
-  const [owner, repoName] = resolution.repo.split("/") as [string, string];
+  /* Unlike the CMS generator, the CLI may be pointed at another repository so
+     the owner can test a renamed drafts repo — but only in a read-then-verify
+     order: no write happens until GitHub confirms the name, `private === true`,
+     push permission and an unused scratch branch. The default stays the agreed
+     destination. */
+  const requestedRepo = normalizeRepo(options.repo || process.env["DRAFT_REPO"] || DRAFT_REPO_DEFAULT);
+  if (!/^[A-Za-z0-9_.-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/.test(requestedRepo)) {
+    fail(`--repo must look like "owner/name", got ${JSON.stringify(requestedRepo)}`);
+  }
+  if (classifyRepo(requestedRepo) === "public") {
+    fail(
+      `${requestedRepo} is the PUBLIC repository — draft edits must never be written there ` +
+        "(requirement 5). Point --repo at the private drafts repository instead.",
+    );
+  }
+  const [owner, repoName] = requestedRepo.split("/") as [string, string];
 
   const origin = currentOrigin();
   if (origin && origin.toLowerCase().includes(PUBLIC_REPO.toLowerCase())) {
     // Not fatal in itself, but say it loudly: this checkout IS the public repo.
     console.log(
-      `i this checkout's origin is ${PUBLIC_REPO} (the public site). Draft probes go to ${resolution.repo} instead.\n`,
+      `i this checkout's origin is ${PUBLIC_REPO} (the public site). Draft probes go to ${requestedRepo} instead.\n`,
     );
   }
 
@@ -267,7 +287,9 @@ async function main(): Promise<void> {
 
   console.log("MATH 7TH — Sveltia CMS private-repository verification");
   console.log(`  cms:    @sveltia/cms@${SVELTIA_CMS_VERSION}`);
-  console.log(`  repo:   ${resolution.repo}${classifyRepo(resolution.repo) === "draft" ? "" : " (non-default name)"}`);
+  console.log(
+    `  repo:   ${requestedRepo}${classifyRepo(requestedRepo) === "draft" ? "" : ` (non-default name; agreed destination is ${DRAFT_REPO_DEFAULT})`}`,
+  );
   console.log(`  branch: ${branch} (scratch; never ${DRAFT_BRANCH})`);
   console.log(`  token:  not logged, not saved`);
   if (apiRoot !== "https://api.github.com") console.log(`  ⚠ endpoint: ${endpoint} (test override, localhost only)\n`);
@@ -286,7 +308,7 @@ async function main(): Promise<void> {
       error instanceof GithubError
         ? `${error.kind} (${error.status}): ${error.advice}`
         : (error as Error).message;
-    console.error(`✗ cannot read ${resolution.repo} — ${detail}`);
+    console.error(`✗ cannot read ${requestedRepo} — ${detail}`);
     console.error(
       "\n  Nothing was written. Common causes:\n" +
         "   • the token's resource owner is a different account than the repository owner\n" +
@@ -311,9 +333,9 @@ async function main(): Promise<void> {
   }
 
   /* HARD STOP — draft content is only ever written to a private repository.
-     This check runs before the confirmation prompt, before any branch is
-     created and before any commit. `--yes` is a prompt-skipper, not an
-     override: it cannot get past this. */
+     GitHub's own answer is checked before the confirmation prompt, before any
+     branch is created and before any commit. `--yes` is a prompt-skipper, not
+     an override: it cannot get past this. */
   if (repoInfo.private !== true) {
     blocked(
       `refusing to verify ${repoInfo.full_name}: GitHub reports private=${String(repoInfo.private)}.\n` +
@@ -337,12 +359,27 @@ async function main(): Promise<void> {
   /* Refuse a pre-existing scratch branch up front: it belongs to someone else
      (or to an earlier interrupted run) and must not be reused or deleted. */
   const presentBranches = await listBranches(client, owner, repoName).catch(() => [] as string[]);
-  if (presentBranches.includes(branch)) {
-    console.error(
-      `✗ scratch branch "${branch}" already exists in ${resolution.repo}.\n` +
-        "  It is left untouched: this script only ever deletes branches it created itself.\n" +
-        "  Delete it yourself if it is yours, or pass --branch with a fresh name.\n",
-    );
+
+  /* One consolidated gate: name match, private, push permission, unused
+     scratch branch, not the default branch. Same function the trace re-checks
+     immediately before writing, so neither layer can be bypassed. */
+  const preconditions = verifyWritePreconditions({
+    requestedRepo,
+    visibility: { full_name: repoInfo.full_name, private: repoInfo.private },
+    token: { push: perms?.push === true, contents: "unknown" },
+    existingBranches: presentBranches,
+    branch,
+    defaultBranch: repoInfo.default_branch,
+  });
+  if (!preconditions.writable) {
+    const isExistingBranch = presentBranches.includes(branch);
+    console.error(`✗ ${preconditions.problem}.\n`);
+    if (isExistingBranch) {
+      console.error(
+        "  The branch is left untouched: this script only ever deletes branches it created itself.\n" +
+          "  Delete it yourself if it is yours, or pass --branch with a fresh name.\n",
+      );
+    }
     process.exit(2);
   }
 

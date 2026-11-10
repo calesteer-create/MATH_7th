@@ -129,16 +129,20 @@ describe("runSveltiaTrace against the simulator", () => {
     ).resolves.toBeNull();
   });
 
-  it("reports the write steps as failures for a read-only token, without writing", async () => {
+  it("refuses a read-only token before the write steps, without writing", async () => {
     const { report, cleanup } = await probe(READ_TOKEN, "admin-verification-readonly");
     expect(report.ok).toBe(false);
-    const failed = report.steps.filter((step) => !step.ok).map((step) => step.step.id);
-    expect(failed).toContain("create-ref");
-    const createRef = report.steps.find((step) => step.step.id === "create-ref")!;
-    expect(createRef.error?.kind).toBe("forbidden");
-    expect(report.findings.join(" ")).toMatch(/cannot push/);
+    // Refused up front because GitHub reports push=false — not halfway through,
+    // which is what used to leave a half-created branch behind.
+    expect(report.blockedReason).toMatch(/cannot push/);
+    expect(report.steps.some((step) => step.step.id === "create-ref")).toBe(false);
+    expect(report.claim).toBeUndefined();
     expect(cleanup.deleted).toBe(false); // nothing was created, nothing to delete
     expect(cleanup.reason).toBe("absent");
+    // And no ref was created in the repository.
+    expect(await listBranches(client(), DRAFTS.owner, DRAFTS.repo)).not.toContain(
+      "admin-verification-readonly",
+    );
   });
 
   it("cannot even see the private repository with a token from another owner", async () => {

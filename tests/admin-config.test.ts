@@ -88,6 +88,31 @@ describe("generated YAML", () => {
     expect(parsed.c).toBe("line\nbreak");
   });
 
+  it("is untouched by a refused DRAFT_REPO (generator exits non-zero, file unchanged)", async () => {
+    const { spawn } = await import("node:child_process");
+    const before = committedConfigText();
+    for (const foreign of ["someone/site-assets", "calesteer-create/MATH_7th-notes", PUBLIC_REPO]) {
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const child = spawn(
+          process.execPath,
+          ["--import", "tsx", "scripts/admin-config.ts"],
+          {
+            cwd: process.cwd(),
+            env: { ...process.env, DRAFT_REPO: foreign },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        let stderr = "";
+        child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+        child.on("close", (code) => resolve({ code, stderr }));
+      });
+      expect(result.code).toBe(2);
+      expect(result.stderr).toMatch(/refusing to generate the admin config/);
+      // The committed file is byte-identical: a refusal never half-writes.
+      expect(committedConfigText()).toBe(before);
+    }
+  }, 60_000);
+
   it("is exactly what the generator produces (no hand edits)", () => {
     expect(committedConfigText()).toBe(renderAdminConfig(currentAdminOptions({})));
   });
@@ -255,10 +280,49 @@ describe("repository guard — drafts only", () => {
     expect(classifyRepo("someone/else")).toBe("foreign");
   });
 
-  it("lets the owner rename the drafts repository explicitly", () => {
-    const resolution = resolveDraftRepo({ DRAFT_REPO: "calesteer-create/MATH_7th-notes" });
-    expect(resolution.problem).toBeNull();
-    expect(resolution.role).toBe("foreign");
+  it("refuses to rename the drafts repository via DRAFT_REPO", () => {
+    // A name is not proof that a repository is private, so the generator has no
+    // way to accept another target offline. Renaming needs a code change plus a
+    // live check; an environment variable must not redirect drafts.
+    for (const foreign of [
+      "calesteer-create/MATH_7th-notes",
+      "someone/else",
+      "calesteer-create/site-assets",
+    ]) {
+      const resolution = resolveDraftRepo({ DRAFT_REPO: foreign });
+      expect(resolution.problem).toMatch(/not the agreed drafts destination/);
+      expect(resolution.privacyProvable).toBe(false);
+      expect(() => currentAdminOptions({ DRAFT_REPO: foreign })).toThrow(/not the agreed drafts destination/);
+    }
+  });
+
+  it("accepts DRAFT_REPO only when it restates the agreed destination", () => {
+    for (const spelling of [
+      DRAFT_REPO_DEFAULT,
+      DRAFT_REPO_DEFAULT.toUpperCase(),
+      `${DRAFT_REPO_DEFAULT}.git`,
+      `${DRAFT_REPO_DEFAULT}/`,
+      `  ${DRAFT_REPO_DEFAULT}  `,
+    ]) {
+      expect(currentAdminOptions({ DRAFT_REPO: spelling }).repo).toBe(DRAFT_REPO_DEFAULT);
+    }
+  });
+
+  it("refuses a PUBLIC repository passed as DRAFT_REPO, by name and by visibility", () => {
+    expect(() => currentAdminOptions({ DRAFT_REPO: PUBLIC_REPO })).toThrow(/PUBLIC repository/);
+    expect(() => currentAdminOptions({ DRAFT_REPO: "someone/site-assets" })).toThrow(/not the agreed/);
+    // And the builder refuses even when a caller claims GitHub said private.
+    expect(() =>
+      buildAdminConfig({ repo: "someone/site-assets", branch: "main" } as never),
+    ).toThrow();
+  });
+
+  it("only the agreed destination produces the expected config", () => {
+    const rendered = renderAdminConfig(currentAdminOptions({}));
+    expect(rendered).toContain(`repo: "${DRAFT_REPO_DEFAULT}"`);
+    expect(rendered).toContain("STATUS: EXPERIMENTAL");
+    const parsed = YAML.parse(rendered.replace(/^#.*$/gm, "")) as { backend: { repo: string } };
+    expect(parsed.backend.repo).toBe(DRAFT_REPO_DEFAULT);
   });
 
   it("records that the integration is unverified", () => {

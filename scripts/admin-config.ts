@@ -6,8 +6,9 @@
  *   npm run admin:config -- --check   # exit 1 if the committed file is stale
  *
  * Keeping the YAML generated means the CMS config can never drift from the
- * content model or from the repository guard: if the drafts repository is
- * renamed, one env var and one regeneration updates everything.
+ * content model or from the repository guard. The destination is fixed to the
+ * agreed private drafts repository: `DRAFT_REPO` may only restate it, because
+ * an environment variable cannot prove that some other repository is private.
  */
 
 import fs from "node:fs";
@@ -50,7 +51,7 @@ function main(): void {
     `✓ wrote ${ADMIN_CONFIG_PATH}\n` +
       `  backend: github → ${options.repo} (${options.branch})\n` +
       `  status:  EXPERIMENTAL — see docs/ADMIN.md\n` +
-      `  override the repository with ${DRAFT_REPO_ENV}=owner/name`,
+      `  the destination is fixed; ${DRAFT_REPO_ENV} can only restate it`,
   );
 }
 

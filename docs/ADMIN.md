@@ -31,8 +31,19 @@ public/admin/index.html   صفحة ثابتة: بانر «تجريبي»، شر�
 public/admin/config.yml   مولَّد من src/media/cms-config.ts (لا يُحرَّر يدويًا)
 ```
 
-- الخادم (backend) هو `github`، والمستودع هو **مستودع المسودات الخاص**
-  (`calesteer-create/MATH_7th-drafts` افتراضيًا، ويمكن تغييره بـ`DRAFT_REPO`).
+- الخادم (backend) هو `github`، والمستودع هو **مستودع المسودات الخاص**، وهو
+  **مثبَّت**: `calesteer-create/MATH_7th-drafts` ولا شيء غيره.
+  `DRAFT_REPO` صار بإمكانه فقط **إعادة كتابة الاسم نفسه** (حالة الأحرف، `.git`،
+  شرطة زائدة)؛ أي مستودع آخر — ولو كان خاصًا في الواقع — يُرفض عند التوليد:
+
+  ```
+  ✗ refusing to generate the admin config: <repo> is not the agreed drafts
+    destination (calesteer-create/MATH_7th-drafts) …
+  ```
+
+  السبب: اسم المستودع لا يُثبت أنه خاص، والمولّد يعمل بلا شبكة. تغيير الوجهة
+  يحتاج تعديل كود + تحققًا حيًّا من GitHub (`npm run admin:verify-github`).
+  عند الرفض لا يُكتب الملف إطلاقًا: `public/admin/config.yml` يبقى بايت-ببايت.
 - المصادقة: **access token** فقط (`auth_methods: [token]`). لا يوجد OAuth worker
   منشور لهذا المشروع، ولا نطلب منك إنشاء واحد.
 - `publish_mode: simple`: الحفظ يذهب مباشرة إلى فرع المسودات. لا يوجد
@@ -152,6 +163,11 @@ read -rs PAT && printf '%s' "$PAT" | npm run admin:verify-github -- --token-stdi
 - يطلب التوكن من طرفية **مخفية** (أو stdin). لا يُقرأ من `--token` ولا من ملف
   ولا من متغير بيئة، ولا يُطبع ولا يُكتب على القرص. النتيجة تُكتب في
   `admin-verification.json` (مستثنى من git) وتحوي الحكم فقط.
+- يقبل `--repo` لمستودع غير الوجهة (لتجربة مستودع مُعاد تسميته)، لكنه **للقراءة
+  فقط** حتى تتحقق كل الشروط معًا: أن اسم المستودع الذي أجاب عنه GitHub هو نفسه
+  المطلوب، وأن `private === true`، وأن التوكن يملك `push`/`Contents: write`،
+  وأن الفرع التجريبي غير موجود، وأنه ليس الفرع الافتراضي. تُفحص هذه الشروط في
+  الـCLI **وقبل الكتابة مباشرة داخل `runSveltiaTrace`** — فلا تكفي طبقة واحدة.
 - **يرفض أي مستودع لا يقول GitHub عنه `private === true`** — قبل إنشاء أي فرع
   أو commit، وقبل أي سؤال تأكيد. الرفض إلزامي ولا يغلبه `--yes` ولا أي خيار أو
   متغير بيئة (كل محاولات الالتفاف مغطاة باختبار). وجود `private` غائبًا أو بقيمة
@@ -242,5 +258,6 @@ read -rs PAT && printf '%s' "$PAT" | npm run admin:verify-github -- --token-stdi
 | `tests/admin-config.test.ts` | صلاحية YAML + مخطط Sveltia الرسمي، تطابق الحقول مع النموذج، حارس المستودع، صفحة `/admin/` |
 | `tests/github-client.test.ts` | 401/403/404/409/422، المستودع الخاص، الصلاحيات، commits، تعارض `expectedHeadOid`، retry، rate limit |
 | `tests/admin-verify-github.test.ts` | تسلسل Sveltia كاملًا على المحاكي، عدم لمس `main`، رفض المستودع العام، تنظيف الفرع، CLI |
-| `tests/draft-safety.test.ts` | ملكية الفرع (فرع موجود مسبقًا يبقى كما هو، فشل الإنشاء لا يحذف غيره، رأس متغيّر، فشل تنظيف آمن)، ورفض أي مستودع `private !== true` ولو باسم آخر، وعدم قابلية التجاوز |
+| `tests/draft-safety.test.ts` | ملكية الفرع (فرع موجود مسبقًا يبقى كما هو، فشل الإنشاء لا يحذف غيره، رأس متغيّر، فشل تنظيف آمن)، ورفض أي مستودع `private !== true` ولو باسم آخر، وعدم قابلية التجاوز، وشروط الكتابة السبعة قبل الفحص |
+| `tests/admin-config.test.ts` | الوجهة المثبتة: `DRAFT_REPO` لا يغيّرها، ولا يُكتب الملف عند الرفض |
 | `tests/no-public-write.test.ts` | لا كتابة للعام، لا Workflow نشر، لا حذف، لا أسرار، لا توكن من argv |

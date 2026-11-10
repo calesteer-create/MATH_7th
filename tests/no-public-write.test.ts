@@ -214,12 +214,21 @@ describe("visibility is checked, not assumed (fix 2)", () => {
   it("checkWritableRepo requires GitHub to say private === true", async () => {
     const { checkWritableRepo } = await import("@/media/repo-guard");
     const name = "calesteer-create/notes-and-plans";
-    expect(checkWritableRepo(name, { full_name: name, private: true }).writable).toBe(true);
+    // Generator destination mode: only the agreed repo is ever writable, so a
+    // foreign-but-probably-private name is refused regardless of visibility.
+    expect(checkWritableRepo(name, { full_name: name, private: true }).writable).toBe(false);
+    // Verified (CLI) mode does accept it — but only with live proof of privacy.
+    expect(
+      checkWritableRepo(name, { full_name: name, private: true }, { destination: "verified" })
+        .writable,
+    ).toBe(true);
+    expect(checkWritableRepo(DRAFT_REPO_DEFAULT, { full_name: DRAFT_REPO_DEFAULT, private: true }).writable).toBe(true);
     for (const value of [false, null, 0, "true", undefined] as unknown[]) {
-      const verdict = checkWritableRepo(name, {
-        full_name: name,
-        private: value as boolean | null,
-      });
+      const verdict = checkWritableRepo(
+        name,
+        { full_name: name, private: value as boolean | null },
+        { destination: "verified" },
+      );
       expect(verdict.writable).toBe(false);
       expect(verdict.problem).toMatch(/PRIVATE|private=/);
     }
