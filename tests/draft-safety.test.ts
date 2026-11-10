@@ -782,16 +782,67 @@ describe("branch lookup fails closed (finding 3)", () => {
 
 describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
   const DRAFTS_REPO = { owner: "calesteer-create", repo: "MATH_7th-drafts" };
+  const BRANCHES = ["admin-verification-toctou-public", "admin-verification-toctou-refresh-fails",
+    "admin-verification-toctou-renamed"];
 
+  /**
+   * Every request that could actually change state, or try to.
+   *
+   * This used to exclude `/graphql` wholesale, which also excluded
+   * `createCommitOnBranch` — the very mutation that writes a commit — so the
+   * assertion could never fail. Writes are now identified by the request log
+   * itself: `isWrite` (REST write method, or GraphQL mutation) plus an explicit
+   * list of the REST ref endpoints, so a mislabelled log cannot hide a write.
+   */
   function writesIn(state: ReturnType<typeof fixtureWithRepos>, since: number): string[] {
     return state.requests
       .slice(since)
-      .filter(
-        (entry) =>
-          entry.path !== "/graphql" &&
-          (entry.method === "POST" || entry.method === "DELETE" || entry.method === "PATCH"),
-      )
+      .filter((entry) => {
+        const restRefWrite =
+          entry.method !== "GET" && /\/git\/refs?(\/|$)/.test(entry.path);
+        return Boolean(entry.isWrite) || restRefWrite;
+      })
+      .map((entry) =>
+        entry.path === "/graphql"
+          ? `graphql ${entry.graphqlKind ?? "?"} ${entry.graphqlOperation ?? "?"}`
+          : `${entry.method} ${entry.path}`,
+      );
+  }
+
+  /** Mutations that actually create or change commits/refs. */
+  function commitMutationsIn(state: ReturnType<typeof fixtureWithRepos>, since: number): string[] {
+    return state.requests
+      .slice(since)
+      .filter((entry) => entry.graphqlOperation === "createCommitOnBranch")
+      .map((entry) => entry.graphqlOperation!);
+  }
+
+  function refPostsIn(state: ReturnType<typeof fixtureWithRepos>, since: number): string[] {
+    return state.requests
+      .slice(since)
+      .filter((entry) => entry.method === "POST" && /\/git\/refs$/.test(entry.path))
       .map((entry) => `${entry.method} ${entry.path}`);
+  }
+
+  /** Operations in the order GitHub saw them, for the ordering assertions. */
+  function operationTrail(state: ReturnType<typeof fixtureWithRepos>, since: number): string[] {
+    return state.requests
+      .slice(since)
+      .map((entry) =>
+        entry.path === "/graphql"
+          ? `graphql:${entry.graphqlOperation ?? "?"}`
+          : `${entry.method}:${entry.path}`,
+      );
+  }
+  const METADATA_PATH = `/repos/${DRAFTS_REPO.owner}/${DRAFTS_REPO.repo}`;
+
+  function assertNoWriteAtAll(state: ReturnType<typeof fixtureWithRepos>, since: number): void {
+    expect(refPostsIn(state, since)).toEqual([]);
+    expect(commitMutationsIn(state, since)).toEqual([]);
+    expect(writesIn(state, since)).toEqual([]);
+    // And no branch of ours exists in the fixture.
+    const repo = state.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo)!;
+    for (const branch of BRANCHES) expect(repo.branches.has(branch)).toBe(false);
   }
 
   it("refuses to write when the repository becomes public between the first read and the gate", async () => {
@@ -831,14 +882,24 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
       // No ownership claim, no branch, no commit.
       expect(report.claim).toBeUndefined();
       expect(report.commit).toBeUndefined();
-      expect(writesIn(state, since)).toEqual([]);
-      expect(state.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo)!.branches.has(
-        "admin-verification-toctou-public",
-      )).toBe(false);
-      // The refresh step is what caught it, and it is visible in the report.
+      assertNoWriteAtAll(state, since);
+      // The refresh step is what caught it.
       const refresh = report.steps.find((step) => step.step.id === "repo-refresh");
       expect(refresh?.ok).toBe(false);
       expect(report.steps.some((step) => step.step.id === "create-ref")).toBe(false);
+
+      /* Ordering: the first metadata read came first, the refusal happened at
+         `repo-refresh`, and nothing ran after it that could write. */
+      const trail = operationTrail(state, since);
+      const metadataRead = `GET:${METADATA_PATH}`;
+      const metadataReads = trail.filter((entry) => entry === metadataRead);
+      expect(metadataReads.length).toBe(2); // initial read + the failed refresh
+      // The initial read happened before every other request of the run.
+      expect(trail.indexOf(metadataRead)).toBeGreaterThanOrEqual(0);
+      const refreshIndex = trail.lastIndexOf(metadataRead);
+      // Everything before the refresh is a read: no mutation ever ran.
+      expect(trail.slice(0, refreshIndex).filter((entry) => entry.startsWith("graphql:mutation"))).toEqual([]);
+      expect(trail.slice(refreshIndex + 1)).toEqual([]); // nothing ran after the failed refresh
     } finally {
       state.afterRequest = undefined;
       await server.close();
@@ -852,21 +913,11 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
       const client = makeClient(server);
       const since = state.requests.length;
       // Let the first metadata read through, then break every later metadata read.
-      let firstReadDone = false;
-      state.afterRequest = (entry, repoName) => {
-        if (
-          entry.method === "GET" &&
-          repoName === DRAFTS_REPO.repo &&
-          /^\/repos\/[^/]+\/[^/]+$/.test(entry.path)
-        ) {
-          firstReadDone = true;
-        }
-      };
       let metadataReads = 0;
       state.failOn = (entry) => {
         if (entry.method !== "GET" || !/^\/repos\/[^/]+\/[^/]+$/.test(entry.path)) return false;
         metadataReads += 1;
-        return firstReadDone && metadataReads > 1;
+        return metadataReads > 1;
       };
 
       const report = await runSveltiaTrace(client, {
@@ -879,10 +930,14 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
       expect(report.blockedReason).toMatch(/could not re-read the repository/);
       expect(report.claim).toBeUndefined();
       expect(report.commit).toBeUndefined();
-      expect(writesIn(state, since)).toEqual([]);
       expect(report.steps.find((step) => step.step.id === "repo-refresh")?.ok).toBe(false);
+      assertNoWriteAtAll(state, since);
+      // The failed refresh answered 500 and the run stopped there.
+      const refreshResponses = state.requests
+        .slice(since)
+        .filter((entry) => /^\/repos\/[^/]+\/[^/]+$/.test(entry.path));
+      expect(refreshResponses[refreshResponses.length - 1]?.status).toBe(500);
     } finally {
-      state.afterRequest = undefined;
       state.failOn = undefined;
       await server.close();
     }
@@ -891,28 +946,16 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
   it("refuses when the refresh reports a different repository", async () => {
     const state = fixtureWithRepos({});
     const server = await startMockGithub(state);
+    // After the first metadata read, GitHub answers with a renamed repository.
+    const repo = state.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo)!;
     try {
       const client = makeClient(server);
       const since = state.requests.length;
-      let firstReadDone = false;
-      state.afterRequest = (entry, repoName) => {
-        if (
-          entry.method === "GET" &&
-          repoName === DRAFTS_REPO.repo &&
-          /^\/repos\/[^/]+\/[^/]+$/.test(entry.path)
-        ) {
-          firstReadDone = true;
-        }
-      };
-      state.failOn = (entry) => false;
-      // Answer the second metadata read with a *renamed* repository by hijacking
-      // the repo's own name in the fixture after the first read.
-      const original = state.afterRequest;
-      state.afterRequest = (entry, repoName) => {
-        original?.(entry, repoName);
-        if (firstReadDone) {
-          const repo = state.repos.find((candidate) => candidate.name === DRAFTS_REPO.repo);
-          if (repo) repo.fullNameOverride = "calesteer-create/somewhere-else";
+      let metadataReads = 0;
+      state.afterRequest = (entry) => {
+        if (entry.method === "GET" && /^\/repos\/[^/]+\/[^/]+$/.test(entry.path)) {
+          metadataReads += 1;
+          if (metadataReads === 1) repo.fullNameOverride = "calesteer-create/somewhere-else";
         }
       };
 
@@ -923,9 +966,66 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
       });
       expect(report.ok).toBe(false);
       expect(report.blockedReason).toMatch(/not calesteer-create\/MATH_7th-drafts|answered for/);
-      expect(writesIn(state, since)).toEqual([]);
+      expect(report.claim).toBeUndefined();
+      assertNoWriteAtAll(state, since);
+      // Specifically: no ref POST and no commit mutation at any point.
+      expect(refPostsIn(state, since)).toEqual([]);
+      expect(commitMutationsIn(state, since)).toEqual([]);
     } finally {
+      repo.fullNameOverride = undefined;
       state.afterRequest = undefined;
+      await server.close();
+    }
+  });
+
+  it("still writes on the happy path, so the assertion above can actually fail", async () => {
+    /* Control test: with no interference the same monitoring must SEE the ref
+       POST and the commit mutation. Without this, the zero-write assertions
+       could pass simply because the detector never matches anything. */
+    const state = fixtureWithRepos({});
+    const server = await startMockGithub(state);
+    try {
+      const client = makeClient(server);
+      const since = state.requests.length;
+      const report = await runSveltiaTrace(client, {
+        owner: DRAFTS_REPO.owner,
+        repo: DRAFTS_REPO.repo,
+        branch: "admin-verification-toctou-control",
+      });
+      expect(report.ok).toBe(true);
+      expect(refPostsIn(state, since)).toHaveLength(1);
+      expect(commitMutationsIn(state, since).length).toBeGreaterThanOrEqual(1);
+
+      /* Ordering of the deciding steps: first metadata read, other reads,
+         repo-refresh, exact-ref check, then ref creation. */
+      const trail = operationTrail(state, since);
+      const metadataRead = `GET:${METADATA_PATH}`;
+      const firstMetadata = trail.indexOf(metadataRead);
+      const refresh = trail.lastIndexOf(metadataRead);
+      const exactRef = trail.indexOf(
+        `GET:${METADATA_PATH}/git/ref/heads/admin-verification-toctou-control`,
+      );
+      const createRef = trail.indexOf(`POST:${METADATA_PATH}/git/refs`);
+      expect(firstMetadata).toBeGreaterThanOrEqual(0);
+      expect(refresh).toBeGreaterThan(firstMetadata);
+      expect(exactRef).toBeGreaterThan(refresh);
+      expect(createRef).toBeGreaterThan(exactRef);
+      // The commit mutation comes last.
+      const commit = trail.indexOf("graphql:createCommitOnBranch");
+      expect(commit).toBeGreaterThan(createRef);
+
+      // Clean up the branch this control test created.
+      const cleanup = await cleanupProbeBranch(
+        client,
+        DRAFTS_REPO.owner,
+        DRAFTS_REPO.repo,
+        "admin-verification-toctou-control",
+        "main",
+        report.claim,
+        report.commit,
+      );
+      expect(cleanup.reason).toBe("deleted");
+    } finally {
       await server.close();
     }
   });

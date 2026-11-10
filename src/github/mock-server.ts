@@ -80,7 +80,20 @@ export interface RequestLogEntry {
   status: number;
   /** Never the token itself. */
   authenticated: boolean;
+  /**
+   * For `POST /graphql`, the operation GitHub was asked to run, classified as
+   * `query` or `mutation`. Anything that can change state is a mutation, so
+   * tests can assert "no write was attempted" without having to know every
+   * operation name — and without treating `/graphql` as either always-read or
+   * always-write.
+   */
   graphqlOperation?: string;
+  graphqlKind?: "query" | "mutation";
+  /**
+   * True only for requests that can modify state: a REST write method, or a
+   * GraphQL mutation. GraphQL queries (which use POST) are not writes.
+   */
+  isWrite?: boolean;
 }
 
 export interface MockGithubState {
@@ -307,7 +320,15 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
     }
     const query = payload.query ?? "";
     const variables = payload.variables ?? {};
-    entry.graphqlOperation = detectOperation(query);
+    const operation = detectOperation(query);
+    const kind: "query" | "mutation" = /^\s*mutation\b|\bmutation\s*\(/.test(query)
+      ? "mutation"
+      : "query";
+    entry.graphqlOperation = operation;
+    entry.graphqlKind = kind;
+    // GraphQL always uses POST, so the *shape* decides: a `query` is a read
+    // even though it travels over POST; a `mutation` is a write.
+    entry.isWrite = kind === "mutation";
 
     // Resolve the repository named by the GraphQL variables, whatever the
     // operation is: mutations carry it inside `branch.repositoryNameWithOwner`.
@@ -615,11 +636,15 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
 
 function detectOperation(query: string): string {
   if (query.includes("createCommitOnBranch")) return "createCommitOnBranch";
+  if (query.includes("createRef")) return "createRef";
+  if (query.includes("deleteRef")) return "deleteRef";
   if (query.includes("refUpdateRule")) return "viewerCanPush";
   if (query.includes("defaultBranchRef")) return "defaultBranch";
   if (query.includes("object(expression")) return "readFile";
   if (query.includes("ref(qualifiedName")) return "branchHead";
-  return "other";
+  // Never silently "other" for a mutation: an unclassified mutation would be a
+  // write nobody noticed.
+  return /^\s*mutation\b/.test(query) ? "unclassifiedMutation" : "query";
 }
 
 function canSee(repo: MockRepo, token: MockToken): boolean {
