@@ -20,6 +20,7 @@
 | عارض الدرس (تكبير/تحريك/تنقّل/لمس) | ✅ منفَّذ |
 | تحديد «آخر درس في الوحدة» | ✅ منفَّذ |
 | **تصدير ثابت لـ GitHub Pages** (`/MATH_7th/`) | ✅ منفَّذ ومُختبَر — [docs/STATIC_EXPORT.md](docs/STATIC_EXPORT.md) |
+| **لوحة إدارة مسودات على Sveltia CMS + استيراد صور محلي** | ⚠️ منفَّذة لكن **غير معتمدة** — [docs/ADMIN.md](docs/ADMIN.md) |
 | **توليد الاختبارات آليًا** | ⏳ المرحلة التالية |
 | **حل الاختبارات والتصحيح** | ⏳ المرحلة التالية |
 
@@ -36,6 +37,18 @@ npm run db:migrate        # إنشاء قاعدة البيانات
 npm run db:seed-admin     # إنشاء حساب المالك
 npm run dev               # http://localhost:3000
 ```
+
+### مسودات الإدارة والصور (PR 5)
+
+```bash
+npm run admin:config            # يولّد public/admin/config.yml (لا تحرّره يدويًا)
+npm run media:import -- --lesson 3 --from ~/scans/lesson-3   # WebP + بلا EXIF/GPS
+npm run media:sync              # يكمّل ما يرفعه المتصفح: sha256، الأبعاد، المصغّرات
+npm run admin:verify-github     # يتحقق من مستودع المسودات الخاص (أنت تشغّله)
+```
+
+> ⚠️ تكامل Sveltia مع مستودع GitHub **الخاص** لم يُتحقَّق منه بعد. لا تعتمد على
+> `/admin/` لحفظ محتوى حقيقي قبل تنفيذ خطوات [docs/ADMIN.md §5](docs/ADMIN.md).
 
 ### متغيرات البيئة
 
