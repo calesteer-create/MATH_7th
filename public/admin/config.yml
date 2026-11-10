@@ -61,16 +61,6 @@ collections:
       - "position"
       - "id"
       - "titleAr"
-    view_groups:
-      groups:
-        - name: "published"
-          label: "منشورة"
-          field: "archived"
-          eq: false
-        - name: "archived"
-          label: "مؤرشفة"
-          field: "archived"
-          eq: true
     fields:
       - name: "id"
         label: "معرّف الوحدة (رقم فريد، وهو اسم الملف)"

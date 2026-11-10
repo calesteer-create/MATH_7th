@@ -30,6 +30,25 @@ import { DRAFT_BRANCH, DRAFT_REPO_DEFAULT, checkWritableRepo, resolveDraftRepo }
 export const ADMIN_CONFIG_PATH = "public/admin/config.yml";
 export const ADMIN_INDEX_PATH = "public/admin/index.html";
 
+/**
+ * The mount element Sveltia looks for.
+ *
+ * Sveltia 0.262.1 mounts on `#nc-root` if it exists and on `<body>` otherwise
+ * (`src/lib/services/api/methods/init.js`):
+ *
+ *     mount(App, { target: document.querySelector('#nc-root') ?? document.body, … })
+ *
+ * Nothing else is a mount point: `#cms-mount` (used by an earlier version of
+ * `public/admin/index.html`) is not referenced anywhere in the bundle, so the
+ * CMS ignored it. It matters because `<body>` mounts are *unbounded* — the app
+ * shell is `position: fixed; inset: 0` and Sveltia adds
+ * `body:not(:has(#nc-root)) { overflow: hidden }` (`components/app.svelte`), so
+ * the static notice page would be covered by the CMS once it loads. With
+ * `#nc-root` the shell is `position: absolute` inside its own containing block
+ * (`#nc-root > .sui.app-shell`), which leaves the rest of the page usable.
+ */
+export const CMS_MOUNT_ID = "nc-root";
+
 /** Unit accents accepted by the content model (src/lib/utils.ts). */
 export const UNIT_ACCENTS = [
   "teal",
@@ -41,6 +60,112 @@ export const UNIT_ACCENTS = [
   "emerald",
   "cyan",
 ] as const;
+
+/**
+ * Field-name validation for the options Sveltia resolves against `fields`.
+ *
+ * Sveltia 0.262.1 validates these options **at load time** and reports a name it
+ * cannot find as a `config.error.*` **error**, not a warning:
+ * `parseCmsConfig` → `parseCollections` → `parseEntryCollection` →
+ * `checkViewOptions` (`src/lib/services/config/parser/collections/views.js`) →
+ * `addMessage()` with its default `type: 'error'` → `collectors.errors` →
+ * `initCmsConfig` throws `Errors found in configuration` and the editor never
+ * mounts (the entrance page shows the error list instead of the sign-in form).
+ *
+ * The published JSON schema cannot catch this: `view_groups[].field` and
+ * `sortable_fields[]` are plain strings there, so schema validation passes even
+ * when the name does not exist. These helpers reproduce the *field lookup* half
+ * of Sveltia's own check, over the config object the generator produced, so a
+ * regression fails in CI instead of in the browser.
+ *
+ * Deliberately not covered (they cannot be checked as safely):
+ *   - `relation` `value_field`/`display_fields`: template strings, not key paths.
+ *   - `summary`/`slug.template`: `{{fields.x}}` templates, resolved lazily.
+ *   - nested key paths (`images.0.file`): only top-level names are compared.
+ */
+export interface FieldLike {
+  name?: unknown;
+  widget?: unknown;
+  fields?: unknown;
+}
+
+export interface CollectionLike {
+  name?: unknown;
+  divider?: unknown;
+  fields?: unknown;
+  view_groups?: unknown;
+  sortable_fields?: unknown;
+  [key: string]: unknown;
+}
+
+/**
+ * Keys Sveltia accepts in a sort key without a field definition.
+ * `METADATA_KEYS` and `_summary`/`_manual` are handled by
+ * `isNonFieldSortKey()` and `SUMMARY_COLUMN_KEY` (`table-keys.js`,
+ * `parser/utils/fields.js`); the rest are derived from entry metadata rather
+ * than from a configured field. Kept narrow on purpose: anything not listed here
+ * must be a real field, so the check cannot silently drift into permissiveness.
+ */
+export const NON_FIELD_SORT_KEYS = [
+  "slug",
+  "commit_author",
+  "commit_date",
+  "_summary",
+  "_manual",
+] as const;
+
+/** Field names the collection declares (top level only). */
+export function declaredFieldNames(collection: CollectionLike): string[] {
+  const fields = Array.isArray(collection.fields) ? (collection.fields as FieldLike[]) : [];
+  return fields
+    .map((field) => (typeof field?.name === "string" ? field.name : undefined))
+    .filter((name): name is string => Boolean(name));
+}
+
+/**
+ * `view_groups` in both accepted shapes (array, or `{ groups: [...] }`), reduced
+ * to the `field` each group filters on.
+ */
+export function viewGroupFields(collection: CollectionLike): string[] {
+  const groups = collection.view_groups;
+  const list = Array.isArray(groups)
+    ? groups
+    : groups && typeof groups === "object" && Array.isArray((groups as { groups?: unknown }).groups)
+      ? ((groups as { groups: unknown[] }).groups ?? [])
+      : [];
+  return list
+    .map((group) =>
+      group && typeof group === "object" ? (group as { field?: unknown }).field : undefined,
+    )
+    .filter((field): field is string => typeof field === "string" && field.length > 0);
+}
+
+/** `sortable_fields` in both accepted shapes, reduced to the raw key strings. */
+export function sortableFieldKeys(collection: CollectionLike): string[] {
+  const sortable = collection.sortable_fields;
+  if (Array.isArray(sortable)) {
+    return sortable.filter((key): key is string => typeof key === "string");
+  }
+  // Object form: `{ default: "x", fields: [...] }`
+  const fields =
+    sortable && typeof sortable === "object" ? (sortable as { fields?: unknown }).fields : undefined;
+  return Array.isArray(fields) ? fields.filter((key): key is string => typeof key === "string") : [];
+}
+
+/**
+ * Every name in `view_groups`/`sortable_fields` that the collection's `fields`
+ * never define. An empty array means Sveltia's check will pass; a non-empty one
+ * is what makes the editor refuse to mount.
+ */
+export function undefinedFieldReferences(collection: CollectionLike): string[] {
+  const declared = new Set(declaredFieldNames(collection));
+  return [
+    ...viewGroupFields(collection).filter((name) => !declared.has(name)),
+    ...sortableFieldKeys(collection).filter(
+      (name) => !declared.has(name) && !(NON_FIELD_SORT_KEYS as readonly string[]).includes(name),
+    ),
+  ];
+}
 
 /** Phase badge shown on the /admin/ page until private-repo support is proven. */
 export const ADMIN_STATUS = {
@@ -193,7 +318,7 @@ export function buildAdminConfig(options: CmsConfigOptions): YamlValue {
     throw new Error(`refusing to generate an admin config for ${options.repo}: ${verdict.problem}`);
   }
   const branch = options.branch ?? DRAFT_BRANCH;
-  return {
+  const config: YamlValue = {
     backend: {
       name: "github",
       repo: options.repo,
@@ -243,13 +368,15 @@ export function buildAdminConfig(options: CmsConfigOptions): YamlValue {
       identifier_field: "titleAr",
       slug: { template: "{{fields.id}}", editable: false },
       summary: "#{{fields.position}} · {{fields.titleAr}}",
+      // No `view_groups` here: groups filter the list by a field's value, and
+      // the units collection has no status/archive field by design — the
+      // content model gives units no publish state at all (they appear when a
+      // published lesson exists). A group pointing at a field that `fields`
+      // never defines is a *fatal* config error in Sveltia 0.262.1
+      // (view_groups validation → collectors.errors → the editor refuses to
+      // mount), not a cosmetic warning. `tests/admin-config.test.ts` now fails
+      // if a view group or sort key names an undefined field.
       sortable_fields: ["position", "id", "titleAr"],
-      view_groups: {
-        groups: [
-          { name: "published", label: "منشورة", field: "archived", eq: false },
-          { name: "archived", label: "مؤرشفة", field: "archived", eq: true },
-        ],
-      },
       fields: [
         {
           name: "id",
@@ -484,6 +611,23 @@ export function buildAdminConfig(options: CmsConfigOptions): YamlValue {
     },
     ],
   };
+
+  // Fail here rather than in the browser: Sveltia refuses to mount when a view
+  // group or sort key names a field the collection does not define, and the
+  // error only appears once the page is opened (see undefinedFieldReferences).
+  const dangling = ((config.collections ?? []) as CollectionLike[])
+    .filter((entry) => !entry.divider && typeof entry.name === "string")
+    .map((entry) => ({ name: String(entry.name), missing: undefinedFieldReferences(entry) }))
+    .filter(({ missing }) => missing.length > 0)
+    .map(({ name, missing }) => `${name} → ${missing.join(", ")}`);
+
+  if (dangling.length > 0) {
+    throw new Error(
+      `refusing to generate an admin config with field references Sveltia cannot resolve: ${dangling.join("; ")}`,
+    );
+  }
+
+  return config;
 }
 
 export const ADMIN_CONFIG_BANNER = `# ⚠ AUTO-GENERATED — do not edit by hand.
