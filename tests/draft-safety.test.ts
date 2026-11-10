@@ -824,6 +824,20 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
       .map((entry) => `${entry.method} ${entry.path}`);
   }
 
+  /**
+   * GraphQL mutations in the order GitHub saw them.
+   *
+   * Read from the request log (`graphqlKind`), never from a hand-built string:
+   * `operationTrail()` renders `graphql:<operation>`, so an assertion looking
+   * for `graphql:mutation` matched nothing and could never fail.
+   */
+  function mutationsIn(state: ReturnType<typeof fixtureWithRepos>, since: number): string[] {
+    return state.requests
+      .slice(since)
+      .filter((entry) => entry.graphqlKind === "mutation")
+      .map((entry) => entry.graphqlOperation ?? "unclassifiedMutation");
+  }
+
   /** Operations in the order GitHub saw them, for the ordering assertions. */
   function operationTrail(state: ReturnType<typeof fixtureWithRepos>, since: number): string[] {
     return state.requests
@@ -897,9 +911,11 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
       // The initial read happened before every other request of the run.
       expect(trail.indexOf(metadataRead)).toBeGreaterThanOrEqual(0);
       const refreshIndex = trail.lastIndexOf(metadataRead);
-      // Everything before the refresh is a read: no mutation ever ran.
-      expect(trail.slice(0, refreshIndex).filter((entry) => entry.startsWith("graphql:mutation"))).toEqual([]);
-      expect(trail.slice(refreshIndex + 1)).toEqual([]); // nothing ran after the failed refresh
+      /* No GraphQL mutation at all — checked against the request log, not a
+         string form, so the assertion can actually fail. */
+      expect(mutationsIn(state, since)).toEqual([]);
+      // And nothing ran after the failed refresh, so nothing could have written.
+      expect(trail.slice(refreshIndex + 1)).toEqual([]);
     } finally {
       state.afterRequest = undefined;
       await server.close();
@@ -996,8 +1012,12 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
       expect(refPostsIn(state, since)).toHaveLength(1);
       expect(commitMutationsIn(state, since).length).toBeGreaterThanOrEqual(1);
 
-      /* Ordering of the deciding steps: first metadata read, other reads,
-         repo-refresh, exact-ref check, then ref creation. */
+      /* Ordering of every deciding step:
+           1. first metadata read,
+           2. the other reads (account, branch head, can-push, tree, entry, blob),
+           3. repo-refresh (second metadata read),
+           4. exact branch-ref lookup,
+           5. ref creation, then the commit mutation. */
       const trail = operationTrail(state, since);
       const metadataRead = `GET:${METADATA_PATH}`;
       const firstMetadata = trail.indexOf(metadataRead);
@@ -1006,12 +1026,27 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
         `GET:${METADATA_PATH}/git/ref/heads/admin-verification-toctou-control`,
       );
       const createRef = trail.indexOf(`POST:${METADATA_PATH}/git/refs`);
-      expect(firstMetadata).toBeGreaterThanOrEqual(0);
-      expect(refresh).toBeGreaterThan(firstMetadata);
-      expect(exactRef).toBeGreaterThan(refresh);
-      expect(createRef).toBeGreaterThan(exactRef);
-      // The commit mutation comes last.
       const commit = trail.indexOf("graphql:createCommitOnBranch");
+
+      expect(firstMetadata).toBeGreaterThanOrEqual(0);
+      expect(trail.filter((entry) => entry === metadataRead)).toHaveLength(2);
+      // (2) reads happen between the first metadata read and the refresh…
+      expect(refresh).toBeGreaterThan(firstMetadata);
+      const between = trail.slice(firstMetadata + 1, refresh);
+      expect(between.length).toBeGreaterThan(0);
+      expect(between.filter((entry) => entry.startsWith("POST:"))).toEqual([]);
+      /* The trace makes exactly two commit mutations: the real commit and the
+         deliberate stale-`expectedHeadOid` probe that GitHub must reject. Both
+         come after the ref was created; nothing between the metadata reads. */
+      expect(mutationsIn(state, since)).toEqual([
+        "createCommitOnBranch",
+        "createCommitOnBranch",
+      ]);
+      expect(between.filter((entry) => entry.startsWith("graphql:createCommit"))).toEqual([]);
+      // (4) exact ref lookup after the refresh, before any write.
+      expect(exactRef).toBeGreaterThan(refresh);
+      // (5) creation then commit, in that order.
+      expect(createRef).toBeGreaterThan(exactRef);
       expect(commit).toBeGreaterThan(createRef);
 
       // Clean up the branch this control test created.
@@ -1025,6 +1060,79 @@ describe("visibility is re-checked at the write boundary (TOCTOU)", () => {
         report.commit,
       );
       expect(cleanup.reason).toBe("deleted");
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+describe("the request log classifies writes correctly", () => {
+  it("marks REST writes, GraphQL queries and GraphQL mutations differently", async () => {
+    const state = fixtureWithRepos({});
+    const server = await startMockGithub(state);
+    try {
+      const client = makeClient(server);
+      const since = state.requests.length;
+      const report = await runSveltiaTrace(client, {
+        owner: "calesteer-create",
+        repo: "MATH_7th-drafts",
+        branch: "admin-verification-log-classification",
+      });
+      expect(report.ok).toBe(true);
+
+      const log = state.requests.slice(since);
+      const gql = log.filter((entry) => entry.path === "/graphql");
+      expect(gql.length).toBeGreaterThan(0);
+
+      // Every GraphQL request is POST but not every POST is a write.
+      for (const entry of gql) {
+        expect(entry.method).toBe("POST");
+        expect(entry.graphqlKind).toBe(entry.graphqlKind === "mutation" ? "mutation" : "query");
+        expect(entry.isWrite).toBe(entry.graphqlKind === "mutation");
+      }
+      // Reads exist and are NOT flagged as writes.
+      const readOps = gql.filter((entry) => entry.graphqlKind === "query").map((e) => e.graphqlOperation);
+      expect(readOps).toEqual(expect.arrayContaining(["viewerCanPush", "branchHead", "readFile"]));
+      expect(gql.filter((entry) => entry.graphqlKind === "query" && entry.isWrite)).toEqual([]);
+      // Mutations exist and ARE flagged as writes.
+      const mutations = gql.filter((entry) => entry.graphqlKind === "mutation");
+      expect(mutations.length).toBeGreaterThan(0);
+      expect(mutations.every((entry) => entry.isWrite === true)).toBe(true);
+      expect(mutations.map((entry) => entry.graphqlOperation)).toContain("createCommitOnBranch");
+
+      // REST writes are flagged too, and REST reads are not.
+      const restPost = log.filter((entry) => entry.path !== "/graphql" && entry.method === "POST");
+      expect(restPost.length).toBeGreaterThan(0); // the ref creation
+      expect(restPost.every((entry) => entry.isWrite === true)).toBe(true);
+      const restGet = log.filter((entry) => entry.method === "GET");
+      expect(restGet.length).toBeGreaterThan(0);
+      expect(restGet.every((entry) => entry.isWrite === false)).toBe(true);
+      // DELETE (cleanup) is a REST write.
+      const deletes = log.filter((entry) => entry.method === "DELETE");
+      for (const entry of deletes) expect(entry.isWrite).toBe(true);
+    } finally {
+      await server.close();
+    }
+  }, 60_000);
+
+  it("keeps an unrecognised mutation classified as a write", async () => {
+    const state = fixtureWithRepos({});
+    const server = await startMockGithub(state);
+    try {
+      // A mutation the simulator knows nothing about must never look like a read.
+      const response = await fetch(`${server.url}/graphql`, {
+        method: "POST",
+        headers: {
+          Authorization: "token github_pat_finegrained_contents_write",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ query: "mutation { someFutureWrite { ok } }", variables: {} }),
+      });
+      await response.text();
+      const entry = state.requests[state.requests.length - 1]!;
+      expect(entry.graphqlKind).toBe("mutation");
+      expect(entry.graphqlOperation).toBe("unclassifiedMutation");
+      expect(entry.isWrite).toBe(true);
     } finally {
       await server.close();
     }

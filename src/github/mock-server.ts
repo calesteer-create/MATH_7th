@@ -90,8 +90,16 @@ export interface RequestLogEntry {
   graphqlOperation?: string;
   graphqlKind?: "query" | "mutation";
   /**
-   * True only for requests that can modify state: a REST write method, or a
-   * GraphQL mutation. GraphQL queries (which use POST) are not writes.
+   * True only for requests that can modify state.
+   *
+   * - REST: any request whose HTTP method is `POST`, `PUT`, `PATCH` or `DELETE`.
+   * - GraphQL: any request carrying an operation whose text is a `mutation`.
+   *
+   * `/graphql` is excluded from the REST rule on purpose: GraphQL always uses
+   * POST, so a POST there may be a read (`query`) or a write (`mutation`), and
+   * only the operation shape can tell them apart. An unrecognised mutation is
+   * still a write (`unclassifiedMutation`), so no write can hide behind a name
+   * the simulator does not know.
    */
   isWrite?: boolean;
 }
@@ -260,6 +268,11 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
     status: 0,
     authenticated: rawToken !== undefined,
   };
+  /* Every request is classified once, here. REST writes are decided by HTTP
+     method; `/graphql` is decided by the operation shape further down, because
+     GraphQL uses POST for both reads and writes. */
+  entry.isWrite =
+    entry.path !== "/graphql" && ["POST", "PUT", "PATCH", "DELETE"].includes(entry.method);
   const respond = (status: number, body: unknown, headers?: Record<string, string>, raw?: string): void => {
     entry.status = status;
     state.requests.push(entry);
@@ -327,8 +340,13 @@ async function handle(state: MockGithubState, req: http.IncomingMessage, res: ht
     entry.graphqlOperation = operation;
     entry.graphqlKind = kind;
     // GraphQL always uses POST, so the *shape* decides: a `query` is a read
-    // even though it travels over POST; a `mutation` is a write.
+    // even though it travels over POST; a `mutation` is a write — including an
+    // operation this simulator does not recognise (`unclassifiedMutation`).
     entry.isWrite = kind === "mutation";
+    if (kind === "mutation" && operation === "query") {
+      // Defensive: a mutation must never be recorded as an anonymous "query".
+      entry.graphqlOperation = "unclassifiedMutation";
+    }
 
     // Resolve the repository named by the GraphQL variables, whatever the
     // operation is: mutations carry it inside `branch.repositoryNameWithOwner`.
