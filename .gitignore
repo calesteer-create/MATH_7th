@@ -19,3 +19,6 @@ data/uploads/
 next-env.d.ts
 *.tsbuildinfo
 tsconfig.tsbuildinfo
+
+# Locally produced by `npm run admin:verify-github` (verdict only, never a token).
+admin-verification.json

@@ -39,6 +39,9 @@ jobs:
       - name: Validate content model
         run: npm run content:validate
 
+      - name: Check the generated admin config is up to date
+        run: npm run admin:config:check
+
       - name: TypeScript typecheck
         run: npm run typecheck
 

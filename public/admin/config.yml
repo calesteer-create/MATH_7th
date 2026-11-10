@@ -1,0 +1,339 @@
+# ⚠ AUTO-GENERATED — do not edit by hand.
+# Source: src/media/cms-config.ts   Regenerate: npm run admin:config
+# STATUS: EXPERIMENTAL — Sveltia CMS has NOT been verified against a real
+# private GitHub repository yet. See docs/ADMIN.md and
+# `npm run admin:verify-github` before relying on this panel.
+#
+# The backend below points at the PRIVATE DRAFTS repository. Committing here
+# never publishes anything: there is no publish workflow in this PR.
+#
+# Only a repository GitHub confirms as PRIVATE is ever a drafts target. The
+# verification script refuses a public repository outright (no flag overrides
+# it), so a public repository can never receive draft commits.
+#
+# The destination is fixed to calesteer-create/MATH_7th-drafts: DRAFT_REPO
+# cannot redirect the panel to another repository, because a repository name
+# says nothing about its visibility.
+
+backend:
+  name: "github"
+  repo: "calesteer-create/MATH_7th-drafts"
+  branch: "main"
+  auth_methods:
+    - "token"
+publish_mode: "simple"
+site_url: "https://calesteer-create.github.io/MATH_7th/"
+display_url: "https://calesteer-create.github.io/MATH_7th/"
+app_title: "MATH 7TH — إدارة المسودات (تجريبي)"
+logo_url: "/MATH_7th/favicon.ico"
+media_folder: "public/media/lessons/{{slug}}"
+public_folder: "/media/lessons/{{slug}}"
+media_libraries:
+  all:
+    max_file_size: 15728640
+    transformations:
+      raster_image:
+        format: "webp"
+        quality: 82
+        width: 2200
+        height: 2200
+      svg:
+        optimize: true
+slug:
+  encoding: "ascii"
+  lowercase: true
+collections:
+  - name: "units"
+    label: "الوحدات — Units"
+    label_singular: "وحدة"
+    icon: "menu_book"
+    folder: "content/units"
+    extension: "json"
+    format: "json"
+    create: true
+    delete: false
+    identifier_field: "titleAr"
+    slug:
+      template: "{{fields.id}}"
+      editable: false
+    summary: "#{{fields.position}} · {{fields.titleAr}}"
+    sortable_fields:
+      - "position"
+      - "id"
+      - "titleAr"
+    view_groups:
+      groups:
+        - name: "published"
+          label: "منشورة"
+          field: "archived"
+          eq: false
+        - name: "archived"
+          label: "مؤرشفة"
+          field: "archived"
+          eq: true
+    fields:
+      - name: "id"
+        label: "معرّف الوحدة (رقم فريد، وهو اسم الملف)"
+        widget: "number"
+        value_type: "int"
+        required: true
+        min: 1
+        hint: "يُكتب في اسم الملف: 3 → content/units/3.json. لا يمكن تعديله بعد الإنشاء."
+      - name: "position"
+        label: "ترتيب الوحدة"
+        widget: "number"
+        value_type: "int"
+        required: true
+        min: 1
+        hint: "فريد على مستوى كل الوحدات. يعمل مع أزرار الترتيب في قائمة الوحدات."
+      - name: "titleAr"
+        label: "العنوان (عربي)"
+        widget: "string"
+        required: true
+        maxlength: 200
+      - name: "titleEn"
+        label: "Title (English)"
+        widget: "string"
+        required: false
+        maxlength: 200
+      - name: "descriptionAr"
+        label: "الوصف (عربي)"
+        widget: "text"
+        required: false
+        maxlength: 1000
+      - name: "descriptionEn"
+        label: "Description (English)"
+        widget: "text"
+        required: false
+        maxlength: 1000
+      - name: "pageFrom"
+        label: "من صفحة"
+        widget: "string"
+        required: false
+        maxlength: 20
+      - name: "pageTo"
+        label: "إلى صفحة"
+        widget: "string"
+        required: false
+        maxlength: 20
+      - name: "accent"
+        label: "لون الوحدة"
+        widget: "select"
+        required: true
+        default: "teal"
+        options:
+          - "teal"
+          - "sky"
+          - "indigo"
+          - "violet"
+          - "rose"
+          - "amber"
+          - "emerald"
+          - "cyan"
+      - name: "createdAt"
+        label: "أُنشئت في"
+        widget: "datetime"
+        required: true
+        format: "YYYY-MM-DDTHH:mm:ss.SSS[Z]"
+        picker_utc: true
+        readonly: true
+      - name: "updatedAt"
+        label: "آخر تحديث"
+        widget: "datetime"
+        required: true
+        format: "YYYY-MM-DDTHH:mm:ss.SSS[Z]"
+        picker_utc: true
+        readonly: true
+        auto_now: true
+  - divider: true
+  - name: "lessons"
+    label: "الدروس — Lessons"
+    label_singular: "درس"
+    icon: "description"
+    folder: "content/lessons"
+    extension: "json"
+    format: "json"
+    create: true
+    delete: false
+    identifier_field: "titleAr"
+    slug:
+      template: "{{fields.id}}"
+      editable: false
+    summary: "{{fields.status}} · #{{fields.position}} · {{fields.titleAr}}"
+    sortable_fields:
+      - "unitId"
+      - "position"
+      - "id"
+      - "titleAr"
+      - "status"
+      - "updatedAt"
+    view_groups:
+      groups:
+        - name: "drafts"
+          label: "مسودات"
+          field: "status"
+          eq: "draft"
+        - name: "published"
+          label: "منشورة"
+          field: "status"
+          eq: "published"
+    fields:
+      - name: "id"
+        label: "معرّف الدرس (رقم فريد، وهو اسم الملف)"
+        widget: "number"
+        value_type: "int"
+        required: true
+        min: 1
+      - name: "unitId"
+        label: "الوحدة"
+        widget: "relation"
+        collection: "units"
+        value_field: "{{fields.id}}"
+        search_fields:
+          - "titleAr"
+          - "titleEn"
+          - "id"
+        display_fields:
+          - "#{{id}} {{titleAr}}"
+        required: true
+        hint: "يجب أن تكون الوحدة موجودة مسبقًا في مجموعة الوحدات."
+      - name: "position"
+        label: "ترتيب الدرس داخل الوحدة"
+        widget: "number"
+        value_type: "int"
+        required: true
+        min: 1
+      - name: "titleAr"
+        label: "العنوان (عربي)"
+        widget: "string"
+        required: true
+        maxlength: 200
+      - name: "titleEn"
+        label: "Title (English)"
+        widget: "string"
+        required: false
+        maxlength: 200
+      - name: "pageLabel"
+        label: "إشارة الصفحات"
+        widget: "string"
+        required: false
+        maxlength: 100
+        hint: "مثال: «ص 24–29». حقل نصي حر."
+      - name: "status"
+        label: "حالة النشر"
+        widget: "select"
+        required: true
+        default: "draft"
+        options:
+          - label: "مسودة"
+            value: "draft"
+          - label: "منشور"
+            value: "published"
+        hint: "«منشور» هنا يعني جاهزًا للنشر — لا يُنشر شيء تلقائيًا. النشر العام يدوي (PR 6)."
+      - name: "isLastInUnit"
+        label: "آخر درس في الوحدة"
+        widget: "boolean"
+        required: false
+        default: false
+      - name: "publishedAt"
+        label: "تاريخ النشر"
+        widget: "datetime"
+        required: false
+        format: "YYYY-MM-DDTHH:mm:ss.SSS[Z]"
+        picker_utc: true
+      - name: "contentUpdatedAt"
+        label: "آخر تحديث للمحتوى"
+        widget: "datetime"
+        required: true
+        format: "YYYY-MM-DDTHH:mm:ss.SSS[Z]"
+        picker_utc: true
+        readonly: true
+        hint: "أسّ اكتشاف تقادم الاختبارات (sourceFingerprint). يحدّثه media:sync."
+      - name: "createdAt"
+        label: "أُنشئ في"
+        widget: "datetime"
+        required: true
+        format: "YYYY-MM-DDTHH:mm:ss.SSS[Z]"
+        picker_utc: true
+        readonly: true
+      - name: "updatedAt"
+        label: "آخر تحديث"
+        widget: "datetime"
+        required: true
+        format: "YYYY-MM-DDTHH:mm:ss.SSS[Z]"
+        picker_utc: true
+        readonly: true
+        auto_now: true
+      - name: "images"
+        label: "صفحات الدرس (صور WebP)"
+        widget: "list"
+        required: false
+        collapsed: true
+        summary: "#{{fields.position}} · {{fields.file}}"
+        hint: "ترتيب الصور = ترتيب العرض. الرفع من المتصفح يحوّل تلقائيًا إلى WebP ويحذف EXIF/GPS، لكن sha256 والمصغّرات والأبعاد تُحسب محليًا بـ `npm run media:sync`. thumb/width/height/bytes/sha256 are computed by `npm run media:sync`; the CMS cannot produce them and they must not be typed by hand."
+        fields:
+          - name: "position"
+            label: "ترتيب الصورة"
+            widget: "number"
+            value_type: "int"
+            required: true
+            min: 1
+          - name: "file"
+            label: "الملف"
+            widget: "image"
+            required: true
+            media_libraries:
+              default:
+                config:
+                  slugify_filename: true
+          - name: "thumb"
+            label: "Thumbnail (derived)"
+            widget: "hidden"
+          - name: "width"
+            label: "Width (derived)"
+            widget: "number"
+            required: false
+            value_type: "int"
+            readonly: true
+            hint: "Filled in by `npm run media:sync` from the stored WebP."
+          - name: "height"
+            label: "Height (derived)"
+            widget: "number"
+            required: false
+            value_type: "int"
+            readonly: true
+            hint: "Filled in by `npm run media:sync` from the stored WebP."
+          - name: "bytes"
+            label: "Original upload size (derived)"
+            widget: "number"
+            required: false
+            value_type: "int"
+            readonly: true
+            hint: "Informational only; the original stays on the owner's machine."
+          - name: "sha256"
+            label: "sha256 of the stored WebP (derived)"
+            widget: "string"
+            required: false
+            readonly: true
+            hint: "Content integrity hash. `npm run media:sync` computes it; do not type it."
+  - divider: true
+  - name: "settings"
+    label: "إعدادات المنصة"
+    icon: "settings"
+    files:
+      - name: "site"
+        label: "بيانات الموقع"
+        file: "content/site.json"
+        fields:
+          - name: "titleAr"
+            label: "عنوان الموقع (عربي)"
+            widget: "string"
+            required: false
+          - name: "titleEn"
+            label: "Site title (English)"
+            widget: "string"
+            required: false
+          - name: "notes"
+            label: "ملاحظات المالك"
+            widget: "text"
+            required: false
