@@ -7,16 +7,16 @@
  * must repair the record, create the thumbnail, keep the tree valid, and report
  * (never delete) orphans.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { validateContentTree } from "@/content/validate";
+import { ensureDirPath, openDir, UnsafeComponentError } from "@/lib/dirfd";
 import {
   formatRollbackReport,
-  makeDirsTracked,
   resolveInside,
   rollbackWrites,
   writeJson as writeJsonAtomic,
@@ -760,9 +760,14 @@ describe("media:sync is atomic when the writes themselves fail", () => {
     expect(() => resolveInside(path.join(root, "public", "media"), path.join(lessonsDir, "thumbs", "x.webp"))).toThrow(
       UnsafePathError,
     );
-    expect(() =>
-      makeDirsTracked(path.join(root, "public", "media"), path.join(lessonsDir, "thumbs", "sub"), []),
-    ).toThrow(UnsafePathError);
+    expect(() => {
+      const handle = openDir(path.join(root, "public", "media"));
+      try {
+        ensureDirPath(handle, ["lessons", "1", "thumbs", "sub"]);
+      } finally {
+        handle.close();
+      }
+    }).toThrow(UnsafeComponentError);
 
     const rolled = rollbackWrites(
       [path.join(lessonsDir, "thumbs", "x.webp")],
@@ -792,7 +797,14 @@ describe("media:sync is atomic when the writes themselves fail", () => {
     // The write path refuses before creating anything.
     expect(() => writeJsonAtomic(contentRoot, path.join(lessonsDir, "9.json"), { id: 9 })).toThrow(UnsafePathError);
     // So does directory creation, and so does a rollback delete or restore.
-    expect(() => makeDirsTracked(contentRoot, path.join(lessonsDir, "nested"), [])).toThrow(UnsafePathError);
+    expect(() => {
+      const handle = openDir(contentRoot);
+      try {
+        ensureDirPath(handle, ["lessons", "nested"]);
+      } finally {
+        handle.close();
+      }
+    }).toThrow(UnsafeComponentError);
 
     const victimDir = path.join(outside, "victim");
     fs.mkdirSync(victimDir);
@@ -955,4 +967,103 @@ describe("media:sync is atomic when the writes themselves fail", () => {
     expect(fs.readFileSync(overwritten, "utf8")).toBe(previous.toString("utf8"));
     expect(fs.readFileSync(untouched, "utf8")).toBe('{\n  "state": "same"\n}\n');
   });
+});
+
+/**
+ * `media:sync` itself, reading through a folder that is a link out of the tree.
+ *
+ * The earlier version of this test raced the folder between directory and link.
+ * That proved nothing: whenever the race made the page look absent the CLI
+ * aborted before reading, so both the vulnerable and the fixed version passed.
+ *
+ * A symlinked lesson folder is worse than a race and fully deterministic: the
+ * page is *present* through the link, so the script really does try to read it.
+ * Before the descriptor rewrite that read went outside mediaRoot; the outside
+ * bytes were hashed and reflected into the content record.
+ */
+describe("media:sync never reads or writes outside the media root", () => {
+  let base = "";
+  let contentRoot = "";
+  let mediaRoot = "";
+  let outside = "";
+
+  beforeEach(async () => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-sync-outside-"));
+    contentRoot = path.join(base, "content");
+    mediaRoot = path.join(base, "public", "media");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(contentRoot, "units"), { recursive: true });
+    fs.mkdirSync(path.join(contentRoot, "lessons"), { recursive: true });
+    fs.mkdirSync(path.join(contentRoot, "quizzes"), { recursive: true });
+    fs.mkdirSync(mediaRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    writeJson(path.join(contentRoot, "units", "1.json"), unit(1, 1));
+    writeJson(
+      path.join(contentRoot, "lessons", "1.json"),
+      lesson(1, 1, [{ position: 1, file: "page-01.webp", thumb: "thumbs/page-01.webp" }]),
+    );
+  });
+
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  function runCli(...args: string[]) {
+    return spawnSync(
+      process.execPath,
+      ["--import", "tsx", "scripts/media-sync.ts", "--content", contentRoot, "--media", mediaRoot, ...args],
+      { cwd: process.cwd(), encoding: "utf8", timeout: 120_000 },
+    );
+  }
+
+  it("does not hash a page that lives outside the root through a linked folder", async () => {
+    // A real WebP outside the tree, so the run would happily decode and hash it.
+    const outsidePage = path.join(outside, "page-01.webp");
+    await sharp({ create: { width: 640, height: 800, channels: 3, background: { r: 9, g: 9, b: 9 } } })
+      .webp()
+      .toFile(outsidePage);
+    const before = fs.readFileSync(outsidePage);
+    // lessons/1 is a link to the outside directory.
+    fs.mkdirSync(path.join(mediaRoot, "lessons"), { recursive: true });
+    fs.symlinkSync(outside, path.join(mediaRoot, "lessons", "1"));
+
+    // `atime` is the witness: opening the page outside updates it even when the
+    // bytes are only hashed and nothing is ever written there. Without it the test
+    // cannot distinguish "refused to look" from "looked and discarded".
+    const old = new Date(2000, 0, 1);
+    fs.utimesSync(outsidePage, old, old);
+    const atimeBefore = fs.statSync(outsidePage).atimeMs;
+
+    runCli();
+
+    const atimeAfter = fs.statSync(outsidePage).atimeMs;
+    // Nothing outside was modified, created or removed...
+    expect(fs.readFileSync(outsidePage)).toEqual(before);
+    // ...and it was not even opened through the link.
+    expect(atimeAfter).toBe(atimeBefore);
+    expect(fs.readdirSync(outside)).toEqual(["page-01.webp"]);
+    // ...and the page outside was never adopted. This is the discriminating
+    // assertion: before the descriptor rewrite the run found the page through the
+    // link, hashed it, and reported it as present (`missing: 0`), which is a read
+    // outside the tree even though it wrote nothing there.
+    const record = JSON.parse(fs.readFileSync(path.join(contentRoot, "lessons", "1.json"), "utf8"));
+    expect(record.images[0].sha256).toBeUndefined();
+    expect(record.images[0].width).toBeUndefined();
+  }, 180_000);
+
+  it("does not create a thumbnail outside the root through a linked thumbs folder", async () => {
+    const lessonDir = path.join(mediaRoot, "lessons", "1");
+    fs.mkdirSync(lessonDir, { recursive: true });
+    await sharp({ create: { width: 640, height: 800, channels: 3, background: { r: 4, g: 5, b: 6 } } })
+      .webp()
+      .toFile(path.join(lessonDir, "page-01.webp"));
+    // The thumbnail folder points outside, so a successful run would publish there.
+    fs.symlinkSync(outside, path.join(lessonDir, "thumbs"));
+
+    runCli();
+
+    // No image was written outside, and nothing was left behind — the thumbnail
+    // must not have been published through the link.
+    expect(fs.readdirSync(outside)).toEqual([]);
+  }, 180_000);
 });

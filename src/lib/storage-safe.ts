@@ -244,23 +244,30 @@ async function writeSerialized(root: string, dirParts: string[], leaf: string, d
 
 async function writeSerializedInner(root: string, dirParts: string[], leaf: string, data: Buffer): Promise<void> {
   const constants = fsSync.constants;
-  const rootHandle = openRoot(root, true);
-
-  // Every directory below the root is created relative to a descriptor, so
-  // `mkdir` cannot be redirected by a swap of the textual path.
-  makeDirPath(rootHandle, dirParts);
-  const parent = openDirUnder(rootHandle, dirParts);
-
+  // The root handle is acquired *inside* the guarded region: every later step —
+  // creating levels, opening the parent, opening the leaf — can fail, and each of
+  // those failures must still close it. Anything done before the `try` would leak
+  // a descriptor per refused write.
+  let rootHandle: ReturnType<typeof openRoot> | null = null;
+  let parent: ReturnType<typeof openDirUnder> | null = null;
   let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
   let created = false;
   let committed = false;
   let failure: unknown = null;
   try {
+    rootHandle = openRoot(root, true);
+    // Every directory below the root is created relative to a descriptor, so
+    // `mkdir` cannot be redirected by a swap of the textual path.
+    makeDirPath(rootHandle, dirParts);
+    parent = openDirUnder(rootHandle, dirParts);
+    if (parent === null) throw new UnsafeStoragePathError(`cannot open ${dirParts.join("/")}`);
+    const pinned = parent;
+
     try {
       // The leaf is opened relative to the pinned parent, so the name cannot move.
       // `O_EXCL` refuses an existing entry instead of truncating it.
       handle = await fs.open(
-        at(parent.fd, leaf),
+        at(pinned.fd, leaf),
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
         0o644,
       );
@@ -269,11 +276,11 @@ async function writeSerializedInner(root: string, dirParts: string[], leaf: stri
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       // It exists: open for writing without truncating, then prove — on the
       // descriptor — that it is a regular file inside this directory.
-      handle = await fs.open(at(parent.fd, leaf), constants.O_WRONLY | constants.O_NOFOLLOW, 0o644);
+      handle = await fs.open(at(pinned.fd, leaf), constants.O_WRONLY | constants.O_NOFOLLOW, 0o644);
     }
 
     const stat = await handle.stat();
-    if (!stat.isFile()) throw new UnsafeStoragePathError(`${at(parent.fd, leaf)} is not a regular file`);
+    if (!stat.isFile()) throw new UnsafeStoragePathError(`${at(pinned.fd, leaf)} is not a regular file`);
     // Truncation only here, on a descriptor obtained through the pinned chain.
     await handle.truncate(0);
     await handle.write(data, 0, data.length, 0);
@@ -287,7 +294,7 @@ async function writeSerializedInner(root: string, dirParts: string[], leaf: stri
     // directory. Closing first and then unlinking by `<ns>/<fd>/name` would be a
     // use-after-close — the number can be reused by an unrelated open, and the
     // unlink would then land in whatever directory that new descriptor names.
-    if (!committed && created) {
+    if (!committed && created && parent !== null) {
       try {
         parent.unlink(leaf);
       } catch (error) {
@@ -300,8 +307,8 @@ async function writeSerializedInner(root: string, dirParts: string[], leaf: stri
         }
       }
     }
-    parent.close();
-    rootHandle.close();
+    parent?.close();
+    rootHandle?.close();
   }
   if (failure !== null) throw failure;
 }

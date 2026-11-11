@@ -29,15 +29,22 @@ import { canonicalMediaFile, isLegalMediaName } from "../src/media/naming";
 import { buildReferenceIndex, collectedQuizReferences } from "../src/media/sync-helpers";
 import {
   defaultPaths,
-  makeDirsTracked,
   nowIso,
   readLessons,
   readQuizFiles,
   formatRollbackReport,
-  resolveInside,
   rollbackWrites,
   writeJson,
 } from "../src/media/tree";
+import {
+  ensureDirPath,
+  fileExistsAt,
+  openDir,
+  openDirUnder,
+  readFileAt,
+  relativeParts,
+  writeFileAt,
+} from "../src/lib/dirfd";
 import { validateContentTree } from "../src/content/validate";
 import type { LessonContent, LessonImageContent } from "../src/content/model";
 
@@ -92,6 +99,22 @@ interface SyncSummary {
   canonicalized: Array<{ lessonId: number; from: string; to: string }>;
 }
 
+/**
+ * The media root in the spelling the descriptor walk uses.
+ *
+ * `realpath` when it exists (a symlinked root has two names, and the descriptors
+ * descend the resolved one); the declared path when it does not, so a fresh
+ * checkout can still create it.
+ */
+function resolveMediaRoot(mediaRoot: string, options: { create: boolean }): string {
+  try {
+    return fs.realpathSync(mediaRoot);
+  } catch {
+    if (options.create) return path.resolve(mediaRoot);
+    return path.resolve(mediaRoot);
+  }
+}
+
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   const paths = defaultPaths();
@@ -124,9 +147,29 @@ async function main(): Promise<void> {
    */
   const pendingThumbs: Array<{ path: string; buffer: Buffer }> = [];
 
+  // The media tree is read through descriptors: the root is opened once and each
+  // lesson folder is opened relative to it, so a folder swapped for a link during
+  // the run cannot make this phase read or hash anything outside mediaRoot.
+  // A fresh checkout may not have produced `public/media` yet: that is an empty
+  // tree, not an error, and every page is then reported as missing.
+  const mediaRootHandle = ((): ReturnType<typeof openDir> | null => {
+    try {
+      return openDir(resolveMediaRoot(paths.mediaRoot, { create: false }));
+    } catch {
+      return null;
+    }
+  })();
+  try {
   for (const entry of readLessons(paths.contentRoot)) {
     const lesson = entry.value;
     const dir = path.join(lessonsDir, String(lesson.id));
+    const lessonParts = relativeParts(resolveMediaRoot(paths.mediaRoot, { create: false }), dir);
+    let lessonDir: ReturnType<typeof openDir> | null = null;
+    try {
+      lessonDir = mediaRootHandle === null ? null : openDirUnder(mediaRootHandle, lessonParts);
+    } catch {
+      lessonDir = null; // absent, or refused; treated as "no files" below
+    }
     const nextImages: LessonImageContent[] = [];
     let changed = false;
 
@@ -155,13 +198,15 @@ async function main(): Promise<void> {
         nextImages.push(image);
         continue;
       }
-      const filePath = path.join(dir, file);
-      if (!fs.existsSync(filePath)) {
+      // Read through the pinned lesson descriptor: the bytes and the existence
+      // check refer to the same file, and `readFileAt` verifies the type with
+      // `fstat` before returning anything.
+      const buffer = lessonDir === null ? null : readFileAt(lessonDir, file);
+      if (buffer === null) {
         summary.missing.push(`lessons/${lesson.id}/${file}`);
         nextImages.push(image);
         continue;
       }
-      const buffer = fs.readFileSync(filePath);
       if (detectMime(buffer) !== "image/webp") {
         summary.errors.push(`lessons/${lesson.id}/${file} is not a WebP file`);
         nextImages.push(image);
@@ -187,7 +232,19 @@ async function main(): Promise<void> {
         sha256: sha256Hex(buffer),
       };
       const thumbPath = path.join(dir, "thumbs", file);
-      if (!fs.existsSync(thumbPath)) {
+      const thumbExists = ((): boolean => {
+        if (lessonDir === null) return false;
+        let thumbs: ReturnType<typeof openDir> | null = null;
+        try {
+          thumbs = openDirUnder(lessonDir, ["thumbs"]);
+          return fileExistsAt(thumbs, file);
+        } catch {
+          return false;
+        } finally {
+          thumbs?.close();
+        }
+      })();
+      if (!thumbExists) {
         const thumbBuffer = await sharp(buffer)
           .resize({ width: THUMB_MAX_EDGE, height: THUMB_MAX_EDGE, fit: "inside", withoutEnlargement: true })
           .webp({ quality: THUMB_QUALITY, effort: 4 })
@@ -208,15 +265,17 @@ async function main(): Promise<void> {
       nextImages.push(refreshed);
     }
 
-    // Orphan detection scoped to this lesson folder.
-    if (fs.existsSync(dir)) {
-      for (const name of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (!name.isFile() || !name.name.toLowerCase().endsWith(".webp")) continue;
+    // Orphan detection scoped to this lesson folder, listed through the same
+    // descriptor the pages were read from.
+    if (lessonDir !== null) {
+      for (const name of lessonDir.list()) {
+        if (!name.isFile() || name.name.toLowerCase().endsWith(".webp") === false) continue;
         if (!nextImages.some((image) => image.file === name.name)) {
           summary.orphans.push(`lessons/${lesson.id}/${name.name}`);
         }
       }
     }
+    lessonDir?.close();
 
     if (changed) {
       summary.lessonsChanged += 1;
@@ -234,6 +293,9 @@ async function main(): Promise<void> {
       // In a read-only run the in-memory record is corrected so orphan
       // detection below still compares against the right set.
     }
+  }
+  } finally {
+    mediaRootHandle?.close();
   }
 
   const quizRefs = collectedQuizReferences(readQuizFiles(paths.contentRoot));
@@ -351,36 +413,67 @@ async function main(): Promise<void> {
   const createdFiles: string[] = [];
   const createdDirectories: string[] = [];
   const overwrittenFiles: Array<{ path: string; previous: Buffer }> = [];
-  const rememberFile = (target: string): void => {
-    if (!fs.existsSync(target)) {
-      createdFiles.push(target);
+
+  /**
+   * Records what a write is about to do, reading any previous bytes through a
+   * descriptor rather than by path.
+   *
+   * `fs.existsSync(path)` followed by `fs.readFileSync(path)` is a check-then-use
+   * pair: the directory can be swapped between them, and the "previous bytes"
+   * would then come from outside the tree. Here the parent is pinned and the read
+   * goes through it, and the same handle is reused for the write below.
+   */
+  const remember = (
+    parent: ReturnType<typeof openDir>,
+    name: string,
+    absolute: string,
+  ): void => {
+    const existing = fileExistsAt(parent, name);
+    if (!existing) {
+      createdFiles.push(absolute);
       return;
     }
-    overwrittenFiles.push({ path: target, previous: fs.readFileSync(target) });
+    const previous = readFileAt(parent, name);
+    if (previous === null) {
+      createdFiles.push(absolute);
+      return;
+    }
+    overwrittenFiles.push({ path: absolute, previous });
   };
+
   try {
-    for (const thumb of pendingThumbs) {
-      // Thumbnail writes go through the same containment guard: a symlinked
-      // directory inside mediaRoot must not become a route out of it.
-      const safeThumb = resolveInside(paths.mediaRoot, thumb.path);
-      rememberFile(safeThumb);
-      makeDirsTracked(paths.mediaRoot, path.dirname(safeThumb), createdDirectories);
-      // O_NOFOLLOW so the final component cannot be (or become) a symlink.
-      const thumbFlags =
-        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
-      const thumbFd = fs.openSync(safeThumb, thumbFlags, 0o644);
+    if (pendingThumbs.length > 0) {
+      const mediaRootForWrites = resolveMediaRoot(paths.mediaRoot, { create: true });
+      const mediaHandle = openDir(mediaRootForWrites);
       try {
-        fs.writeFileSync(thumbFd, thumb.buffer);
+        for (const thumb of pendingThumbs) {
+          const parts = relativeParts(mediaRootForWrites, thumb.path);
+          const leaf = parts.pop() as string;
+          // Missing levels are created relative to the pinned root and recorded,
+          // so a failed run can remove exactly what it created.
+          const { dir, created } = ensureDirPath(mediaHandle, parts);
+          try {
+            for (const name of created) createdDirectories.push(path.join(mediaRootForWrites, name));
+            remember(dir, leaf, path.join(mediaRootForWrites, ...parts, leaf));
+            // `writeFileAt` creates with O_EXCL, or truncates only after the
+            // descriptor is proven to be a regular file. No O_TRUNC on a path.
+            writeFileAt(dir, leaf, thumb.buffer, { exclusive: false });
+          } finally {
+            dir.close();
+          }
+        }
       } finally {
-        fs.closeSync(thumbFd);
+        mediaHandle.close();
       }
     }
     for (const pending of pendingWrites) {
-      const target = resolveInside(
-        paths.contentRoot,
-        path.join(paths.contentRoot, "lessons", pending.file),
-      );
-      rememberFile(target);
+      const target = path.join(paths.contentRoot, "lessons", pending.file);
+      const contentHandle = openDir(paths.contentRoot);
+      try {
+        remember(contentHandle, path.join("lessons", pending.file), target);
+      } finally {
+        contentHandle.close();
+      }
       writeJson(paths.contentRoot, target, pending.lesson);
     }
   } catch (error) {

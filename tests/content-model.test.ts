@@ -192,6 +192,35 @@ describe("lesson validation", () => {
     expect(codes(tree())).toContain("IMAGE_NOT_FOUND");
   });
 
+  /**
+   * Guard, not a regression: `30d763f` already refused this case, because the
+   * `isInsideRoot` check ran before the read. The change makes the refusal
+   * structural — the bytes now come from a pinned descriptor rather than from a
+   * path that was checked a moment earlier. So this test does not distinguish the
+   * two versions; it locks the behaviour in place for future changes.
+   */
+  it("refuses to read a media file that lives outside the root through a link", () => {
+    // `content:validate` hashes media to prove the record matches the bytes. If it
+    // follows a symlinked lesson folder it hashes a file that is not part of the
+    // repository — a record could then "validate" against bytes nobody reviewed,
+    // and an outside file would be opened by a validation run.
+    const outside = path.join(tmp, "outside-media");
+    fs.mkdirSync(outside, { recursive: true });
+    const realBytes = fs.readFileSync(path.join(tmp, "media", "lessons", "1", "page-01.webp"));
+    fs.writeFileSync(path.join(outside, "page-01.webp"), realBytes);
+    // Re-point the lesson folder at the outside copy.
+    const lessonDir = path.join(tmp, "media", "lessons", "1");
+    fs.rmSync(lessonDir, { recursive: true, force: true });
+    fs.symlinkSync(outside, lessonDir);
+
+    // The page exists through the link, so a path-based read would find it and
+    // accept the record. The descriptor read refuses the component instead.
+    const result = tree();
+    expect(codes(result)).toContain("IMAGE_NOT_FOUND");
+    // And the outside bytes were not consumed: the file is untouched.
+    expect(fs.readFileSync(path.join(outside, "page-01.webp"))).toEqual(realBytes);
+  });
+
   it("fails when a media file's hash does not match the lesson record", () => {
     const file = path.join(tmp, "media", "lessons", "1", "page-01.webp");
     const buf = fs.readFileSync(file);

@@ -99,22 +99,56 @@ function probeNamespace(candidate: string): boolean {
     fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
     const base = `${candidate}/${fd}`;
 
-    // 1. list
-    if (!Array.isArray(fs.readdirSync(base))) return false;
-    // 2. create
-    fs.writeFileSync(`${base}/probe.txt`, "probe");
-    // 3. stat through the descriptor
-    if (!fs.statSync(`${base}/probe.txt`).isFile()) return false;
-    // 4. open a child relative to the descriptor
-    const child = fs.openSync(`${base}/probe.txt`, fs.constants.O_RDONLY);
+    // Every operation this module performs is exercised. A namespace that works
+    // for some of them and not others is rejected: partial support is worse than
+    // none, because it would pass the check and fail mid-operation later.
+    if (!Array.isArray(fs.readdirSync(base))) return false; // list
+
+    const created = fs.openSync(`${base}/probe.txt`, fs.constants.O_WRONLY | fs.constants.O_CREAT, 0o644);
     try {
-      if (fs.readFileSync(child, "utf8") !== "probe") return false;
+      fs.writeFileSync(created, "probe"); // create + write
     } finally {
-      fs.closeSync(child);
+      fs.closeSync(created);
     }
-    // 5. unlink relative to the descriptor
-    fs.unlinkSync(`${base}/probe.txt`);
-    return !fs.existsSync(path.join(dir, "probe.txt"));
+
+    const reopened = fs.openSync(`${base}/probe.txt`, fs.constants.O_RDONLY);
+    try {
+      if (fs.readFileSync(reopened, "utf8") !== "probe") return false; // read
+    } finally {
+      fs.closeSync(reopened);
+    }
+
+    if (!fs.statSync(`${base}/probe.txt`).isFile()) return false; // stat
+    if (fs.lstatSync(`${base}/probe.txt`).isSymbolicLink()) return false; // lstat
+
+    // mkdir, then rename between the descriptor and its child descriptor.
+    fs.mkdirSync(`${base}/inner`);
+    const inner = fs.openSync(`${base}/inner`, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    try {
+      fs.renameSync(`${base}/probe.txt`, `${candidate}/${inner}/moved.txt`);
+      if (!fs.existsSync(`${base}/inner/moved.txt`)) return false; // rename across
+      fs.unlinkSync(`${base}/inner/moved.txt`); // unlinkat
+      if (fs.existsSync(`${base}/inner/moved.txt`)) return false;
+    } finally {
+      fs.closeSync(inner);
+    }
+    fs.rmdirSync(`${base}/inner`); // remove an empty directory
+    if (fs.existsSync(path.join(dir, "inner"))) return false;
+
+    // The descriptor must stay pinned to its inode: rename the directory away,
+    // put a link in its place, and confirm the descriptor still sees the original.
+    const pinned = `${base}/pinned.txt`;
+    fs.writeFileSync(pinned, "pinned");
+    const moved = `${dir}-moved`;
+    fs.renameSync(dir, moved);
+    fs.symlinkSync(os.tmpdir(), dir);
+    try {
+      if (fs.readFileSync(`${base}/pinned.txt`, "utf8") !== "pinned") return false;
+    } finally {
+      fs.unlinkSync(dir);
+      fs.renameSync(moved, dir);
+    }
+    return true;
   } catch {
     return false;
   } finally {
@@ -378,4 +412,193 @@ export function withDir<T>(dir: string, fn: (handle: OpenDir) => T): T {
   } finally {
     handle.close();
   }
+}
+
+/**
+ * Reads a file relative to a pinned parent directory, verifying on the descriptor.
+ *
+ * Returns `null` when the entry does not exist, so callers keep the "absent" and
+ * "refused" cases distinguishable: absence is an empty result, a symlink or a
+ * non-file is an error.
+ */
+export function readFileAt(parent: OpenDir, name: string): Buffer | null {
+  let fd: number | null = null;
+  try {
+    fd = parent.open(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    // `fstat` on the descriptor that was actually opened: the type check and the
+    // read refer to one file, with no name re-resolved in between.
+    if (!fs.fstatSync(fd).isFile()) {
+      throw new UnsafeComponentError(`${name} is not a regular file`);
+    }
+    return fs.readFileSync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw translateComponentError(error);
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+/** True when `name` exists inside `parent` and is a regular file. */
+export function fileExistsAt(parent: OpenDir, name: string): boolean {
+  try {
+    return parent.lstat(name).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Writes `data` to `name` inside a pinned parent directory.
+ *
+ * `exclusive: false` truncates an existing file — but only after the descriptor
+ * is open and `fstat` has confirmed it is a regular file, so truncation can never
+ * reach something that was not validated.
+ */
+export function writeFileAt(
+  parent: OpenDir,
+  name: string,
+  data: Buffer,
+  options: { exclusive?: boolean; mode?: number } = {},
+): void {
+  const exclusive = options.exclusive ?? true;
+  const mode = options.mode ?? 0o644;
+  let fd: number | null = null;
+  try {
+    if (exclusive) {
+      fd = parent.open(name, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, mode);
+    } else {
+      try {
+        fd = parent.open(name, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, mode);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        // Existing: open without truncating, prove the type, then truncate.
+        fd = parent.open(name, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, mode);
+        if (!fs.fstatSync(fd).isFile()) {
+          throw new UnsafeComponentError(`${name} is not a regular file`);
+        }
+        fs.ftruncateSync(fd, 0);
+      }
+    }
+    fs.writeFileSync(fd, data);
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+/**
+ * `mkdir -p` that reports what it actually created.
+ *
+ * Each level is created relative to its parent's descriptor, so a swapped textual
+ * path cannot redirect the creation. A level that already exists is opened with
+ * `O_NOFOLLOW | O_DIRECTORY`, which refuses a symlink rather than traversing it.
+ * The returned list contains only directories this call created, deepest last —
+ * that is what a rollback must remove and nothing else.
+ */
+export function makeDirPathTracked(root: OpenDir, parts: string[]): string[] {
+  const created: string[] = [];
+  let current = root.fd;
+  const opened: number[] = [];
+  try {
+    for (const part of parts) {
+      const target = at(current, part);
+      let madeIt = false;
+      try {
+        fs.mkdirSync(target);
+        madeIt = true;
+        created.push(part);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      try {
+        current = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      } catch (error) {
+        if (madeIt) created.pop();
+        throw translateComponentError(error);
+      }
+      opened.push(current);
+    }
+    return created;
+  } finally {
+    for (const fd of [...opened].reverse()) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* nothing to do */
+      }
+    }
+  }
+}
+
+/**
+ * Ensures every level of `parts` exists under `root`, creating what is missing.
+ *
+ * Returns the relative names it actually created (e.g. `["lessons", "lessons/3"]`),
+ * which is exactly what a rollback may remove. Creation is one `mkdirat` per
+ * level against the parent descriptor; an existing level is opened with
+ * `O_NOFOLLOW | O_DIRECTORY` so a symlink is refused rather than traversed.
+ */
+export function ensureDirPath(root: OpenDir, parts: string[]): { dir: OpenDir; created: string[] } {
+  const created: string[] = [];
+  let current = root;
+  let ownedCurrent: OpenDir | null = null;
+  try {
+    for (const [index, part] of parts.entries()) {
+      let madeIt = false;
+      try {
+        fs.mkdirSync(at(current.fd, part));
+        madeIt = true;
+        created.push(parts.slice(0, index + 1).join("/"));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      let next: OpenDir;
+      try {
+        next = openDirUnder(current, [part]);
+      } catch (error) {
+        if (madeIt) created.pop();
+        throw error;
+      }
+      // Only descriptors this call owns are closed; `root` belongs to the caller.
+      if (ownedCurrent !== null) ownedCurrent.close();
+      ownedCurrent = next;
+      current = next;
+    }
+    if (parts.length === 0) {
+      const fd = fs.openSync(at(root.fd), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+      return { dir: makeSingle(fd), created };
+    }
+    return { dir: ownedCurrent as OpenDir, created };
+  } catch (error) {
+    if (ownedCurrent !== null) ownedCurrent.close();
+    throw error;
+  }
+}
+
+/** A handle owning exactly one descriptor. */
+function makeSingle(fd: number): OpenDir {
+  return {
+    fd,
+    open: (name, flags, mode) => fs.openSync(at(fd, name), flags, mode),
+    mkdir: (name) => {
+      fs.mkdirSync(at(fd, name));
+    },
+    unlink: (name) => {
+      fs.unlinkSync(at(fd, name));
+    },
+    rename: (from, toDir, to) => {
+      fs.renameSync(at(fd, from), at(toDir.fd, to));
+    },
+    stat: (name) => fs.statSync(at(fd, name)),
+    lstat: (name) => fs.lstatSync(at(fd, name)),
+    list: () => fs.readdirSync(at(fd), { withFileTypes: true }),
+    close: () => {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    },
+  };
 }

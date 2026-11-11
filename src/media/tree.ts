@@ -128,7 +128,14 @@ function asUnsafePathError(error: unknown): unknown {
 
 function writeJsonInner(root: string, target: string, value: unknown): void {
   const handle = openParent(root, target, { create: true });
-  const temporary = `.${handle.leaf}.tmp-${process.pid}`;
+  // A unique temporary name, not `.<leaf>.tmp-<pid>`: two runs of the same script
+  // — or two processes sharing a pid namespace — would otherwise collide on the
+  // name, and the loser's cleanup could delete the winner's in-flight file.
+  const temporary = `.${handle.leaf}.${crypto.randomUUID()}.tmp`;
+  // Tracks whether *this* call actually created the temporary file. Without it the
+  // `catch` would unlink a name it never owned: an `EEXIST` failure means someone
+  // else's file is sitting there, and removing it would destroy their work.
+  let createdTemporary = false;
   try {
     // Refuse a link at the destination explicitly. `renameat` would replace the
     // link itself rather than writing through it — the victim's bytes are safe —
@@ -146,21 +153,28 @@ function writeJsonInner(root: string, target: string, value: unknown): void {
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
       0o644,
     );
+    createdTemporary = true;
     try {
       fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
     } finally {
       fs.closeSync(fd);
     }
     // `renameat`: both operands are descriptors, so the destination directory
-    // cannot be swapped between the write and the publication.
+    // cannot be swapped between the write and the publication. Ownership of the
+    // temporary file passes to the destination name here.
     handle.parent.rename(temporary, handle.parent, handle.leaf);
+    createdTemporary = false;
   } catch (error) {
     // Never let cleanup mask the real failure: on a read-only directory even
     // removing the temporary file is refused, and the caller needs the cause.
-    try {
-      handle.parent.unlink(temporary);
-    } catch {
-      /* as above */
+    // Only ever remove the file this call created, and only relative to the same
+    // descriptor it was created under.
+    if (createdTemporary) {
+      try {
+        handle.parent.unlink(temporary);
+      } catch {
+        /* as above */
+      }
     }
     throw error;
   } finally {
@@ -535,33 +549,62 @@ export function rollbackWrites(
         failures.push(`could not restore ${file.path}: no writable descriptor path`);
         continue;
       }
-      // Read the current bytes *through a descriptor* opened O_NOFOLLOW relative
-      // to the pinned parent, so the comparison and the rewrite refer to one file.
-      let current: Buffer | null = null;
+      // One descriptor for the whole compare-and-restore, so the file that is
+      // compared is the file that is rewritten. Reading through one descriptor,
+      // closing it, and reopening the *name* for writing would leave a window in
+      // which the name points at something else — and the rewrite would land on a
+      // file that was never compared.
+      let fd: number;
       try {
-        const fd = handle.parent.open(handle.leaf, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-        try {
-          current = fs.readFileSync(fd);
-        } finally {
-          fs.closeSync(fd);
-        }
+        // `O_RDONLY` first: a restored record may legitimately be mode 0444, and
+        // `O_RDWR` would fail on it before the bytes could even be compared.
+        fd = handle.parent.open(handle.leaf, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        // Absent: create it exclusively, so a file that appeared meanwhile is not
+        // silently adopted, and write through the new descriptor.
+        const created = handle.parent.open(
+          handle.leaf,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+          0o644,
+        );
+        try {
+          fs.writeFileSync(created, file.previous);
+        } finally {
+          fs.closeSync(created);
+        }
+        restored += 1;
+        continue;
       }
-      if (current !== null && current.equals(file.previous)) continue;
-
-      const fd = handle.parent.open(
-        handle.leaf,
-        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW,
-        0o644,
-      );
       try {
-        fs.ftruncateSync(fd, 0);
-        fs.writeFileSync(fd, file.previous);
+        // `fstat` on the descriptor: the type is decided on the file that will be
+        // written, not on a name that could point somewhere else.
+        if (!fs.fstatSync(fd).isFile()) {
+          failures.push(`refused to restore ${file.path}: not a regular file`);
+          continue;
+        }
+        const current = fs.readFileSync(fd);
+        if (current.equals(file.previous)) continue; // already the old bytes
+        const identity = fs.fstatSync(fd);
+        // Reopen the *same name* for writing, then prove by `dev`/`ino` that it is
+        // the file that was just compared. Without that check a swap between the
+        // read and the reopen would let the restore land on another file.
+        const writable = handle.parent.open(handle.leaf, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+        try {
+          const again = fs.fstatSync(writable);
+          if (again.dev !== identity.dev || again.ino !== identity.ino) {
+            failures.push(`refused to restore ${file.path}: the file changed during the restore`);
+            continue;
+          }
+          fs.ftruncateSync(writable, 0);
+          fs.writeSync(writable, file.previous, 0, file.previous.length, 0);
+          restored += 1;
+        } finally {
+          fs.closeSync(writable);
+        }
       } finally {
         fs.closeSync(fd);
       }
-      restored += 1;
     } catch (error) {
       failures.push(`could not restore ${file.path}: ${(error as Error).message}`);
     } finally {
@@ -635,30 +678,6 @@ export function formatRollbackReport(
       "inspect the files listed above before re-running.",
   );
   return { lines, failureLines, complete };
-}
-
-/**
- * `mkdir -p` that records which directories it actually created, so a failed
- * commit can remove exactly those and nothing that was already there.
- */
-export function makeDirsTracked(root: string, dir: string, created: string[]): void {
-  // The whole chain is validated first: a symlinked component below the root is
-  // refused here rather than allowed to redirect every directory created below.
-  resolveInside(root, dir);
-  const missing: string[] = [];
-  let current = path.resolve(dir);
-  const absoluteRoot = path.resolve(root);
-  while (current !== absoluteRoot && lstatOrNull(current) === null) {
-    missing.push(current);
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  for (const target of [...missing].reverse()) {
-    fs.mkdirSync(target);
-    created.push(target);
-  }
-  resolveInside(root, dir);
 }
 
 export function writeLesson(contentRoot: string, lesson: LessonContent): string {

@@ -836,3 +836,68 @@ describe("the re-check after mkdir uses the upload root, not the directory", () 
     expect(fs.readFileSync(target, "utf8")).toBe("OK");
   });
 });
+
+/**
+ * Descriptor leaks.
+ *
+ * Every read and write opens up to three descriptors (root, parent, file). A
+ * missing `close` in a `finally` is invisible in behaviour but fatal in
+ * production: a long-running server exhausts its descriptor table and then fails
+ * every operation. Measured on the process's own descriptor directory rather
+ * than inferred from the code.
+ */
+describe("descriptor bookkeeping", () => {
+  function fdNamespacePath(): string {
+    return fs.existsSync("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd";
+  }
+  function openDescriptors(): number {
+    return fs.readdirSync(fdNamespacePath()).length;
+  }
+
+  it("does not grow the descriptor table across many reads and writes", async () => {
+    const storage = await import("@/lib/storage");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fdleak-"));
+    const previous = process.env.UPLOAD_DIR;
+    process.env.UPLOAD_DIR = path.join(base, "uploads");
+    try {
+      await storage.writeKey("lesson/page.webp", Buffer.from("X"));
+      const baseline = openDescriptors();
+
+      for (let i = 0; i < 300; i += 1) await storage.readKey("lesson/page.webp");
+      const afterReads = openDescriptors();
+      expect(afterReads - baseline).toBeLessThanOrEqual(1);
+
+      for (let i = 0; i < 150; i += 1) await storage.writeKey("lesson/page.webp", Buffer.from("Y"));
+      expect(openDescriptors() - afterReads).toBeLessThanOrEqual(1);
+
+      for (let i = 0; i < 150; i += 1) await storage.deleteKey("lesson/page.webp");
+      expect(openDescriptors() - afterReads).toBeLessThanOrEqual(1);
+    } finally {
+      if (previous === undefined) delete process.env.UPLOAD_DIR;
+      else process.env.UPLOAD_DIR = previous;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("does not leak when a write fails after opening the root", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fdleak2-"));
+    const root = path.join(base, "uploads");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    // A link where a directory must be: the walk refuses, after the root is open.
+    fs.symlinkSync(outside, path.join(root, "link"));
+    try {
+      const baseline = openDescriptors();
+      for (let i = 0; i < 200; i += 1) {
+        await writeInsideUploadRoot(root, path.join(root, "link", "x.bin"), Buffer.from("X")).catch(
+          () => undefined,
+        );
+      }
+      expect(openDescriptors() - baseline).toBeLessThanOrEqual(1);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+});

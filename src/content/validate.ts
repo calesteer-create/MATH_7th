@@ -15,6 +15,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { openDir, openDirUnder, readFileAt } from "../lib/dirfd";
 import {
   GRADING_MODES,
   IMAGE_FILE_RE,
@@ -798,6 +799,33 @@ export interface TreeValidationOptions {
   lessonOverrides?: ReadonlyMap<string, LessonContent>;
 }
 
+/**
+ * Reads a media file relative to the media root, descriptor by descriptor.
+ *
+ * Returns `null` when the file is absent. A symlinked component is refused rather
+ * than followed, so validation cannot be tricked into hashing a file outside the
+ * tree — which would otherwise let a record's `sha256` be "valid" against bytes
+ * that are not part of the repository.
+ */
+function readMediaInside(resolvedMediaRoot: string, relative: string): Buffer | null {
+  let rootHandle: ReturnType<typeof openDir> | null = null;
+  let parent: ReturnType<typeof openDir> | null = null;
+  try {
+    if (!fs.existsSync(resolvedMediaRoot)) return null;
+    const parts = relative.split("/").filter((part) => part !== "" && part !== ".");
+    const leaf = parts.pop();
+    if (leaf === undefined) return null;
+    rootHandle = openDir(resolvedMediaRoot);
+    parent = openDirUnder(rootHandle, parts);
+    return readFileAt(parent, leaf);
+  } catch {
+    return null;
+  } finally {
+    parent?.close();
+    rootHandle?.close();
+  }
+}
+
 export function validateContentTree(
   contentRoot: string,
   mediaRoot?: string,
@@ -1002,11 +1030,14 @@ export function validateContentTree(
         }
         referencedMedia.add(rel);
         referencedMedia.add(`lessons/${lesson.id}/${image.thumb}`);
-        if (!fs.existsSync(full)) {
+        // Read through a pinned descriptor rather than by path: `existsSync` then
+        // `readFileSync` is a check-then-use pair, and the media tree is written by
+        // uploads. The bytes come from the descriptor that was verified.
+        const buffer = readMediaInside(resolvedMediaRoot, rel);
+        if (buffer === null) {
           error("IMAGE_NOT_FOUND", `${file}#/images`, `missing media file ${rel}`);
           continue;
         }
-        const buffer = fs.readFileSync(full);
         mediaBytes += buffer.byteLength;
         if (!isWebpMagic(buffer)) {
           error("IMAGE_NOT_WEBP", `${file}#/images`, `${rel} is not a WebP file`);
@@ -1016,11 +1047,10 @@ export function validateContentTree(
         if (digest !== image.sha256) {
           error("IMAGE_HASH_MISMATCH", `${file}#/images`, `sha256 of ${rel} does not match the lesson record`);
         }
-        const thumbFull = thumbFullEarly;
-        if (!fs.existsSync(thumbFull)) {
+        const thumbBuffer = readMediaInside(resolvedMediaRoot, `lessons/${lesson.id}/${image.thumb}`);
+        if (thumbBuffer === null) {
           error("IMAGE_THUMB_NOT_FOUND", `${file}#/images`, `missing thumbnail lessons/${lesson.id}/${image.thumb}`);
         } else {
-          const thumbBuffer = fs.readFileSync(thumbFull);
           mediaBytes += thumbBuffer.byteLength;
           if (!isWebpMagic(thumbBuffer)) {
             error("IMAGE_NOT_WEBP", `${file}#/images`, `lessons/${lesson.id}/${image.thumb} is not a WebP file`);

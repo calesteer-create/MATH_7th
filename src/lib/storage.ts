@@ -71,6 +71,11 @@ function partsBase(declaredRoot: string): string {
 }
 
 export async function readKey(key: string): Promise<Buffer | null> {
+  // Three resources, each closed exactly once, in reverse order of acquisition:
+  // the root handle, the parent handle and the file descriptor. Passing
+  // `openDir(...)` straight into `openDirUnder(...)` would drop the root handle on
+  // the floor and leak one descriptor per read.
+  let rootHandle: OpenDir | null = null;
   let parent: OpenDir | null = null;
   let fd: number | null = null;
   try {
@@ -80,30 +85,36 @@ export async function readKey(key: string): Promise<Buffer | null> {
     // root. Mixing the declared root with a resolved target yields a `..`
     // prefix and would silently read nothing.
     const target = resolveKey(key);
-    const parts = relativeParts(partsBase(base), target);
-    const leaf = parts[parts.length - 1];
+    const resolvedBase = partsBase(base);
+    const parts = relativeParts(resolvedBase, target);
+    const leaf = parts.pop();
     if (leaf === undefined) return null;
 
     // The root may not exist on a fresh deployment; absence is a `null`, not an
     // error, which is what the previous `readFile`-in-a-try-catch did.
-    if (!fsSync.existsSync(partsBase(base))) return null;
-    parent = openDirUnder(openDir(partsBase(base)), parts.slice(0, -1));
-    try {
-      fd = parent.open(leaf, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
-      // `fstat` on the descriptor: a symlinked leaf is refused by O_NOFOLLOW
-      // already, and anything that is not a regular file is not served.
-      if (!fsSync.fstatSync(fd).isFile()) return null;
-      // `node:fs/promises` will not take a numeric descriptor; the sync form does
-      // and still reads from the descriptor, which is the point.
-      return fsSync.readFileSync(fd);
-    } finally {
-      if (fd !== null) fsSync.closeSync(fd);
-      parent.close();
-    }
+    if (!fsSync.existsSync(resolvedBase)) return null;
+
+    rootHandle = openDir(resolvedBase);
+    parent = openDirUnder(rootHandle, parts);
+    fd = parent.open(leaf, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+    // `fstat` on the descriptor: a symlinked leaf is refused by O_NOFOLLOW
+    // already, and anything that is not a regular file is not served.
+    if (!fsSync.fstatSync(fd).isFile()) return null;
+    // `node:fs/promises` will not take a numeric descriptor; the sync form does
+    // and still reads from the descriptor, which is the point.
+    return fsSync.readFileSync(fd);
   } catch {
     return null;
   } finally {
+    if (fd !== null) {
+      try {
+        fsSync.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    }
     parent?.close();
+    rootHandle?.close();
   }
 }
 

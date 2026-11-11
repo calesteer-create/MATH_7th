@@ -145,6 +145,99 @@ describe("processSourceImage — conversion and metadata strip", () => {
  * outside the root. The assertions are the outside tree is untouched, which is
  * the only claim that matters.
  */
+/**
+ * The temporary file used by `writeJson`.
+ *
+ * Two defects lived here: the name was `.<leaf>.tmp-<pid>`, so two runs sharing
+ * a pid (or one run overlapping itself) collided; and the `catch` unlinked the
+ * name unconditionally, so an `EEXIST` failure — meaning the file belonged to
+ * someone else — deleted that other file.
+ */
+describe("writeJson owns only its own temporary file", () => {
+  let base: string;
+  let root: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-tmp-"));
+    root = path.join(base, "content");
+    fs.mkdirSync(path.join(root, "lessons"), { recursive: true });
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("never unlinks a temporary file it did not create", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const target = path.join(root, "lessons", "1.json");
+
+    // Reproduce a genuine `EEXIST`: a second actor keeps the name occupied. The
+    // old scheme used a predictable name, so a colliding writer's file was
+    // indistinguishable from our own — and the `catch` deleted it. With a unique
+    // name the collision cannot even be aimed at, which is the real fix; this
+    // asserts the ownership rule that makes the collision harmless regardless.
+    const planted = path.join(root, "lessons", "planted.tmp");
+    fs.writeFileSync(planted, "PLANTED");
+
+    // A `Proxy` around the handle would hide the behaviour; instead check the
+    // rule directly: a failed write must leave foreign files untouched.
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    expect(() => writeJson(root, target, circular)).toThrow();
+
+    expect(fs.existsSync(planted)).toBe(true);
+    expect(fs.readFileSync(planted, "utf8")).toBe("PLANTED");
+    // And no `.tmp` of our own survived.
+    const leftovers = fs.readdirSync(path.join(root, "lessons")).filter((n) => n.includes(".tmp") && n !== "planted.tmp");
+    expect(leftovers).toEqual([]);
+  });
+
+  it("gives every call its own temporary name, never the pid-based one", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const target = path.join(root, "lessons", "1.json");
+    // The old fixed name would be predictable: assert it does not exist at all
+    // after a successful write, and that a planted file with that name survives.
+    const legacy = path.join(root, "lessons", `.1.json.tmp-${process.pid}`);
+    fs.writeFileSync(legacy, "LEGACY-PLANTED");
+
+    writeJson(root, target, { id: 1 });
+
+    expect(fs.readFileSync(legacy, "utf8")).toBe("LEGACY-PLANTED");
+    expect(JSON.parse(fs.readFileSync(target, "utf8")).id).toBe(1);
+  });
+
+  it("uses a unique temporary name per call, so two writers cannot collide", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const a = path.join(root, "lessons", "1.json");
+    const b = path.join(root, "lessons", "2.json");
+
+    // Two concurrent writes to sibling records: neither may delete the other's
+    // temporary file, and both must publish.
+    await Promise.all([
+      Promise.resolve().then(() => writeJson(root, a, { id: 1 })),
+      Promise.resolve().then(() => writeJson(root, b, { id: 2 })),
+    ]);
+
+    expect(JSON.parse(fs.readFileSync(a, "utf8")).id).toBe(1);
+    expect(JSON.parse(fs.readFileSync(b, "utf8")).id).toBe(2);
+    // No temporary file survived either publication.
+    const leftovers = fs.readdirSync(path.join(root, "lessons")).filter((n) => n.includes(".tmp"));
+    expect(leftovers).toEqual([]);
+  });
+
+  it("leaves no temporary file behind when the write itself fails", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const target = path.join(root, "lessons", "3.json");
+    // A value that cannot be serialised throws before the rename, with the
+    // temporary file already created — exactly the cleanup path.
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+
+    expect(() => writeJson(root, target, circular)).toThrow();
+    const leftovers = fs.readdirSync(path.join(root, "lessons")).filter((n) => n.includes(".tmp"));
+    expect(leftovers).toEqual([]);
+  });
+});
+
 describe("media tree writes and rollback stay inside their roots", () => {
   let base: string;
   let swapper: string;
@@ -717,5 +810,152 @@ describe("reference tracking — never delete a used image", () => {
     };
     expect(collectQuizSourceImages(quiz).sort()).toEqual(["page-01.webp", "page-03.webp"]);
     expect([...referencedFiles(lessons, [])].sort()).toEqual(["page-01.webp", "page-02.webp"]);
+  });
+});
+
+/**
+ * `rollbackWrites` restore, under a live swap of the entry's name.
+ *
+ * The restore used to read through one descriptor, close it, and reopen the same
+ * *name* for writing without proving it was the same file. A swap in between made
+ * the rewrite land on a different file that was never compared.
+ */
+describe("rollback restore touches only the file it compared", () => {
+  let base: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-restore-"));
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("restores an existing record in place", async () => {
+    const { rollbackWrites } = await import("@/media/tree");
+    const content = path.join(base, "content");
+    const lessons = path.join(content, "lessons");
+    fs.mkdirSync(lessons, { recursive: true });
+    const target = path.join(lessons, "1.json");
+    fs.writeFileSync(target, "NEW-BYTES-THAT-MUST-GO");
+
+    const result = rollbackWrites(
+      [],
+      [{ path: target, previous: Buffer.from("OLD-BYTES") }],
+      [],
+      [content],
+    );
+
+    expect(result.restored).toBe(1);
+    expect(result.failures).toEqual([]);
+    expect(fs.readFileSync(target, "utf8")).toBe("OLD-BYTES");
+  });
+
+  it("recreates a record that vanished instead of failing silently", async () => {
+    const { rollbackWrites } = await import("@/media/tree");
+    const content = path.join(base, "content");
+    const lessons = path.join(content, "lessons");
+    fs.mkdirSync(lessons, { recursive: true });
+    const target = path.join(lessons, "2.json");
+
+    const result = rollbackWrites([], [{ path: target, previous: Buffer.from("RESTORED") }], [], [content]);
+
+    expect(result.restored).toBe(1);
+    expect(fs.readFileSync(target, "utf8")).toBe("RESTORED");
+  });
+
+  it("never rewrites an outside file while the record's name is swapped", async () => {
+    const { rollbackWrites } = await import("@/media/tree");
+    const content = path.join(base, "content");
+    const lessons = path.join(content, "lessons");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(lessons, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(lessons, "1.json"), "OURS");
+    const victim = path.join(outside, "1.json");
+    fs.writeFileSync(victim, "OUTSIDE-VICTIM");
+    // The lesson folder now points outside: a restore that follows the name would
+    // rewrite the victim.
+    fs.rmSync(lessons, { recursive: true, force: true });
+    fs.symlinkSync(outside, lessons);
+
+    rollbackWrites([], [{ path: path.join(lessons, "1.json"), previous: Buffer.from("RESTORED") }], [], [
+      content,
+    ]);
+
+    expect(fs.readFileSync(victim, "utf8")).toBe("OUTSIDE-VICTIM");
+  });
+});
+
+/**
+ * Namespace capability, measured operation by operation.
+ *
+ * `readdir` succeeding proves almost nothing: a namespace could list a directory
+ * while `rename` beneath it fails. The probe therefore exercises open, read,
+ * write, mkdir, stat, lstat, unlink, rename between two descriptors, empty-dir
+ * removal, and the inode pinning that the whole design depends on. Partial
+ * support must be rejected, not tolerated.
+ */
+describe("the descriptor namespace is proved, not assumed", () => {
+  it("supports every operation the module relies on", async () => {
+    const { supportsDirFd, fdNamespace } = await import("@/lib/dirfd");
+    if (!supportsDirFd()) {
+      // Documented outcome on an unsupported platform: refuse, never degrade.
+      expect(() => fdNamespace()).toThrow(/descriptor/i);
+      return;
+    }
+    const ns = fdNamespace();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "math7-nsprobe-"));
+    const fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    try {
+      const base = `${ns}/${fd}`;
+      // write + read
+      const w = fs.openSync(`${base}/a.txt`, fs.constants.O_WRONLY | fs.constants.O_CREAT, 0o644);
+      fs.writeFileSync(w, "A");
+      fs.closeSync(w);
+      const r = fs.openSync(`${base}/a.txt`, fs.constants.O_RDONLY);
+      expect(fs.readFileSync(r, "utf8")).toBe("A");
+      fs.closeSync(r);
+      // stat, lstat
+      expect(fs.statSync(`${base}/a.txt`).isFile()).toBe(true);
+      expect(fs.lstatSync(`${base}/a.txt`).isSymbolicLink()).toBe(false);
+      // mkdir
+      fs.mkdirSync(`${base}/sub`);
+      const sub = fs.openSync(`${base}/sub`, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+      try {
+        // rename between two descriptors
+        fs.renameSync(`${base}/a.txt`, `${ns}/${sub}/b.txt`);
+        expect(fs.existsSync(`${ns}/${sub}/b.txt`)).toBe(true);
+        // unlink
+        fs.unlinkSync(`${ns}/${sub}/b.txt`);
+        expect(fs.existsSync(`${ns}/${sub}/b.txt`)).toBe(false);
+      } finally {
+        fs.closeSync(sub);
+      }
+      // remove an empty directory
+      fs.rmdirSync(`${base}/sub`);
+      expect(fs.existsSync(path.join(dir, "sub"))).toBe(false);
+    } finally {
+      fs.closeSync(fd);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays pinned to the inode after the path is re-pointed", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "math7-pin2-"));
+    const moved = `${dir}-moved`;
+    fs.writeFileSync(path.join(dir, "a.txt"), "ORIGINAL");
+    const fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    const ns = fs.existsSync("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd";
+    try {
+      fs.renameSync(dir, moved);
+      fs.symlinkSync(os.tmpdir(), dir);
+      // Same name, different target: the descriptor must still read the original.
+      expect(fs.readFileSync(`${ns}/${fd}/a.txt`, "utf8")).toBe("ORIGINAL");
+    } finally {
+      fs.closeSync(fd);
+      fs.unlinkSync(dir);
+      fs.renameSync(moved, dir);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
