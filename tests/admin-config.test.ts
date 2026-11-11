@@ -23,6 +23,10 @@ import {
   ADMIN_CONFIG_PATH,
   ADMIN_STATUS,
   CMS_MOUNT_ID,
+  GLOBAL_MEDIA_FOLDER,
+  GLOBAL_PUBLIC_FOLDER,
+  LESSON_MEDIA_FOLDER,
+  LESSON_PUBLIC_FOLDER,
   buildAdminConfig,
   currentAdminOptions,
   declaredFieldNames,
@@ -33,6 +37,7 @@ import {
   viewGroupFields,
 } from "@/media/cms-config";
 import { DRAFT_REPO_DEFAULT, PUBLIC_REPO, classifyRepo, resolveDraftRepo } from "@/media/repo-guard";
+import { canonicalMediaFile } from "@/media/naming";
 
 const SCHEMA_PATH = path.join(
   process.cwd(),
@@ -561,5 +566,107 @@ describe("public/admin/index.html — Sveltia mount point", () => {
     expect(html).toContain("EXPERIMENTAL");
     expect(html).toContain("MATH_7th-drafts");
     expect(html).toContain("role=\"status\"");
+  });
+});
+
+/**
+ * G1 / G2 — the media-folder options (found by running the 0.262.1 bundle).
+ *
+ * G1: Sveltia validates the ROOT `media_folder`/`public_folder` with
+ *     `isGlobal: true` (config/parser/index.js → `umt` → `D9`). In that mode the
+ *     guard `(isGlobal || !cmt.includes(tag) && !smt.includes(name))` is
+ *     unconditionally true, so *any* `{{…}}` tag is pushed to
+ *     `collectors.errors` through `y8()` (default type `'error'`) and
+ *     `initCmsConfig` throws "Errors found in configuration" before the editor
+ *     mounts. Verified by calling the bundle's own `umt()`: the previous value
+ *     `public/media/lessons/{{slug}}` produced
+ *     `config.error.global_folder_template_tag`.
+ *
+ * G2: a collection-level `media_folder` that does not start with `/` makes
+ *     `parseAssetFolder()` (`Lze`) set `entryRelative: true`, which turns
+ *     `internalPath` into the *collection folder* and the template into an
+ *     `internalSubPath` — uploads would land in
+ *     `content/lessons/public/media/lessons/<id>/…`, while
+ *     src/media/tree.ts reads `public/media/lessons/<id>/…`.
+ */
+describe("media folders — G1/G2", () => {
+  const config = committedConfig();
+  const TEMPLATE_TAG = /\{\{[^}]+\}\}/;
+
+  it("keeps the root media folders free of template tags (G1)", () => {
+    // A tag here is a FATAL config error, not a warning: the editor never mounts.
+    expect(String(config["media_folder"])).not.toMatch(TEMPLATE_TAG);
+    expect(String(config["public_folder"])).not.toMatch(TEMPLATE_TAG);
+    expect(config["media_folder"]).toBe(GLOBAL_MEDIA_FOLDER);
+    expect(config["public_folder"]).toBe(GLOBAL_PUBLIC_FOLDER);
+  });
+
+  it("still defines the root media_folder (missing_media_folder is fatal)", () => {
+    expect(typeof config["media_folder"]).toBe("string");
+    expect(String(config["media_folder"]).length).toBeGreaterThan(0);
+  });
+
+  it("starts the collection media_folder with a slash, so it is not entry-relative (G2)", () => {
+    const lessons = collection(config, "lessons");
+    expect(lessons["media_folder"]).toBe(LESSON_MEDIA_FOLDER);
+    expect(lessons["public_folder"]).toBe(LESSON_PUBLIC_FOLDER);
+    expect(String(lessons["media_folder"]).startsWith("/")).toBe(true);
+    // …and that resolved path is exactly where src/media/tree.ts looks.
+    expect(String(lessons["media_folder"])).toBe("/public/media/lessons/{{slug}}");
+    expect(String(lessons["public_folder"])).toBe("/media/lessons/{{slug}}");
+  });
+
+  it("uses an absolute public folder — Sveltia rejects relative and URL forms", () => {
+    expect(String(config["public_folder"]).startsWith("/")).toBe(true);
+    expect(/^https?:/.test(String(config["public_folder"]))).toBe(false);
+    expect(/^\.{1,2}\//.test(String(config["public_folder"]))).toBe(false);
+  });
+
+  it("leaves the global Media Library config intact", () => {
+    // Moving the templates onto the collection must not change the global
+    // library: `media_libraries.all` still carries the limits/transformations.
+    const libraries = config["media_libraries"] as {
+      all: { max_file_size: number; transformations: { raster_image: { format: string } } };
+    };
+    expect(libraries.all.max_file_size).toBe(15 * 1024 * 1024);
+    expect(libraries.all.transformations.raster_image.format).toBe("webp");
+    // The units collection inherits the global folders: it declares none.
+    const units = collection(config, "units");
+    expect(units["media_folder"]).toBeUndefined();
+    expect(units["public_folder"]).toBeUndefined();
+  });
+});
+
+/**
+ * The regression guard that ties the two halves together.
+ *
+ * For the public path the generated config implies, `canonicalMediaFile` must
+ * return the bare name the content model demands. If someone edits
+ * `public_folder` later, this fails in CI instead of at the owner's keyboard.
+ */
+describe("CMS value → content-model value", () => {
+  it("canonicalises the path the configured public_folder produces", () => {
+    const config = committedConfig();
+    const lessons = collection(config, "lessons");
+    const template = String(lessons["public_folder"]);
+    for (const lessonId of [1, 7, 42]) {
+      for (const fileName of ["page-01.webp", "page-12.webp"]) {
+        // Sveltia substitutes {{slug}} with the entry slug (the numeric id).
+        const stored = `${template.replace("{{slug}}", String(lessonId))}/${fileName}`;
+        expect(canonicalMediaFile(stored, lessonId)).toBe(fileName);
+        expect(/^[a-z0-9][a-z0-9-]{0,60}\.webp$/.test(canonicalMediaFile(stored, lessonId)!)).toBe(true);
+      }
+    }
+  });
+
+  it("also canonicalises the repository-relative form of the same file", () => {
+    expect(canonicalMediaFile("public/media/lessons/7/page-12.webp", 7)).toBe("page-12.webp");
+  });
+
+  it("returns null for the same path aimed at another lesson", () => {
+    const config = committedConfig();
+    const template = String(collection(config, "lessons")["public_folder"]);
+    const stored = `${template.replace("{{slug}}", "9")}/page-01.webp`;
+    expect(canonicalMediaFile(stored, 3)).toBeNull();
   });
 });

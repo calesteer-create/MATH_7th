@@ -25,13 +25,19 @@ import path from "node:path";
 import sharp from "sharp";
 import { THUMB_MAX_EDGE, THUMB_QUALITY, detectMime } from "../src/media/format";
 import { sha256Hex } from "../src/media/process";
-import { isLegalMediaName } from "../src/media/naming";
+import { canonicalMediaFile, isLegalMediaName } from "../src/media/naming";
 import { buildReferenceIndex, collectedQuizReferences } from "../src/media/sync-helpers";
-import { defaultPaths, nowIso, readLessons, readQuizFiles, validatePaths, writeJson } from "../src/media/tree";
+import { defaultPaths, nowIso, readLessons, readQuizFiles, writeJson } from "../src/media/tree";
+import { validateContentTree } from "../src/content/validate";
 import type { LessonContent, LessonImageContent } from "../src/content/model";
 
 /** Validator codes that `media:sync` fixes by rewriting the lesson record. */
 const REPAIRABLE_CODES = new Set([
+  // A CMS-written path (`/media/lessons/3/page-01.webp`) fails the strict
+  // model rule until it is canonicalised. Every value that cannot be
+  // canonicalised is reported as an unfixable error instead, so this code can
+  // only ever be excused for a record a write run actually repairs.
+  "IMAGE_FILE_INVALID",
   "IMAGE_THUMB_MISMATCH",
   "IMAGE_HASH_MISMATCH",
   "IMAGE_SHA256_INVALID",
@@ -72,6 +78,8 @@ interface SyncSummary {
   orphans: string[];
   missing: string[];
   errors: string[];
+  /** `file` values reduced to the canonical bare name (CMS-written paths). */
+  canonicalized: Array<{ lessonId: number; from: string; to: string }>;
 }
 
 async function main(): Promise<void> {
@@ -88,6 +96,7 @@ async function main(): Promise<void> {
     orphans: [],
     missing: [],
     errors: [],
+    canonicalized: [],
   };
 
   console.log("MATH 7TH — media sync");
@@ -96,6 +105,8 @@ async function main(): Promise<void> {
 
   const lessonsDir = path.join(paths.mediaRoot, "lessons");
   const changedLessons: LessonContent[] = [];
+  /** Writes held back until every lesson has been validated. */
+  const pendingWrites: Array<{ file: string; lesson: LessonContent }> = [];
 
   for (const entry of readLessons(paths.contentRoot)) {
     const lesson = entry.value;
@@ -104,20 +115,39 @@ async function main(): Promise<void> {
     let changed = false;
 
     for (const image of lesson.images) {
-      if (!isLegalMediaName(image.file)) {
-        summary.errors.push(`lessons/${entry.file}: illegal filename ${JSON.stringify(image.file)}`);
+      // ── Canonicalise what the CMS wrote ──────────────────────────────────
+      // Sveltia stores the asset's public path (`/media/lessons/3/page-01.webp`,
+      // see GLOBAL/LESSON_*_FOLDER in src/media/cms-config.ts), while the
+      // content model requires a bare filename. The parser accepts a closed
+      // list of shapes and returns null for anything else — it never repairs by
+      // guessing, and this step touches no file on disk.
+      const canonical = canonicalMediaFile(image.file, lesson.id);
+      if (canonical === null) {
+        summary.errors.push(
+          `lessons/${entry.file}: unrecognised image path ${JSON.stringify(image.file)} ` +
+            `(expected a bare .webp name, or /media/lessons/${lesson.id}/<name>.webp)`,
+        );
         nextImages.push(image);
         continue;
       }
-      const filePath = path.join(dir, image.file);
+      if (canonical !== image.file) {
+        summary.canonicalized.push({ lessonId: lesson.id, from: image.file, to: canonical });
+      }
+      const file = canonical;
+      if (!isLegalMediaName(file)) {
+        summary.errors.push(`lessons/${entry.file}: illegal filename ${JSON.stringify(file)}`);
+        nextImages.push(image);
+        continue;
+      }
+      const filePath = path.join(dir, file);
       if (!fs.existsSync(filePath)) {
-        summary.missing.push(`lessons/${lesson.id}/${image.file}`);
+        summary.missing.push(`lessons/${lesson.id}/${file}`);
         nextImages.push(image);
         continue;
       }
       const buffer = fs.readFileSync(filePath);
       if (detectMime(buffer) !== "image/webp") {
-        summary.errors.push(`lessons/${lesson.id}/${image.file} is not a WebP file`);
+        summary.errors.push(`lessons/${lesson.id}/${file} is not a WebP file`);
         nextImages.push(image);
         continue;
       }
@@ -126,20 +156,21 @@ async function main(): Promise<void> {
         meta = await sharp(buffer).metadata();
       } catch (error) {
         summary.errors.push(
-          `lessons/${lesson.id}/${image.file} cannot be decoded: ${(error as Error).message}`,
+          `lessons/${lesson.id}/${file} cannot be decoded: ${(error as Error).message}`,
         );
         nextImages.push(image);
         continue;
       }
       const refreshed: LessonImageContent = {
         ...image,
-        thumb: `thumbs/${image.file}`,
+        file,
+        thumb: `thumbs/${file}`,
         width: meta.width ?? image.width,
         height: meta.height ?? image.height,
         bytes: image.bytes ?? buffer.byteLength,
         sha256: sha256Hex(buffer),
       };
-      const thumbPath = path.join(dir, "thumbs", image.file);
+      const thumbPath = path.join(dir, "thumbs", file);
       if (!fs.existsSync(thumbPath)) {
         const thumbBuffer = await sharp(buffer)
           .resize({ width: THUMB_MAX_EDGE, height: THUMB_MAX_EDGE, fit: "inside", withoutEnlargement: true })
@@ -152,6 +183,7 @@ async function main(): Promise<void> {
         }
       }
       if (
+        file !== image.file ||
         refreshed.sha256 !== image.sha256 ||
         refreshed.width !== image.width ||
         refreshed.height !== image.height ||
@@ -175,15 +207,17 @@ async function main(): Promise<void> {
 
     if (changed) {
       summary.lessonsChanged += 1;
-      changedLessons.push({
+      const next: LessonContent = {
         ...lesson,
         images: nextImages,
         contentUpdatedAt: lesson.contentUpdatedAt,
         updatedAt: nowIso(),
-      });
-      if (write) {
-        writeJson(path.join(paths.contentRoot, "lessons", entry.file), changedLessons[changedLessons.length - 1]);
-      }
+      };
+      changedLessons.push(next);
+      // Deferred on purpose: nothing is written until every lesson has been
+      // checked, so a failure halfway through cannot leave one lesson
+      // canonicalised and the next one untouched (a "half-edited" tree).
+      pendingWrites.push({ file: entry.file, lesson: next });
       // In a read-only run the in-memory record is corrected so orphan
       // detection below still compares against the right set.
     }
@@ -203,8 +237,19 @@ async function main(): Promise<void> {
     console.error(`  ✗ missing file referenced by a lesson: ${missing}`);
   }
   for (const error of summary.errors) console.error(`  ✗ ${error}`);
+  // Every canonicalisation is listed before anything is written, so
+  // `--dry-run` shows the exact set of values a real run would rewrite.
+  for (const change of summary.canonicalized) {
+    console.log(
+      `  → canonicalise lesson ${change.lessonId}: ${JSON.stringify(change.from)} ⇒ ${JSON.stringify(change.to)}`,
+    );
+  }
 
   const needsWork = summary.thumbnailsCreated + summary.recordsUpdated > 0;
+  // Errors the sync cannot repair always fail the run. Computed before the
+  // validation verdict below, because an unfixable record must never be
+  // excused by the "a write run would repair this" allowance.
+  const unfixable = summary.errors.length + summary.missing.length;
 
   console.log(
     `\n  thumbnails created: ${summary.thumbnailsCreated}\n` +
@@ -214,10 +259,22 @@ async function main(): Promise<void> {
 
   // Non-strict: IMAGE_ORPHAN is a warning for a human to review, never a
   // deletion — escalating it would make "unused file exists" look fatal.
-  const validation = validatePaths(paths, false);
+  //
+  // `validateContentTree` reads files. A WRITE run therefore hands it the
+  // records it is about to commit (in-memory overrides), so the verdict
+  // describes the tree that will exist afterwards and nothing is written until
+  // that verdict is clean. A READ-ONLY run has nothing to commit, so the
+  // derived-field errors the sync would repair are expected: they are listed
+  // and explicitly labelled instead of failing the preview.
+  const pendingByFile = new Map(pendingWrites.map((pending) => [`lessons/${pending.file}`, pending.lesson]));
+  const validation =
+    write && pendingByFile.size > 0
+      ? validateContentTree(paths.contentRoot, paths.mediaRoot, { lessonOverrides: pendingByFile })
+      : validateContentTree(paths.contentRoot, paths.mediaRoot);
   console.log(`  content validation: ${validation.errors.length} error(s), ${validation.warnings.length} warning(s)`);
+
   const pendingDerivedFieldErrors =
-    needsWork && !write
+    !write && unfixable === 0 && needsWork
       ? validation.errors.every((issue) => REPAIRABLE_CODES.has(issue.code))
       : false;
   const shown = pendingDerivedFieldErrors ? validation.warnings : validation.errors;
@@ -228,8 +285,6 @@ async function main(): Promise<void> {
     console.log("   (derived-field errors above are exactly what a write run repairs)");
   }
 
-  // Errors the sync cannot repair always fail the run.
-  const unfixable = summary.errors.length + summary.missing.length;
   const contentBroken = validation.errors.length > 0 && !pendingDerivedFieldErrors;
 
   if (options.check && needsWork) {
@@ -244,7 +299,19 @@ async function main(): Promise<void> {
     console.log("\n✓ media tree in sync (check mode)");
     return;
   }
-  console.log(write ? "\n✓ media tree in sync" : "\n✓ dry run complete (nothing written)");
+  if (!write) {
+    console.log("\n✓ dry run complete (nothing written)");
+    return;
+  }
+  // Only now — after every lesson passed its checks and the tree validated
+  // cleanly — is any JSON rewritten. One pass, no partial state.
+  for (const pending of pendingWrites) {
+    writeJson(path.join(paths.contentRoot, "lessons", pending.file), pending.lesson);
+  }
+  if (pendingWrites.length > 0) {
+    console.log(`\n  wrote ${pendingWrites.length} lesson file(s)`);
+  }
+  console.log("\n✓ media tree in sync");
 }
 
 void main().catch((error: unknown) => {

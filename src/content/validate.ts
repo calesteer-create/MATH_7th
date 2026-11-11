@@ -386,10 +386,19 @@ function validateLessonImage(
 
   const file = raw["file"];
   if (typeof file !== "string" || !IMAGE_FILE_RE.test(file)) {
+    // The CMS stores the asset's public path (`/media/lessons/3/page-01.webp`)
+    // while the model requires a bare name. That is reconciled by
+    // `npm run media:sync` (src/media/naming.ts#canonicalMediaFile), not here —
+    // the validator stays strict so an unexpected shape is never silently
+    // accepted. Point the reader at the repair, not just the rule.
+    const looksLikePath = typeof file === "string" && file.includes("/");
     issue(
       "IMAGE_FILE_INVALID",
       "/file",
-      `file must match ${IMAGE_FILE_RE} (bare lowercase webp name, no directories)`,
+      `file must match ${IMAGE_FILE_RE} (bare lowercase webp name, no directories)` +
+        (looksLikePath
+          ? ` — got ${JSON.stringify(file)}; run \`npm run media:sync\` to canonicalise CMS-written paths`
+          : ""),
     );
   }
   const thumb = raw["thumb"];
@@ -728,6 +737,21 @@ function validateQuizQuestion(
 
 /* ── tree loading & cross-file checks ──────────────────────────────────── */
 
+/**
+ * True when `target` really is inside `root` after resolution.
+ *
+ * Defence in depth for the media checks below. Today `IMAGE_FILE_RE` already
+ * makes an escaping name impossible (no separators, no dots before `.webp`), so
+ * this never fires — but the safety of `path.join(...)` here would otherwise
+ * depend on a regex in a different module. If that rule is ever widened, the
+ * containment check is what still stops a read outside the media root.
+ */
+function isInsideRoot(root: string, target: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(resolvedRoot + path.sep);
+}
+
 export interface LoadedTree {
   units: Map<number, { unit: UnitContent; file: string }>;
   lessons: Map<number, { lesson: LessonContent; file: string }>;
@@ -758,7 +782,27 @@ function isWebpMagic(buffer: Buffer): boolean {
   );
 }
 
-export function validateContentTree(contentRoot: string, mediaRoot?: string): TreeValidation {
+/**
+ * Records a caller is about to commit, keyed by `lessons/<file>`.
+ *
+ * `media:sync` uses this to validate the tree it is *about* to write: it builds
+ * every corrected record in memory, asks for a verdict on those, and only then
+ * touches the disk. Without it the validator would judge the stale file and
+ * report a path as invalid one line after the sync canonicalised it.
+ *
+ * Overrides replace the parsed record for that file only; they never introduce
+ * a file that does not exist on disk, so counts and cross-file checks are
+ * unaffected.
+ */
+export interface TreeValidationOptions {
+  lessonOverrides?: ReadonlyMap<string, LessonContent>;
+}
+
+export function validateContentTree(
+  contentRoot: string,
+  mediaRoot?: string,
+  options: TreeValidationOptions = {},
+): TreeValidation {
   const errors: ContentIssue[] = [];
   const warnings: ContentIssue[] = [];
   const error = (code: string, path: string, message: string) =>
@@ -808,8 +852,11 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
 
   /* Lesson files. */
   const lessons = new Map<number, { lesson: LessonContent; file: string }>();
-  for (const { file, raw } of readJsonFiles(path.join(contentRoot, "lessons"))) {
+  for (const { file, raw: rawFromDisk } of readJsonFiles(path.join(contentRoot, "lessons"))) {
     const label = `lessons/${file}`;
+    // A pending write wins: the caller is validating what it is about to commit.
+    const override = options.lessonOverrides?.get(label);
+    const raw: unknown = override ?? rawFromDisk;
     if (raw === undefined) {
       error("INVALID_JSON", label, "file does not contain valid JSON");
       continue;
@@ -944,6 +991,15 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
       for (const image of lesson.images) {
         const rel = `lessons/${lesson.id}/${image.file}`;
         const full = path.join(resolvedMediaRoot, "lessons", String(lesson.id), image.file);
+        const thumbFullEarly = path.join(resolvedMediaRoot, "lessons", String(lesson.id), image.thumb);
+        if (!isInsideRoot(resolvedMediaRoot, full) || !isInsideRoot(resolvedMediaRoot, thumbFullEarly)) {
+          error(
+            "IMAGE_PATH_ESCAPES_MEDIA_ROOT",
+            `${file}#/images`,
+            `${rel} resolves outside the media root; refusing to read it`,
+          );
+          continue;
+        }
         referencedMedia.add(rel);
         referencedMedia.add(`lessons/${lesson.id}/${image.thumb}`);
         if (!fs.existsSync(full)) {
@@ -960,7 +1016,7 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
         if (digest !== image.sha256) {
           error("IMAGE_HASH_MISMATCH", `${file}#/images`, `sha256 of ${rel} does not match the lesson record`);
         }
-        const thumbFull = path.join(resolvedMediaRoot, "lessons", String(lesson.id), image.thumb);
+        const thumbFull = thumbFullEarly;
         if (!fs.existsSync(thumbFull)) {
           error("IMAGE_THUMB_NOT_FOUND", `${file}#/images`, `missing thumbnail lessons/${lesson.id}/${image.thumb}`);
         } else {

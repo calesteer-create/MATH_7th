@@ -26,8 +26,8 @@ site_url: "https://calesteer-create.github.io/MATH_7th/"
 display_url: "https://calesteer-create.github.io/MATH_7th/"
 app_title: "MATH 7TH — إدارة المسودات (تجريبي)"
 logo_url: "/MATH_7th/favicon.ico"
-media_folder: "public/media/lessons/{{slug}}"
-public_folder: "/media/lessons/{{slug}}"
+media_folder: "public/media"
+public_folder: "/media"
 media_libraries:
   all:
     max_file_size: 15728640
@@ -150,6 +150,8 @@ collections:
       template: "{{fields.id}}"
       editable: false
     summary: "{{fields.status}} · #{{fields.position}} · {{fields.titleAr}}"
+    media_folder: "/public/media/lessons/{{slug}}"
+    public_folder: "/media/lessons/{{slug}}"
     sortable_fields:
       - "unitId"
       - "position"

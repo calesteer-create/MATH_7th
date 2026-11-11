@@ -304,7 +304,13 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
    الإعداد من `public/admin/config.yml` نفسه — وهو مناسب للفحص لا للتجربة الكاملة.)
    سجّل الدخول بالتوكن، وافتح وحدة واحدة، **عدّلها واحفظها**.
 5. تأكد أن commit ظهر في `MATH_7th-drafts` على `main`، وأن الصور وصلت WebP.
-6. شغّل `npm run media:sync -- --check` على شجرة المسودات.
+6. **تحقّق من القيمة المخزَّنة في `images[].file`**: المتوقع
+   `/media/lessons/<id>/<file>.webp` (مسار، لا اسم مجرّد) — هذا سلوك Sveltia
+   المثبت من مصدرها. ثم شغّل `npm run media:sync -- --dry-run` واقرأ سطر
+   `→ canonicalise lesson <id>`: كل قيمة ستُطبَّع تُعرض قبل أي كتابة. بعد ذلك
+   `npm run media:sync` ثم `npm run media:sync -- --check` على شجرة المسودات.
+   إن ظهر `unrecognised image path` فالصورة ليست WebP أو في مجلد درس آخر: أعد
+   رفعها ولا تُعدّل الاسم يدويًا.
 7. عندها فقط: حدّث `ADMIN_STATUS.verifiedAgainstPrivateRepo` في
    `src/media/cms-config.ts` و`docs/ADMIN.md` بالتاريخ.
 

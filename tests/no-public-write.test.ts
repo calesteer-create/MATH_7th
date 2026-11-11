@@ -80,13 +80,23 @@ describe("no code path writes to the public repository", () => {
     const config = YAML.parse(fs.readFileSync(path.join(ROOT, "public/admin/config.yml"), "utf8")) as {
       backend: { repo: string };
       media_folder: string;
-      collections: Array<{ name?: string; folder?: string; files?: Array<{ file: string }> }>;
+      collections: Array<{
+        name?: string;
+        folder?: string;
+        files?: Array<{ file: string }>;
+        media_folder?: string;
+      }>;
     };
     expect(config.backend.repo).toBe(DRAFT_REPO_DEFAULT);
-    expect(config.media_folder.startsWith("public/media/")).toBe(true);
+    // The root folder is `public/media` (templateless, see the G1 fix); a
+    // collection may narrow it further, but never outside `public/media/`.
+    const withinMediaRoot = (value: string) =>
+      value.replace(/^\/+/, "").startsWith("public/media/");
+    expect(config.media_folder === "public/media" || withinMediaRoot(config.media_folder)).toBe(true);
     for (const collection of config.collections) {
       if (!collection.name) continue;
       if (collection.folder) expect(collection.folder.startsWith("content/")).toBe(true);
+      if (collection.media_folder) expect(withinMediaRoot(collection.media_folder)).toBe(true);
       for (const file of collection.files ?? []) {
         expect(file.file.startsWith("content/")).toBe(true);
       }

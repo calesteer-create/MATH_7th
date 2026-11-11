@@ -31,6 +31,31 @@ export const ADMIN_CONFIG_PATH = "public/admin/config.yml";
 export const ADMIN_INDEX_PATH = "public/admin/index.html";
 
 /**
+ * Where the CMS writes lesson page scans, and what it stores in
+ * `images[].file`.
+ *
+ * ⚠ These options are NOT interchangeable with the content model, whose rule is
+ * the stricter one (`src/content/model.ts#IMAGE_FILE_RE`): `file` holds a
+ * **bare** filename (`page-01.webp`), while Sveltia always stores the asset's
+ * *public path* (`/media/lessons/3/page-01.webp`). That value is built by
+ * `getAssetPublicPath()` (lib/utils/file/path.js → `HJ`), which returns
+ * `publicFolder + '/' + fileName` and `undefined` when the result would not
+ * start with `/`. No `media_folder`/`public_folder` combination makes it emit a
+ * bare name, so the contracts are reconciled at the boundary instead:
+ * `media:sync` canonicalises the value
+ * (`src/media/naming.ts#canonicalMediaFile`) before the strict validator ever
+ * sees it.
+ *
+ * The split below is what the bundle actually requires:
+ *   - ROOT folders must be templateless — G1, see the note in buildAdminConfig.
+ *   - The COLLECTION's media folder must start with `/` — G2, same note.
+ */
+export const GLOBAL_MEDIA_FOLDER = "public/media";
+export const GLOBAL_PUBLIC_FOLDER = "/media";
+export const LESSON_MEDIA_FOLDER = "/public/media/lessons/{{slug}}";
+export const LESSON_PUBLIC_FOLDER = "/media/lessons/{{slug}}";
+
+/**
  * The mount element Sveltia looks for.
  *
  * Sveltia 0.262.1 mounts on `#nc-root` if it exists and on `<body>` otherwise
@@ -335,8 +360,31 @@ export function buildAdminConfig(options: CmsConfigOptions): YamlValue {
     display_url: options.siteUrl ?? "https://calesteer-create.github.io/MATH_7th/",
     app_title: "MATH 7TH — إدارة المسودات (تجريبي)",
     logo_url: "/MATH_7th/favicon.ico",
-    media_folder: "public/media/lessons/{{slug}}",
-    public_folder: "/media/lessons/{{slug}}",
+    // ── Media folders (G1/G2 fix) ──────────────────────────────────────────
+    // The ROOT folders must stay templateless. Sveltia 0.262.1 validates them
+    // with `isGlobal: true` (config/parser/index.js → umt → D9), and in that
+    // mode the guard `(isGlobal || !cmt.includes(tag) && !smt.includes(name))`
+    // is unconditionally true, so ANY `{{…}}` tag here is pushed to
+    // `collectors.errors` via `y8()` (default type 'error'), which makes
+    // `initCmsConfig` throw "Errors found in configuration" before the editor
+    // mounts. Verified by running the bundle's own `umt()` against this config:
+    // the previous value produced `config.error.global_folder_template_tag`.
+    //
+    // The templates therefore live on the collection (LESSON_MEDIA_FOLDER),
+    // which is the one place the message itself allows: "can only be used in
+    // the option of a collection, a collection file or a field, where there is
+    // an entry to fill it in with".
+    //
+    // The leading `/` on the collection's media_folder is load-bearing. Without
+    // it, `parseAssetFolder()` (config/parser/assets.js → Lze) sets
+    // `entryRelative: true`, `internalPath` becomes the *collection folder*
+    // (`content/lessons`) and the template becomes an `internalSubPath`, so an
+    // upload would land in `content/lessons/public/media/lessons/<id>/…` while
+    // src/media/tree.ts reads `public/media/lessons/<id>/…`. With the slash the
+    // resolved write path is `public/media/lessons/<id>` — verified by calling
+    // the bundle's `tKe()`.
+    media_folder: GLOBAL_MEDIA_FOLDER,
+    public_folder: GLOBAL_PUBLIC_FOLDER,
     media_libraries: {
       all: {
         max_file_size: 15 * 1024 * 1024,
@@ -457,6 +505,8 @@ export function buildAdminConfig(options: CmsConfigOptions): YamlValue {
       identifier_field: "titleAr",
       slug: { template: "{{fields.id}}", editable: false },
       summary: "{{fields.status}} · #{{fields.position}} · {{fields.titleAr}}",
+      media_folder: LESSON_MEDIA_FOLDER,
+      public_folder: LESSON_PUBLIC_FOLDER,
       sortable_fields: ["unitId", "position", "id", "titleAr", "status", "updatedAt"],
       view_groups: {
         groups: [

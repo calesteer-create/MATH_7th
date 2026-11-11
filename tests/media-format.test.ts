@@ -7,7 +7,14 @@ import {
   detectMime,
   isWebpMagic,
 } from "@/media/format";
-import { MEDIA_FILE_RE, isLegalMediaName, nextFreeName, positionalStem, sanitizeBase } from "@/media/naming";
+import {
+  MEDIA_FILE_RE,
+  canonicalMediaFile,
+  isLegalMediaName,
+  nextFreeName,
+  positionalStem,
+  sanitizeBase,
+} from "@/media/naming";
 import { IMAGE_FILE_RE } from "@/content/model";
 
 describe("media format sniffing", () => {
@@ -104,5 +111,99 @@ describe("filename generation", () => {
       expect(isLegalMediaName(bad)).toBe(false);
     }
     expect(isLegalMediaName("page-01.webp")).toBe(true);
+  });
+});
+
+/**
+ * The CMS ↔ content-model boundary (NEW-1).
+ *
+ * Sveltia always stores the asset's *public path* (`/media/lessons/3/page-01.webp`),
+ * never a bare name — `getAssetPublicPath()` builds `publicFolder + '/' + name`
+ * and returns `undefined` for anything that would not start with `/`. The
+ * content model requires a bare name, so `canonicalMediaFile` reconciles the two.
+ *
+ * These cases pin the parser as a *rejector*: the accepted shapes are a closed
+ * list, and a value outside it is refused rather than repaired.
+ */
+describe("canonicalMediaFile — CMS-written paths → bare names", () => {
+  it("accepts every shape Sveltia or media:import can produce", () => {
+    expect(canonicalMediaFile("page-01.webp", 3)).toBe("page-01.webp");
+    expect(canonicalMediaFile("/media/lessons/3/page-01.webp", 3)).toBe("page-01.webp");
+    expect(canonicalMediaFile("public/media/lessons/3/page-01.webp", 3)).toBe("page-01.webp");
+    expect(canonicalMediaFile("/public/media/lessons/3/page-01.webp", 3)).toBe("page-01.webp");
+    // Two-digit and long ids are fine; the id is compared numerically.
+    expect(canonicalMediaFile("/media/lessons/12/page-12.webp", 12)).toBe("page-12.webp");
+  });
+
+  it("is idempotent — a canonical value is returned unchanged", () => {
+    const once = canonicalMediaFile("/media/lessons/3/page-01.webp", 3)!;
+    expect(canonicalMediaFile(once, 3)).toBe(once);
+  });
+
+  it("returns the value unchanged when it is already legal", () => {
+    for (const legal of ["page-01.webp", "a.webp", "page-999.webp"]) {
+      expect(canonicalMediaFile(legal, 3)).toBe(legal);
+    }
+  });
+
+  it("refuses a path that belongs to a different lesson", () => {
+    expect(canonicalMediaFile("/media/lessons/9/page-01.webp", 3)).toBeNull();
+    expect(canonicalMediaFile("public/media/lessons/4/page-01.webp", 3)).toBeNull();
+    // Leading zeros must not smuggle another folder in.
+    expect(canonicalMediaFile("/media/lessons/03/page-01.webp", 3)).toBeNull();
+  });
+
+  it("refuses traversal, absolute and encoded forms without repairing them", () => {
+    const hostile = [
+      "../3/page-01.webp",
+      "../../etc/passwd",
+      "/media/lessons/3/../../4/page-01.webp",
+      "a/../../b.webp",
+      "media/lessons/3/page-01.webp",        // no leading slash/known prefix
+      "//media/lessons/3/page-01.webp",
+      "~/media/lessons/3/page-01.webp",
+      "./page-01.webp",
+      "@media/lessons/3/page-01.webp",
+      "C:\\x\\page-01.webp",
+      "%2e%2e%2fpage-01.webp",
+      "media/lessons/3/page%2D01.webp",
+      "/media/lessons/3/page-01.webp\n",
+      "/media/lessons/3/page 01.webp",
+      "https://example.com/page-01.webp",
+      "data:text/plain;base64,AAAA",
+    ];
+    for (const value of hostile) {
+      expect(canonicalMediaFile(value, 3), JSON.stringify(value)).toBeNull();
+    }
+  });
+
+  it("refuses unsupported extensions instead of renaming them", () => {
+    for (const value of [
+      "page-01.jpg",
+      "page-01.jpeg",
+      "page-01.png",
+      "page-01.webp.jpg",
+      "page-01.WEBP",
+      "/media/lessons/3/page-01.jpg",
+      "/media/lessons/3/page-01.webp.jpg",
+      "page-01",
+    ]) {
+      expect(canonicalMediaFile(value, 3), JSON.stringify(value)).toBeNull();
+    }
+  });
+
+  it("refuses names the model itself refuses", () => {
+    for (const value of ["Page-01.webp", "-page-01.webp", "_page.webp", `${"a".repeat(70)}.webp`]) {
+      expect(canonicalMediaFile(value, 3), JSON.stringify(value)).toBeNull();
+    }
+  });
+
+  it("refuses non-strings and an invalid lesson id", () => {
+    for (const value of ["", null, undefined, 42, {}, ["page-01.webp"]]) {
+      expect(canonicalMediaFile(value, 3)).toBeNull();
+    }
+    expect(canonicalMediaFile("page-01.webp", 0)).toBeNull();
+    expect(canonicalMediaFile("page-01.webp", 1.5)).toBeNull();
+    expect(canonicalMediaFile("page-01.webp", -1)).toBeNull();
   });
 });

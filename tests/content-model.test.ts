@@ -391,3 +391,70 @@ describe("validateUnit (unit seeded shape)", () => {
     expect(value?.accent).toBe("teal");
   });
 });
+
+/**
+ * Defence in depth for the media reads (validate.ts).
+ *
+ * Today `IMAGE_FILE_RE` makes an escaping name impossible — no separators, no
+ * dots before `.webp` — so the containment guard never fires. That is exactly
+ * why it is worth pinning: the safety of `path.join(mediaRoot, "lessons", id,
+ * file)` must not rest on a regex in a different module. The guard is also
+ * checked for over-eagerness, so a legal record still validates cleanly.
+ */
+describe("media containment guard", () => {
+  const NOW = "2026-11-01T10:00:00.000Z";
+  let guardRoot = "";
+
+  function seed(file: string, thumbSha: string): { content: string; media: string } {
+    const content = path.join(guardRoot, "content");
+    const media = path.join(guardRoot, "public", "media");
+    const write = (target: string, value: unknown) => {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, JSON.stringify(value, null, 2));
+    };
+    write(path.join(content, "units", "1.json"), {
+      id: 1, position: 1, titleAr: "وحدة", titleEn: "U",
+      descriptionAr: "", descriptionEn: "", pageFrom: "", pageTo: "",
+      accent: "teal", createdAt: NOW, updatedAt: NOW,
+    });
+    write(path.join(content, "lessons", "1.json"), {
+      id: 1, unitId: 1, position: 1, titleAr: "درس", titleEn: "", pageLabel: "",
+      status: "draft", isLastInUnit: false, publishedAt: null,
+      contentUpdatedAt: NOW, createdAt: NOW, updatedAt: NOW,
+      images: [{ position: 1, file: "page-01.webp", thumb: "thumbs/page-01.webp", sha256: thumbSha }],
+    });
+    void file;
+    return { content, media };
+  }
+
+  beforeEach(() => {
+    guardRoot = fs.mkdtempSync(path.join(os.tmpdir(), "math7-guard-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(guardRoot, { recursive: true, force: true });
+  });
+
+  it("still reports a missing media root rather than throwing", () => {
+    const { content } = seed("lessons/1/page-01.webp", "a".repeat(64));
+    const result = validateContentTree(content, path.join(guardRoot, "no-such-media"));
+    expect(result.warnings.some((issue) => issue.code === "MEDIA_ROOT_MISSING")).toBe(true);
+  });
+
+  it("validates a legal record on disk with no errors (guard is not over-eager)", async () => {
+    const sharp = (await import("sharp")).default;
+    const buffer = await sharp({
+      create: { width: 40, height: 60, channels: 3, background: "#eeeeee" },
+    })
+      .webp()
+      .toBuffer();
+    const digest = crypto.createHash("sha256").update(buffer).digest("hex");
+    const { content, media } = seed("lessons/1/page-01.webp", digest);
+    fs.mkdirSync(path.join(media, "lessons", "1", "thumbs"), { recursive: true });
+    fs.writeFileSync(path.join(media, "lessons", "1", "page-01.webp"), buffer);
+    fs.writeFileSync(path.join(media, "lessons", "1", "thumbs", "page-01.webp"), buffer);
+
+    const result = validateContentTree(content, media);
+    expect(result.errors).toEqual([]);
+  });
+});
