@@ -159,11 +159,22 @@ describe("root symlink policy", () => {
     expect(() => resolveInside(link, path.join(link, "lessons", "1.json"))).not.toThrow();
   });
 
-  it("refuses a target expressed through the real path of a symlinked root", async () => {
+  it("accepts either spelling of a symlinked root, and returns the resolved one", async () => {
     const { resolveInside } = await import("@/media/tree");
-    // Two names for the same directory: accepting a mix would mean the caller
-    // and the guard disagree about which string is the boundary.
-    expect(() => resolveInside(link, path.join(real, "lessons", "1.json"))).toThrow(/outside/);
+    // A root with two names ("link" and "real") is still one boundary. Both
+    // spellings must work, and both must come back in the *resolved* namespace —
+    // the earlier design returned a resolved path that its own callers then
+    // re-checked against the unresolved root, which rejected valid writes.
+    const viaLink = resolveInside(link, path.join(link, "lessons", "1.json"));
+    const viaReal = resolveInside(link, path.join(real, "lessons", "1.json"));
+    const expected = path.join(fs.realpathSync(real), "lessons", "1.json");
+    expect(viaLink).toBe(expected);
+    expect(viaReal).toBe(expected);
+  });
+
+  it("still refuses a target that is under neither spelling", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    expect(() => resolveInside(link, path.join(base, "elsewhere.json"))).toThrow(/outside/);
   });
 
   it("still refuses a symlink below the root", async () => {
@@ -177,5 +188,133 @@ describe("root symlink policy", () => {
   it("refuses a target outside the root even when the root is a symlink", async () => {
     const { resolveInside } = await import("@/media/tree");
     expect(() => resolveInside(link, path.join(base, "elsewhere.json"))).toThrow(/outside/);
+  });
+});
+
+/**
+ * A symlinked upload root is a normal deployment (macOS `/tmp`, a mounted
+ * volume). These drive the public `writeKey`/`readKey`/`deleteKey` surface —
+ * not the resolver — because the bug this guards was that the resolver's
+ * *return value* was in a different namespace than its callers expected.
+ */
+describe("upload storage with a symlinked root", () => {
+  let base: string;
+  let realDir: string;
+  let linkDir: string;
+  let outside: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-linked-root-"));
+    realDir = path.join(base, "real_uploads");
+    linkDir = path.join(base, "uploads_link");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(realDir, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "keep.txt"), "ORIGINAL-BYTES");
+    fs.symlinkSync(realDir, linkDir);
+    process.env.UPLOAD_DIR = linkDir;
+  });
+
+  afterAll(() => {
+    process.env.UPLOAD_DIR = tmp;
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("writes through a symlinked root into the real directory", async () => {
+    const { writeKey } = await import("@/lib/storage");
+    await writeKey("lesson/page.webp", Buffer.from("PAYLOAD"));
+
+    const onReal = path.join(realDir, "lesson", "page.webp");
+    expect(fs.existsSync(onReal)).toBe(true);
+    expect(fs.readFileSync(onReal, "utf8")).toBe("PAYLOAD");
+    // Nothing appeared anywhere else.
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("reads it back through the same root", async () => {
+    const { readKey } = await import("@/lib/storage");
+    const data = await readKey("lesson/page.webp");
+    expect(data?.toString("utf8")).toBe("PAYLOAD");
+  });
+
+  it("deletes only the intended file", async () => {
+    const { writeKey, deleteKey } = await import("@/lib/storage");
+    await writeKey("lesson/other.webp", Buffer.from("SECOND"));
+    await deleteKey("lesson/page.webp");
+
+    expect(fs.existsSync(path.join(realDir, "lesson", "page.webp"))).toBe(false);
+    // The sibling survives, and so does everything outside the root.
+    expect(fs.readFileSync(path.join(realDir, "lesson", "other.webp"), "utf8")).toBe("SECOND");
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+  });
+
+  it("refuses an escaping link through the public interface, silently for deleteKey", async () => {
+    const { writeKey, deleteKey, resolveKey } = await import("@/lib/storage");
+    fs.symlinkSync(outside, path.join(realDir, "images"));
+
+    await expect(writeKey("images/evil.bin", Buffer.from("X"))).rejects.toThrow(/symbolic link/);
+    expect(() => resolveKey("images/keep.txt")).toThrow(/symbolic link/);
+    // deleteKey swallows errors by contract, so the assertion is on the bytes.
+    await deleteKey("images/keep.txt");
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+
+    fs.unlinkSync(path.join(realDir, "images"));
+  });
+});
+
+/**
+ * The root may also be reached through a symlinked *ancestor*, not only through
+ * a symlink at the root itself: `realpathSync` resolves the whole chain.
+ */
+describe("upload storage with a symlinked ancestor", () => {
+  let base: string;
+  let realParent: string;
+  let linkedParent: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-linked-parent-"));
+    realParent = path.join(base, "real_parent");
+    linkedParent = path.join(base, "linked_parent");
+    fs.mkdirSync(realParent, { recursive: true });
+    fs.symlinkSync(realParent, linkedParent);
+    process.env.UPLOAD_DIR = path.join(linkedParent, "uploads");
+  });
+
+  afterAll(() => {
+    process.env.UPLOAD_DIR = tmp;
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("resolves the ancestor chain and writes at the real location", async () => {
+    const { writeKey, readKey, resolveKey } = await import("@/lib/storage");
+
+    // The resolved namespace is what makes the rest of the design consistent:
+    // the kernel would follow the ancestor symlink on its own, so "the bytes
+    // landed somewhere" proves nothing. What must hold is that the key resolves
+    // to the real path, so callers and comparisons agree.
+    expect(resolveKey("a/b.bin")).toBe(path.join(fs.realpathSync(realParent), "uploads", "a", "b.bin"));
+    expect(resolveKey("a/b.bin").startsWith(linkedParent)).toBe(false);
+
+    await writeKey("a/b.bin", Buffer.from("ANCESTOR"));
+    const landed = path.join(realParent, "uploads", "a", "b.bin");
+    expect(fs.readFileSync(landed, "utf8")).toBe("ANCESTOR");
+    expect((await readKey("a/b.bin"))?.toString("utf8")).toBe("ANCESTOR");
+  });
+
+  it("still refuses a symlink below a root reached through a symlinked ancestor", async () => {
+    const { writeKey, resolveKey } = await import("@/lib/storage");
+    const outsideDir = path.join(base, "outside-anc");
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, "keep.txt"), "ORIGINAL");
+    // The escape sits under the *real* parent, i.e. below the resolved root.
+    fs.mkdirSync(path.join(realParent, "uploads"), { recursive: true });
+    fs.symlinkSync(outsideDir, path.join(realParent, "uploads", "escape"));
+
+    expect(() => resolveKey("escape/keep.txt")).toThrow(/symbolic link/);
+    await expect(writeKey("escape/evil.bin", Buffer.from("X"))).rejects.toThrow(/symbolic link/);
+    expect(fs.readdirSync(outsideDir)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(path.join(outsideDir, "keep.txt"), "utf8")).toBe("ORIGINAL");
   });
 });

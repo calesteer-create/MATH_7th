@@ -173,13 +173,22 @@ function lstatOrNull(target: string): fs.Stats | null {
  * symbolic link. Returns the real path string (absolute, `..` free) or throws
  * `UnsafePathError`.
  *
- * **The root is the trust boundary, and it is chosen by the operator.** If the
- * root path itself (or one of its ancestors) is a symlink it is resolved with
- * `realpath` and the walk continues from there: refusing would break legitimate
- * layouts, notably macOS where `/tmp` is a symlink to `/private/tmp`, and the
- * operator asked for that directory explicitly. Everything *below* the resolved
- * root must be a real directory — that is the part an attacker who can plant
- * links inside the tree controls.
+ * **The root is the trust boundary, and it is chosen by the operator.** The
+ * root path is resolved **once** with `realpathSync`, which follows the root
+ * itself *and every ancestor* — refusing either would break legitimate layouts,
+ * notably macOS where `/tmp` is a symlink to `/private/tmp`, while the operator
+ * asked for that directory explicitly.
+ *
+ * The single namespace this function returns is **the resolved root's**: the
+ * returned path is `realpath(root) + relative(target)`. Every caller must use
+ * that returned value for the whole operation and must not re-check it against
+ * the *unresolved* root — doing so mixes two namespaces and rejects perfectly
+ * valid paths. `writeJson`, `writeFileInside`, `makeDirsTracked` and
+ * `rollbackWrites` all follow that rule; `resolveKey` in `src/lib/storage.ts`
+ * returns the resolved path for the same reason.
+ *
+ * Everything *below* the resolved root must be a real directory — that is the
+ * part an attacker who can plant links inside the tree controls.
  *
  * Threat model: this stops **pre-existing** symlinks (a checked-in link, one
  * created by an earlier run, or one placed by someone who can write into the
@@ -191,38 +200,42 @@ function lstatOrNull(target: string): fs.Stats | null {
  */
 export function resolveInside(root: string, target: string): SafePath {
   const declaredRoot = path.resolve(root);
-  let absoluteTarget = path.resolve(target);
+  const absoluteTarget = path.resolve(target);
 
-  // 1. Lexical containment against the declared root: cheap, and it keeps the
-  //    component walk finite.
-  const declaredRelative = path.relative(declaredRoot, absoluteTarget);
-  if (
-    declaredRelative !== "" &&
-    (declaredRelative === ".." ||
-      declaredRelative.startsWith(`..${path.sep}`) ||
-      path.isAbsolute(declaredRelative))
-  ) {
+  // 1. Resolve the root once. `realpathSync` follows the root itself and every
+  //    ancestor; a root that does not exist yet keeps its declared path, because
+  //    there is nothing to resolve and nothing below it can exist either.
+  const resolvedRoot = resolveExistingPrefix(declaredRoot);
+  const rootStat = lstatOrNull(resolvedRoot);
+  if (rootStat !== null && !rootStat.isDirectory()) {
+    throw new UnsafePathError(`root ${declaredRoot} is not a directory`);
+  }
+
+  // 2. A root with two names has two valid spellings, and both name the same
+  //    trust boundary. Accept either — reject anything under neither — then work
+  //    exclusively from the resolved spelling. This is what keeps a resolved
+  //    path from being mistaken for an escape when the root is a symlink.
+  const candidates = resolvedRoot === declaredRoot ? [declaredRoot] : [declaredRoot, resolvedRoot];
+  let relative: string | null = null;
+  for (const candidate of candidates) {
+    const under = path.relative(candidate, absoluteTarget);
+    const escapes =
+      under !== "" && (under === ".." || under.startsWith(`..${path.sep}`) || path.isAbsolute(under));
+    if (!escapes) {
+      relative = under;
+      break;
+    }
+  }
+  if (relative === null) {
     throw new UnsafePathError(`${absoluteTarget} is outside ${declaredRoot}`);
   }
 
-  // 2. The root may exist as a symlink (see above). Resolve it so the walk below
-  //    starts at the real directory, and remap the target onto the same base.
-  let absoluteRoot = declaredRoot;
-  const rootStat = lstatOrNull(declaredRoot);
-  if (rootStat !== null) {
-    if (!rootStat.isDirectory() && !rootStat.isSymbolicLink()) {
-      throw new UnsafePathError(`root ${declaredRoot} is not a directory`);
-    }
-    if (rootStat.isSymbolicLink()) {
-      absoluteRoot = fs.realpathSync(declaredRoot);
-      absoluteTarget = path.join(absoluteRoot, declaredRelative);
-    }
-  }
+  const absoluteRoot = resolvedRoot;
+  const absoluteResolvedTarget = relative === "" ? absoluteRoot : path.join(absoluteRoot, relative);
 
   // 3. Walk every component below the root. A symlink anywhere is refused, and
   //    the first non-existent component ends the walk: nothing below it exists,
   //    so nothing below it can be a symlink.
-  const relative = path.relative(absoluteRoot, absoluteTarget);
   const parts = relative === "" ? [] : relative.split(path.sep);
   let current = absoluteRoot;
   for (const [index, part] of parts.entries()) {
@@ -238,7 +251,27 @@ export function resolveInside(root: string, target: string): SafePath {
     }
   }
 
-  return absoluteTarget as SafePath;
+  return absoluteResolvedTarget as SafePath;
+}
+
+/**
+ * `realpath` for a path that may not exist yet: resolves the longest existing
+ * prefix and re-appends the rest, so a root that the first write creates still
+ * gets a real, symlink-free base instead of its literal spelling.
+ */
+function resolveExistingPrefix(target: string): string {
+  const missing: string[] = [];
+  let current = path.resolve(target);
+  for (;;) {
+    if (lstatOrNull(current) !== null) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    missing.push(path.basename(current));
+    current = parent;
+  }
+  const exists = lstatOrNull(current) !== null;
+  const resolvedBase = exists ? fs.realpathSync(current) : current;
+  return missing.length === 0 ? resolvedBase : path.join(resolvedBase, ...missing.reverse());
 }
 
 /** Throws unless `target` is safe to write to under `root`. */

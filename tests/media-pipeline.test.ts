@@ -6,7 +6,7 @@ import sharp from "sharp";
 import { MediaError, inspectWebp, processSourceImage, sha256Hex } from "@/media/process";
 import { checkDeletion, buildReferenceIndex, collectQuizSourceImages, referencedFiles } from "@/media/references";
 import { importImageIntoLesson, listLessonMediaFiles } from "@/media/import";
-import { UnsafePathError, resolveInside, writeFileInside } from "@/media/tree";
+import { UnsafePathError, resolveInside, writeFileInside, writeJson } from "@/media/tree";
 import type { LessonImageContent } from "@/content/model";
 import { validateLesson } from "@/content/validate";
 
@@ -351,6 +351,50 @@ describe("importImageIntoLesson — refuses symlink escapes", () => {
       UnsafePathError,
     );
     expect(fs.readdirSync(outside)).toEqual(["secret.txt"]);
+  });
+});
+
+describe("a symlinked media root is usable", () => {
+  it("imports into the real directory and validates there", async () => {
+    // The root is chosen by the operator and may be a link (a mounted volume,
+    // macOS /tmp). The guard must accept both spellings and return the resolved
+    // one; an earlier version returned a resolved path that its own callers
+    // re-checked against the unresolved root, so every write was rejected.
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-linked-media-"));
+    const realRoot = path.join(base, "real_media");
+    const linkRoot = path.join(base, "media_link");
+    fs.mkdirSync(realRoot, { recursive: true });
+    fs.symlinkSync(realRoot, linkRoot);
+    try {
+      const source = await makeJpeg(600, 800);
+      const result = await importImageIntoLesson({ mediaRoot: linkRoot, lessonId: 5, source });
+
+      // The returned paths are in the resolved namespace and really exist.
+      expect(result.webPath.startsWith(fs.realpathSync(realRoot))).toBe(true);
+      expect(fs.existsSync(path.join(realRoot, "lessons", "5", result.image.file))).toBe(true);
+      expect(fs.existsSync(path.join(realRoot, "lessons", "5", "thumbs", result.image.file))).toBe(true);
+      // A single boundary: nothing was created next to the link.
+      expect(fs.readdirSync(base).sort()).toEqual(["media_link", "real_media"]);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("writes a lesson record through a symlinked content root", async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-linked-content-"));
+    const realContent = path.join(base, "real_content");
+    const linkContent = path.join(base, "content_link");
+    fs.mkdirSync(path.join(realContent, "lessons"), { recursive: true });
+    fs.symlinkSync(realContent, linkContent);
+    try {
+      writeJson(linkContent, path.join(linkContent, "lessons", "1.json"), { id: 1 });
+      expect(fs.existsSync(path.join(realContent, "lessons", "1.json"))).toBe(true);
+      // ...and a nested directory that had to be created.
+      writeJson(linkContent, path.join(linkContent, "lessons", "deep", "2.json"), { id: 2 });
+      expect(fs.existsSync(path.join(realContent, "lessons", "deep", "2.json"))).toBe(true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 

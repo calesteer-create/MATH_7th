@@ -123,14 +123,18 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
   // Same containment rule as media:sync, applied inside the library function so
   // a direct caller is protected too — not only the CLI. A pre-existing symlink
   // anywhere below mediaRoot is refused before anything is created.
-  resolveInside(mediaRoot, webPath);
-  resolveInside(mediaRoot, thumbPath);
+  //
+  // The *resolved* paths are what this function returns, so caller and disk
+  // agree even when mediaRoot is itself a symlink. Returning the unresolved
+  // spelling would describe files at a location that is not where they are.
+  const resolvedWebPath = resolveInside(mediaRoot, webPath);
+  const resolvedThumbPath = resolveInside(mediaRoot, thumbPath);
 
   if (!options.dryRun && !reused) {
     // Exclusive create: a name that slipped past the collision check can never
     // clobber an existing page, and a symlink at either target is not followed.
-    writeFileInside(mediaRoot, webPath, processed.web, { exclusive: true });
-    writeFileInside(mediaRoot, thumbPath, processed.thumb, { exclusive: true });
+    writeFileInside(mediaRoot, resolvedWebPath, processed.web, { exclusive: true });
+    writeFileInside(mediaRoot, resolvedThumbPath, processed.thumb, { exclusive: true });
   }
 
   const position =
@@ -147,8 +151,8 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
       bytes: processed.sourceBytes,
       sha256: processed.sha256,
     },
-    webPath,
-    thumbPath,
+    webPath: resolvedWebPath,
+    thumbPath: resolvedThumbPath,
     reused,
     processed,
   };
