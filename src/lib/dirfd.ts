@@ -308,6 +308,14 @@ export function translateComponentError(error: unknown): unknown {
   if (code === "ELOOP") {
     return new UnsafeComponentError("a component below the root is a symbolic link");
   }
+  if (code === "ENXIO") {
+    // Opening a FIFO for writing with `O_NONBLOCK` and no reader fails with ENXIO
+    // on Linux. It is a refusal of a special file, not a broken path, and the
+    // message should say so rather than leaking an errno the operator cannot act on.
+    return new UnsafeComponentError(
+      "the entry is a FIFO or another special file, not a regular file; refusing to open it",
+    );
+  }
   if (code === "ENOTDIR") {
     // A symlinked component reaches this branch: `O_DIRECTORY` on a link reports
     // ENOTDIR rather than ELOOP, because the link is not a directory. Both mean

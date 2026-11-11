@@ -14,6 +14,7 @@ import {
   UnsafeComponentError,
   at as fdAt,
   describeEntryType,
+  translateComponentError,
   makeDirPath,
   openDir,
   openDirUnder,
@@ -145,16 +146,21 @@ function writeJsonInner(root: string, target: string, value: unknown): void {
   // else's file is sitting there, and removing it would destroy their work.
   let createdTemporary = false;
   try {
-    // Refuse a link at the destination explicitly. `renameat` would replace the
-    // link itself rather than writing through it — the victim's bytes are safe —
-    // but silently replacing a link is not the same as accepting the write, and
-    // the documented policy is to refuse rather than to redefine the target.
+    // The destination is inspected before anything is created or replaced.
+    // `renameat` below would replace whatever sits at the name — the link's target
+    // survives, and so would a FIFO's — but replacing an entry with a JSON file is
+    // not the same as accepting the write. Only a regular file (or nothing) may be
+    // replaced; a link, FIFO, socket or device is refused and left untouched.
+    let existing: fs.Stats | null = null;
     try {
-      if (handle.parent.lstat(handle.leaf).isSymbolicLink()) {
-        throw new UnsafePathError(`${target} is a symbolic link`);
-      }
+      existing = handle.parent.lstat(handle.leaf);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (existing !== null && !existing.isFile()) {
+      throw new UnsafePathError(
+        `${target} exists but is ${describeEntryType(existing)}; refusing to replace it`,
+      );
     }
     const fd = handle.parent.open(
       temporary,
@@ -224,26 +230,46 @@ function writeFileInsideInner(
   const exclusive = options.exclusive ?? true;
   try {
     let fd: number;
+    // `O_NONBLOCK` on the open. Opening a FIFO blocks — for writing it waits for a
+    // reader — and that block happens *before* any type check could refuse it. The
+    // flag makes the open return immediately; the `fstat` below then rejects the
+    // entry. A regular file is unaffected by the flag.
     try {
       fd = handle.parent.open(
         handle.leaf,
         fs.constants.O_WRONLY |
           fs.constants.O_CREAT |
           fs.constants.O_NOFOLLOW |
+          fs.constants.O_NONBLOCK |
           (exclusive ? fs.constants.O_EXCL : 0),
         options.mode ?? 0o644,
       );
     } catch (error) {
-      if (exclusive || (error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      fd = handle.parent.open(
-        handle.leaf,
-        fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
-        options.mode ?? 0o644,
-      );
+      if (exclusive || (error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw asUnsafePathError(translateComponentError(error));
+      }
+      // Existing entry: open without O_TRUNC so nothing is emptied before the type
+      // is known, then prove the type on the descriptor that will be written.
+      try {
+        fd = handle.parent.open(
+          handle.leaf,
+          fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+          options.mode ?? 0o644,
+        );
+      } catch (openError) {
+        throw asUnsafePathError(translateComponentError(openError));
+      }
     }
     try {
+      // The order is fixed: open, `fstat` proves the type, then truncate and write.
+      // There is no `O_TRUNC` in any open flag, so a rejected FIFO or device is
+      // left exactly as it was found rather than emptied first.
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) {
+        throw new UnsafePathError(`${target} exists but is ${describeEntryType(stat)}; refusing to write through it`);
+      }
       // Truncation happens on the descriptor, after the open succeeded through
-      // the pinned chain, so `O_TRUNC` cannot empty a file before it is proven.
+      // the pinned chain, so it cannot empty a file before it is proven.
       if (!exclusive) fs.ftruncateSync(fd, 0);
       fs.writeFileSync(fd, data);
     } finally {
@@ -430,6 +456,34 @@ export function assertSafePath(root: string, target: string): SafePath {
  *
  * Failures are returned, never swallowed: the caller has to be able to say
  * whether the tree really is unchanged instead of assuming it.
+ *
+ * **What the deletion of `createdFiles` does and does not prove.** Two different
+ * claims are involved and only the first one holds:
+ *
+ *   1. *Creation was proven at write time.* `media:sync` records a path in
+ *      `createdFiles` only after the write reported that it created the file
+ *      (`writeFileAt` returning `true`, which is `O_EXCL` succeeding). A path in
+ *      this list really was this run's file at the moment it was written.
+ *
+ *   2. *Identity is NOT proven at delete time.* By the time the rollback runs, the
+ *      name may refer to a different inode: something could have removed our file
+ *      and put a regular file of its own in its place. This function checks, on a
+ *      descriptor, that the entry is a regular file, and it then unlinks *that*
+ *      name. It holds no `dev`/`ino` of the file it created, so it cannot tell our
+ *      file from a regular file substituted for it — and it would delete the
+ *      substitute.
+ *
+ * Closing that window would require keeping the created file's descriptor (or its
+ * `dev`/`ino`) for the lifetime of the batch and comparing before removing, which
+ * this design does not do: the write helper closes its descriptor when it returns,
+ * and Node offers no portable `unlink` conditioned on an inode. A `lstat` followed
+ * by `unlink` would not close it either — the name can be swapped between the two
+ * calls — so no extra `lstat` is added here and no such claim is made.
+ *
+ * The practical consequence is bounded: the deletion is confined to
+ * `allowedRoots`, it can only remove a *regular file* at a path this run wrote,
+ * and it can only happen during rollback after a failure. It remains a documented
+ * limit of concurrent modification by another process, not a proof of ownership.
  */
 export function rollbackWrites(
   createdFiles: string[],
@@ -518,8 +572,10 @@ export function rollbackWrites(
         continue;
       }
       // `lstat` through the descriptor, then `unlinkat` against the same one: the
-      // directory cannot move between the check and the removal, so a deletion
-      // cannot land outside the root.
+      // *directory* cannot move between the check and the removal, so the deletion
+      // cannot land outside the root. This proves the type, not the identity — see
+      // the note on `createdFiles` above; a regular file substituted for ours at
+      // the same name is not detected and is removed.
       let stat: fs.Stats;
       try {
         stat = handle.parent.lstat(handle.leaf);

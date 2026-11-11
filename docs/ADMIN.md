@@ -396,6 +396,32 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
 | جرد الـorphans في `content:validate` بـ`readdirSync(path)` يدخل مجلد درس عبر رابط | جرد عبر `OpenDir.list()` و`openDirUnder()`؛ الرابط يُتخطّى ولا يُتبع |
 | فتح FIFO يعلّق العملية قبل `fstat` | `O_NONBLOCK` على كل فتح (`readFileAt`, `writeFileAt`, `readKey`, rollback, `import.ts`, `storage-safe`) |
 
+وفي هذه الجولة:
+
+| كان | صار |
+|---|---|
+| `writeFileInside` يفتح بلا `O_NONBLOCK` و**بلا `fstat`** قبل `ftruncate` | `O_NONBLOCK` على الفتحين، والترتيب: فتح ← `fstat` يثبت أنه ملف عادي ← `ftruncate` وكتابة. لا `O_TRUNC` في أي راية |
+| `writeJson` يرفض الروابط فقط، فيستبدل FIFO/socket/جهاز بملف JSON عبر `renameat` | `lstat` قبل أي إنشاء أو استبدال؛ يُستبدل **ملف عادي** أو لا شيء. الأنواع الأخرى رفض وتبقى كما هي |
+
+### ما لا يُثبته rollback (مهم)
+
+الحذف في `rollbackWrites` يثبت **النوع** لا **الهوية**:
+
+- **إثبات الإنشاء وقت الكتابة** — قائم: المسار يدخل `createdFiles` فقط بعد أن
+  يُبلّغ `writeFileAt` أنه أنشأه (`O_EXCL` نجح).
+- **إثبات هوية الملف وقت الحذف** — **غير قائم**: لا يُحفظ `dev`/`ino` للملف
+  المُنشأ، فالاسم قد يشير إلى inode آخر. الملف العادي الذي يستبدل ملفنا بنفس
+  الاسم **يُحذف**، ولا يُكتشف.
+
+إغلاق هذه النافذة يحتاج حفظ واصف الملف (أو `dev`/`ino`) طوال الدفعة ومقارنته قبل
+الحذف؛ Node لا يوفّر `unlink` مشروطًا بـinode، و`lstat` ثم `unlink` **لا يُغلق**
+السباق لأن الاسم قد يُبدَّل بين النداءين — لذلك لم يُضَف، ولم يُدَّعَ.
+
+النطاق محدود: الحذف محصور في `allowedRoots`، ولا يمسّ إلا **ملفًا عاديًا** في مسار
+كتبه التشغيل، ولا يحدث إلا في rollback بعد فشل. وسلوك الاستبدال مثبّت باختبار
+(`rollback deletion: type is proven, identity is documented as unproven`) حتى
+تتغيّر الوثيقة إن تغيّر السلوك.
+
 اختبارات هذه الجولة: `tests/media-pipeline.test.ts` (ملكية المدخلات ونوعها)،
 `tests/content-model.test.ts` (جرد الـorphans عبر رابط)، `tests/images.test.ts`
 (FIFO بلا تعليق)، `tests/media-sync.test.ts` (رابط في مكان المصغرة).

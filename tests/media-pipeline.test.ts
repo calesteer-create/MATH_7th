@@ -1065,3 +1065,199 @@ describe("an entry this run did not create is never adopted as its own", () => {
     expect(result.failures.join("\n")).toMatch(/symbolic link/i);
   });
 });
+
+/**
+ * `writeFileInside` on an entry that is not a regular file.
+ *
+ * The open had no `O_NONBLOCK`, so a FIFO at the destination blocked the process
+ * on `open` — before any type check could run. And with `exclusive: false` the old
+ * code called `ftruncate` without proving the type first: `fstat` was missing
+ * entirely, so the sequence was open → truncate → write on an unknown entry.
+ *
+ * The order asserted here is: open, `fstat` proves a regular file, then truncate
+ * and write. A FIFO is never truncated, never replaced, and never waited on.
+ */
+describe("writeFileInside refuses special files instead of writing through them", () => {
+  const canMkfifo = spawnSync("mkfifo", ["--version"], { encoding: "utf8" }).status === 0;
+  let base: string;
+  let root: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-wfi-"));
+    root = path.join(base, "media");
+    fs.mkdirSync(path.join(root, "lessons", "1"), { recursive: true });
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it.skipIf(!canMkfifo)("does not hang, refuses a FIFO, and leaves it in place (exclusive: false)", async () => {
+    const { writeFileInside } = await import("@/media/tree");
+    const fifo = path.join(root, "lessons", "1", "page.webp");
+    expect(spawnSync("mkfifo", [fifo], { encoding: "utf8" }).status).toBe(0);
+    const before = fs.lstatSync(fifo);
+
+    // Without O_NONBLOCK this call blocks forever and the test times out; the
+    // 20s budget is the assertion that it returns.
+    expect(() => writeFileInside(root, fifo, Buffer.from("X"), { exclusive: false })).toThrow(
+      /FIFO|not a regular file/i,
+    );
+
+    // The entry is still a FIFO, same inode: not truncated, not replaced by a file.
+    const after = fs.lstatSync(fifo);
+    expect(after.isFIFO()).toBe(true);
+    expect(after.ino).toBe(before.ino);
+    expect(after.size).toBe(0);
+  }, 20_000);
+
+  it.skipIf(!canMkfifo)("refuses a FIFO with the default exclusive mode too", async () => {
+    const { writeFileInside } = await import("@/media/tree");
+    const fifo = path.join(root, "lessons", "1", "page2.webp");
+    expect(spawnSync("mkfifo", [fifo], { encoding: "utf8" }).status).toBe(0);
+    const before = fs.lstatSync(fifo);
+    // O_EXCL fails with EEXIST here; either way the FIFO must survive untouched.
+    expect(() => writeFileInside(root, fifo, Buffer.from("X"))).toThrow();
+    const after = fs.lstatSync(fifo);
+    expect(after.isFIFO()).toBe(true);
+    expect(after.ino).toBe(before.ino);
+  }, 20_000);
+
+  it("still writes a normal file and replaces it when asked", async () => {
+    const { writeFileInside } = await import("@/media/tree");
+    const file = path.join(root, "lessons", "1", "ok.webp");
+    writeFileInside(root, file, Buffer.from("FIRST"));
+    expect(fs.readFileSync(file, "utf8")).toBe("FIRST");
+    writeFileInside(root, file, Buffer.from("SECOND"), { exclusive: false });
+    expect(fs.readFileSync(file, "utf8")).toBe("SECOND");
+    expect(fs.lstatSync(file).isFile()).toBe(true);
+  });
+
+  it("refuses a symlink at the destination", async () => {
+    const { writeFileInside } = await import("@/media/tree");
+    const victim = path.join(base, "victim.txt");
+    fs.writeFileSync(victim, "VICTIM");
+    const link = path.join(root, "lessons", "1", "link.webp");
+    fs.symlinkSync(victim, link);
+    expect(() => writeFileInside(root, link, Buffer.from("X"), { exclusive: false })).toThrow();
+    expect(fs.readFileSync(victim, "utf8")).toBe("VICTIM");
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+});
+
+/**
+ * `writeJson` must not replace a special entry with a JSON file.
+ *
+ * It used to refuse only symlinks. A FIFO at the record name was silently replaced
+ * by `renameat`, which destroyed an entry the run never created.
+ */
+describe("writeJson refuses to replace non-regular entries", () => {
+  const canMkfifo = spawnSync("mkfifo", ["--version"], { encoding: "utf8" }).status === 0;
+  let base: string;
+  let root: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-wj-"));
+    root = path.join(base, "content");
+    fs.mkdirSync(path.join(root, "lessons"), { recursive: true });
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it.skipIf(!canMkfifo)("refuses a FIFO and leaves it as a FIFO", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const fifo = path.join(root, "lessons", "1.json");
+    expect(spawnSync("mkfifo", [fifo], { encoding: "utf8" }).status).toBe(0);
+    const before = fs.lstatSync(fifo);
+
+    expect(() => writeJson(root, fifo, { id: 1 })).toThrow(/FIFO|not a regular file/i);
+
+    const after = fs.lstatSync(fifo);
+    expect(after.isFIFO()).toBe(true);
+    expect(after.ino).toBe(before.ino);
+    // No JSON was published and no temporary file was left behind.
+    expect(fs.readdirSync(path.join(root, "lessons"))).toEqual(["1.json"]);
+  }, 20_000);
+
+  it("refuses a symlink and leaves the target intact", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const victim = path.join(base, "victim.json");
+    fs.writeFileSync(victim, "ORIGINAL");
+    const link = path.join(root, "lessons", "2.json");
+    fs.symlinkSync(victim, link);
+
+    expect(() => writeJson(root, link, { id: 2 })).toThrow(/symbolic link|not a regular file/i);
+    expect(fs.readFileSync(victim, "utf8")).toBe("ORIGINAL");
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  it("refuses a directory at the record name", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const dir = path.join(root, "lessons", "3.json");
+    fs.mkdirSync(dir);
+    expect(() => writeJson(root, dir, { id: 3 })).toThrow(/directory|not a regular file/i);
+    expect(fs.lstatSync(dir).isDirectory()).toBe(true);
+  });
+
+  it("still replaces a plain record atomically", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const target = path.join(root, "lessons", "4.json");
+    writeJson(root, target, { id: 4, title: "first" });
+    writeJson(root, target, { id: 4, title: "second" });
+    expect(JSON.parse(fs.readFileSync(target, "utf8")).title).toBe("second");
+    expect(fs.readdirSync(path.join(root, "lessons"))).toEqual(["4.json"]);
+  });
+});
+
+/**
+ * The documented limit of `rollbackWrites`, pinned as behaviour rather than
+ * asserted away.
+ *
+ * Creation is proven at write time (a path enters `createdFiles` only after the
+ * write reported `O_EXCL` success). Identity is *not* proven at delete time: a
+ * regular file substituted for ours at the same name is removed, because no
+ * `dev`/`ino` of the created file is retained and Node offers no unlink conditioned
+ * on an inode. This test exists so the claim in the docs stays honest — if someone
+ * later makes the rollback refuse a substituted file, this test failing is the
+ * signal that the documentation must change with it.
+ */
+describe("rollback deletion: type is proven, identity is documented as unproven", () => {
+  it("cannot distinguish a substituted regular file from the one it created", async () => {
+    const { rollbackWrites } = await import("@/media/tree");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-ident-"));
+    const root = path.join(base, "media");
+    fs.mkdirSync(root, { recursive: true });
+    const target = path.join(root, "ours.webp");
+    fs.writeFileSync(target, "OURS");
+    // Another process replaces our file with a regular file of its own.
+    fs.rmSync(target);
+    fs.writeFileSync(target, "SUBSTITUTE");
+    try {
+      const result = rollbackWrites([target], [], [], [root]);
+      // The substitute is removed: the current behaviour, and the documented limit.
+      expect(result.created).toBe(1);
+      expect(fs.existsSync(target)).toBe(false);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("still refuses anything that is not a regular file", async () => {
+    const { rollbackWrites } = await import("@/media/tree");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-ident2-"));
+    const root = path.join(base, "media");
+    fs.mkdirSync(root, { recursive: true });
+    const victim = path.join(base, "outside.txt");
+    fs.writeFileSync(victim, "OUTSIDE");
+    const link = path.join(root, "substituted.webp");
+    fs.symlinkSync(victim, link);
+    try {
+      const result = rollbackWrites([link], [], [], [root]);
+      // A link is a different inode *and* a different type: refused.
+      expect(result.created).toBe(0);
+      expect(fs.readFileSync(victim, "utf8")).toBe("OUTSIDE");
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
