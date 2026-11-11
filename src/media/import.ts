@@ -105,11 +105,19 @@ export function fileSha256(file: string, root?: string): string | null {
     // O_NOFOLLOW: the name we hash must not itself be a link.
     const fd = fs.openSync(safe, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     try {
-      // The open resolved every directory component afresh; if the result is not
-      // where the guard said it was, a component changed between the check and
-      // the syscall. Nothing outside the root is ever hashed.
-      const actual = fs.realpathSync(safe);
-      if (actual !== safe) throw new UnsafePathError(`${safe} resolved to ${actual}`);
+      // `realpath` re-walks the chain the kernel walked, so a component that is a
+      // link right now is caught. It is not sufficient alone: an attacker can
+      // point a component outside for the open and restore it before this runs,
+      // leaving `realpath` reporting an inside path while the descriptor refers
+      // to an outside file. So the descriptor's identity is compared as well —
+      // inode and device must be the ones the resolved path names. And the bytes
+      // are read from the *descriptor*, never from a re-opened path.
+      const resolved = resolveInside(root, fs.realpathSync(safe));
+      const opened = fs.fstatSync(fd);
+      const named = fs.statSync(resolved);
+      if (opened.dev !== named.dev || opened.ino !== named.ino) {
+        throw new UnsafePathError(`${safe} was opened at a file it no longer names`);
+      }
       return sha256Hex(fs.readFileSync(fd));
     } finally {
       fs.closeSync(fd);

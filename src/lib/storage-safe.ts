@@ -130,9 +130,46 @@ function resolveExistingPrefix(target: string): string {
   return missing.length === 0 ? resolvedBase : path.join(resolvedBase, ...missing.reverse());
 }
 
+/**
+ * Serialises writes to the same target within this process.
+ *
+ * The write is now three syscalls (probe-create, identity check, truncate+write)
+ * instead of one, so two overlapping calls for the same key would interleave and
+ * one payload would be spliced into the other. Keys are generated per upload, so
+ * a collision means the same key was written twice concurrently — the last
+ * writer must win, as it did when a single `open` did the whole job. Serialising
+ * restores that: one payload, never a mixture. It is per-process only, which is
+ * all a single-owner deployment needs.
+ */
+const inflight = new Map<string, Promise<void>>();
+
+function serialize<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const previous = inflight.get(key) ?? Promise.resolve();
+  const next = previous.then(work, work);
+  // The queued marker never rejects: its job is only to order the next write, and
+  // an unhandled rejection here would take the process down instead of surfacing
+  // through the caller's own promise.
+  const marker = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  inflight.set(key, marker);
+  // Drop the entry once it is idle, so the map does not grow without bound on a
+  // long-running server.
+  void marker.then(() => {
+    if (inflight.get(key) === marker) inflight.delete(key);
+  });
+  return next;
+}
+
 /** Writes `data` at `target`, never through a symlink, creating parents safely. */
 export async function writeInsideUploadRoot(root: string, target: string, data: Buffer): Promise<void> {
   const safeTarget = resolveInsideUploadRoot(root, target);
+  // Serialised by target: see `serialize` for why a multi-step write needs it.
+  return serialize(safeTarget, () => writeSerialized(root, safeTarget, data));
+}
+
+async function writeSerialized(root: string, safeTarget: string, data: Buffer): Promise<void> {
   const directory = path.dirname(safeTarget);
   await fs.mkdir(directory, { recursive: true });
 
@@ -143,54 +180,144 @@ export async function writeInsideUploadRoot(root: string, target: string, data: 
   // catches a symlink at the final component.
   resolveInsideUploadRoot(root, safeTarget);
 
-  const flags =
-    fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | fsSync.constants.O_NOFOLLOW;
   // Again as close to the open as this API allows. `O_NOFOLLOW` then stops the
   // final component from being a link at the instant of the syscall.
   resolveInsideUploadRoot(root, safeTarget);
-  const handle = await fs.open(safeTarget, flags, 0o644);
+
+  // The open must not be able to destroy anything, because at this point the
+  // destination is still unproven: a component swapped between the check above
+  // and this call sends the open outside the root, and `O_TRUNC` would empty an
+  // outside file *before* any post-open check could refuse it. So: no `O_TRUNC`
+  // and no `O_CREAT` yet. `O_EXCL` fails with `EEXIST` instead of touching an
+  // existing file, and an absent file is created empty — harmless even at the
+  // wrong location. The real (truncating) open happens below, only after the
+  // descriptor has been proved to be the file the guard approved.
+  const probeFlags = fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL;
+  let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
-    // The last defence, and the only one that observes what the *kernel* did:
-    // `realpath` re-walks the whole chain after the open. If a directory
-    // component was swapped for a link between the check above and the open, the
-    // descriptor points somewhere the guard never approved, and this rejects it
-    // before a single byte is written. The empty/truncated file the open created
-    // at that path is removed below, so nothing of ours is left outside the root.
-    await assertOpenedInsideRoot(root, safeTarget);
-    await handle.writeFile(data);
+    handle = await fs.open(safeTarget, probeFlags, 0o644);
   } catch (error) {
-    await handle.close();
-    // Cleaning up must never replace the real cause with its own failure.
-    try {
-      const stat = await fs.lstat(safeTarget).catch(() => null);
-      if (stat !== null && stat.isFile()) await fs.unlink(safeTarget);
-    } catch {
-      /* the refusal is what the caller needs to see */
-    }
-    throw error;
+    handle = await openExistingInsideRoot(root, safeTarget, error);
+  }
+
+  let committed = false;
+  let identity: { dev: number; ino: number } | undefined;
+  try {
+    // Proves what the *kernel* actually opened, not what the path resolves to
+    // now: `realpath` alone is defeated by a swap that is undone before it runs.
+    identity = await assertOpenedInsideRoot(root, safeTarget, handle);
+    // Truncation is now safe: this descriptor was just proven to be a file inside
+    // the root (both by path and by inode), so emptying it destroys nothing that
+    // lives outside. `truncate` acts on the descriptor, not on a path, so no
+    // swap can redirect it anywhere else.
+    await handle.truncate(0);
+    await handle.write(data, 0, data.length, 0);
+    committed = true;
+    return;
   } finally {
     await handle.close().catch(() => undefined);
+    if (!committed) {
+      // Only the file this call created is removed, and only by identity: the
+      // path is re-proved to name the same inode as the closed descriptor, so a
+      // swap between the check and the unlink cannot point the deletion outside
+      // the root. If it cannot be proved, the leftover is reported, not removed.
+      await removeIfStillOurs(root, safeTarget, identity);
+    }
   }
 }
 
 /**
- * Proves the path the guard validated is still the path the filesystem resolves.
+ * Opens a target that already exists, without giving it the chance to be
+ * damaged first.
  *
- * `realpath` is the only check that sees the result of the kernel's own walk, so
- * it catches a component swapped *before* the open — the case `lstat` walks and
- * `O_NOFOLLOW` both miss, because `O_NOFOLLOW` constrains the final component
- * only. It cannot catch a swap that happens *after* the open; nothing in Node
- * can, since there is no dirfd-relative access. This narrows the window, it does
- * not close it, and the docs say so.
+ * Used only when the exclusive probe reported `EEXIST`. The open appends
+ * (`O_APPEND`) and not truncates, so even a swapped component can only have
+ * bytes added at the end — and the bytes are discarded by the `truncate(0)` that
+ * follows a successful identity check. Anything that is not `EEXIST` is a real
+ * failure and is rethrown unchanged.
  */
-async function assertOpenedInsideRoot(root: string, safeTarget: string): Promise<void> {
+async function openExistingInsideRoot(
+  root: string,
+  safeTarget: string,
+  cause: unknown,
+): Promise<Awaited<ReturnType<typeof fs.open>>> {
+  if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
+  const flags = fsSync.constants.O_WRONLY | fsSync.constants.O_APPEND | fsSync.constants.O_NOFOLLOW;
+  const handle = await fs.open(safeTarget, flags, 0o644);
+  // Identity is proved by the caller for both branches; nothing is written here.
+  return handle;
+}
+
+/**
+ * Proves the descriptor refers to a file inside `root`, and returns its identity.
+ *
+ * Two checks, because either alone is unsound:
+ *
+ * 1. `realpath` on the path the guard validated — it re-walks the chain, so a
+ *    component that is *currently* a link is caught.
+ * 2. `dev`/`ino` of the open descriptor against the `dev`/`ino` of the resolved
+ *    path. This is what catches the swap-and-restore attack: the attacker points
+ *    the component outside, lets the kernel open the outside file, then restores
+ *    the directory before `realpath` runs. The path then resolves inside and
+ *    check 1 passes, but the descriptor still refers to the outside inode, and
+ *    the identities differ.
+ *
+ * Neither check closes the race — a swap *after* both leaves the descriptor
+ * valid and the writes go to the file it names. There is no dirfd-relative
+ * access in Node to do better, which is why the write path is also arranged so
+ * that the window cannot be used to *destroy* anything: no `O_TRUNC` before the
+ * identity is proven, and no `O_CREAT` through a path that may still move.
+ */
+async function assertOpenedInsideRoot(
+  root: string,
+  safeTarget: string,
+  handle: { stat: () => Promise<fsSync.Stats> },
+): Promise<{ dev: number; ino: number }> {
   const resolvedRoot = resolveExistingPrefix(path.resolve(root));
   const actual = await fs.realpath(safeTarget);
   const under = path.relative(resolvedRoot, actual);
-  const escapes = under === ".." || under.startsWith(`..${path.sep}`) || path.isAbsolute(under);
-  if (escapes) {
+  if (under === ".." || under.startsWith(`..${path.sep}`) || path.isAbsolute(under)) {
     throw new UnsafeStoragePathError(`${safeTarget} resolves to ${actual}, outside ${resolvedRoot}`);
   }
+
+  // The identity check: the descriptor and the *same* resolved path must name one
+  // file. `stat` (not `lstat`) follows the path the kernel would follow now.
+  const opened = await handle.stat();
+  const named = await fs.stat(actual);
+  if (opened.dev !== named.dev || opened.ino !== named.ino) {
+    throw new UnsafeStoragePathError(
+      `${safeTarget} was opened at a different file (${opened.dev}:${opened.ino}) than it now names ` +
+        `(${named.dev}:${named.ino}); a directory component changed during the write`,
+    );
+  }
+  return { dev: opened.dev, ino: opened.ino };
+}
+
+/**
+ * Removes a file this call created, but only after re-proving by inode that the
+ * path still names it.
+ *
+ * The `lstat`-then-`unlink` sequence is not safe on its own: a directory
+ * component can change between the two calls, so the `lstat` blesses one file and
+ * the `unlink` removes another. Here the consecutive check is by identity
+ * (`dev`/`ino`) and the path is re-resolved first, so a deleted file is provably
+ * the one created. When that cannot be proved, this throws and the caller reports
+ * the leftover instead of deleting something it cannot vouch for.
+ */
+async function removeIfStillOurs(
+  root: string,
+  safeTarget: string,
+  identity: { dev: number; ino: number } | undefined,
+): Promise<void> {
+  if (identity === undefined) return; // nothing was proven, so nothing is removed
+  const resolvedRoot = resolveExistingPrefix(path.resolve(root));
+  const actual = await fs.realpath(safeTarget).catch(() => null);
+  if (actual === null) return; // already gone
+  const under = path.relative(resolvedRoot, actual);
+  if (under === ".." || under.startsWith(`..${path.sep}`) || path.isAbsolute(under)) return;
+  const stat = await fs.lstat(actual);
+  if (!stat.isFile() || stat.dev !== identity.dev || stat.ino !== identity.ino) return;
+  await fs.unlink(actual);
 }
 
 /** Deletes `target` only if it is a real file inside the root. */

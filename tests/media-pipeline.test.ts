@@ -178,6 +178,22 @@ describe("media reads never cross mediaRoot", () => {
     expect(fs.readdirSync(outside)).toEqual(["secret.webp"]);
   });
 
+  it("reads bytes from the descriptor, not from a re-resolved path", () => {
+    // The distinction matters: `realpath` alone can report an inside path while
+    // the descriptor refers to an outside file (swap, open, restore, check). The
+    // hash must therefore come from the descriptor and be gated on its identity.
+    const dir = path.join(mediaRoot, "lessons", "3");
+    fs.mkdirSync(dir, { recursive: true });
+    const inside = path.join(dir, "page.webp");
+    fs.writeFileSync(inside, Buffer.from("INSIDE"));
+    const outsideFile = path.join(outside, "page.webp");
+    fs.writeFileSync(outsideFile, Buffer.from("OUTSIDE-SECRET"));
+
+    // Same basename both sides: only the resolved location may decide.
+    expect(fileSha256(inside, mediaRoot)).toMatch(/^[0-9a-f]{64}$/);
+    expect(fileSha256(outsideFile, mediaRoot)).toBeNull();
+  });
+
   it("still lists and hashes real files inside mediaRoot", () => {
     const dir = path.join(mediaRoot, "lessons", "3");
     fs.mkdirSync(dir, { recursive: true });

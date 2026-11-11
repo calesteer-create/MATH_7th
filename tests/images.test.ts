@@ -335,6 +335,138 @@ describe("upload storage with a symlinked ancestor", () => {
  * exists so a *worsening* of the guard fails the suite instead of shipping
  * silently. If it fails, treat it as a genuine escape, not a flake.
  */
+describe("the open cannot damage a file outside the root", () => {
+  let base: string;
+  let uploadRoot: string;
+  let outside: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-trunc-"));
+    uploadRoot = path.join(base, "uploads");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("leaves an existing outside file byte-identical when the target is refused", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const ORIGINAL = "VICTIM-IMPORTANT-DATA".repeat(10);
+    const victim = path.join(outside, "page.webp");
+    fs.writeFileSync(victim, ORIGINAL);
+    // The lesson folder is a link out: the guard refuses before opening.
+    fs.symlinkSync(outside, path.join(uploadRoot, "swapped"));
+
+    await expect(
+      writeInsideUploadRoot(uploadRoot, path.join(uploadRoot, "swapped", "page.webp"), Buffer.from("PAYLOAD")),
+    ).rejects.toMatchObject({ name: "UnsafeStoragePathError" });
+
+    // An `O_TRUNC` open here would have emptied the victim before any check.
+    expect(fs.statSync(victim).size).toBe(ORIGINAL.length);
+    expect(fs.readFileSync(victim, "utf8")).toBe(ORIGINAL);
+  });
+
+  it("does not delete an outside file on the refusal path", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const victim = path.join(outside, "keep.txt");
+    fs.writeFileSync(victim, "EXTERNAL-ORIGINAL");
+    fs.symlinkSync(outside, path.join(uploadRoot, "swapped"));
+
+    await expect(
+      writeInsideUploadRoot(uploadRoot, path.join(uploadRoot, "swapped", "keep.txt"), Buffer.from("PAY")),
+    ).rejects.toThrow();
+
+    // Cleanup must be identity-proved, never a blind unlink of the old path.
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(victim, "utf8")).toBe("EXTERNAL-ORIGINAL");
+  });
+
+  it("still overwrites an existing file inside the root completely", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const target = path.join(uploadRoot, "lesson", "page.webp");
+
+    await writeInsideUploadRoot(uploadRoot, target, Buffer.from("MUCH-LONGER-PAYLOAD"));
+    // A shorter payload must leave no tail: the real storage contract.
+    await writeInsideUploadRoot(uploadRoot, target, Buffer.from("HI"));
+    expect(fs.readFileSync(target, "utf8")).toBe("HI");
+    expect(fs.statSync(target).size).toBe(2);
+
+    await writeInsideUploadRoot(uploadRoot, target, Buffer.from("AGAIN-LONGER"));
+    expect(fs.readFileSync(target, "utf8")).toBe("AGAIN-LONGER");
+  });
+
+  it("writes one payload, not a splice, when the same key is written concurrently", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const target = path.join(uploadRoot, "c", "x.bin");
+    const payloads = ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7"];
+
+    await Promise.all(payloads.map((p) => writeInsideUploadRoot(uploadRoot, target, Buffer.from(p))));
+
+    // Exactly one writer wins; an interleaved multi-step write would concatenate.
+    expect(payloads).toContain(fs.readFileSync(target, "utf8"));
+  });
+});
+
+/**
+ * The damaging case, run against real concurrency.
+ *
+ * Unlike the checks above, this one is a genuine regression test: it fails on
+ * 98c7a1b (`TRUNCATED-TO-ZERO`, 2/2 runs) and passes after the fix, because the
+ * open no longer carries `O_TRUNC` before the destination is proven. It is
+ * deliberately the sharpest assertion available — an outside file must keep its
+ * bytes — rather than "the call throws", which both versions already did.
+ */
+describe("a swapped component cannot truncate an outside file", () => {
+  it("keeps the outside file's bytes under a live swap", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const { spawn } = await import("node:child_process");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-trunc-race-"));
+    const uploadRoot = path.join(base, "uploads");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+
+    const ORIGINAL = "VICTIM-DATA".repeat(30);
+    const victim = path.join(outside, "page.webp");
+    fs.writeFileSync(victim, ORIGINAL);
+
+    const swapper = path.join(base, "swapper.cjs");
+    fs.writeFileSync(
+      swapper,
+      `const fs=require("fs"),path=require("path");
+       const [root,out]=process.argv.slice(2);
+       const target=path.join(root,"swapped");
+       for(let i=0;i<90000;i++){
+         try{fs.rmSync(target,{recursive:true,force:true});}catch{}
+         try{ i%2 ? fs.mkdirSync(target) : fs.symlinkSync(out,target); }catch{}
+       }`,
+    );
+
+    const child = spawn(process.execPath, [swapper, uploadRoot, outside], { stdio: "ignore" });
+    try {
+      for (let attempt = 0; attempt < 600; attempt += 1) {
+        await writeInsideUploadRoot(
+          uploadRoot,
+          path.join(uploadRoot, "swapped", "page.webp"),
+          Buffer.from("PAYLOAD"),
+        ).catch(() => undefined);
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+
+    // Whatever the race did, the outside file is not ours to damage.
+    expect(fs.existsSync(victim)).toBe(true);
+    expect(fs.statSync(victim).size).toBe(ORIGINAL.length);
+    expect(fs.readFileSync(victim, "utf8")).toBe(ORIGINAL);
+
+    fs.rmSync(base, { recursive: true, force: true });
+  }, 60_000);
+});
+
 describe("a directory swapped for a link while writing (best-effort)", () => {
   let base: string;
   let uploadRoot: string;
