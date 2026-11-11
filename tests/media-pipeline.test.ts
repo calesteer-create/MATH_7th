@@ -6,6 +6,7 @@ import sharp from "sharp";
 import { MediaError, inspectWebp, processSourceImage, sha256Hex } from "@/media/process";
 import { checkDeletion, buildReferenceIndex, collectQuizSourceImages, referencedFiles } from "@/media/references";
 import { importImageIntoLesson, listLessonMediaFiles } from "@/media/import";
+import { UnsafePathError, resolveInside, writeFileInside } from "@/media/tree";
 import type { LessonImageContent } from "@/content/model";
 import { validateLesson } from "@/content/validate";
 
@@ -265,6 +266,93 @@ function validateLessonImages(image: LessonImageContent): { issues: Array<{ code
   };
   return validateLesson(lesson, "lessons/1.json");
 }
+
+describe("importImageIntoLesson — refuses symlink escapes", () => {
+  let root: string;
+  let mediaRoot: string;
+  let outside: string;
+
+  /** Every entry in `outside` with its bytes, so "nothing changed" is provable. */
+  function snapshotOutside(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const entry of fs.readdirSync(outside, { withFileTypes: true })) {
+      out[entry.name] = entry.isDirectory()
+        ? "<dir>"
+        : fs.readFileSync(path.join(outside, entry.name)).toString("base64");
+    }
+    return out;
+  }
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "math7-import-symlink-"));
+    mediaRoot = path.join(root, "public", "media");
+    outside = path.join(root, "outside");
+    fs.mkdirSync(mediaRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "secret.txt"), "ORIGINAL-BYTES");
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("refuses when mediaRoot/lessons is a symlink out of the root", async () => {
+    fs.symlinkSync(outside, path.join(mediaRoot, "lessons"));
+    const before = snapshotOutside();
+    const source = await makeJpeg(600, 800);
+
+    await expect(importImageIntoLesson({ mediaRoot, lessonId: 3, source })).rejects.toBeInstanceOf(UnsafePathError);
+
+    // Not one file, and not even a lesson directory, appeared outside.
+    expect(snapshotOutside()).toEqual(before);
+  });
+
+  it("refuses when lessons/<id>/thumbs is a symlink out of the root", async () => {
+    fs.mkdirSync(path.join(mediaRoot, "lessons", "3"), { recursive: true });
+    fs.symlinkSync(outside, path.join(mediaRoot, "lessons", "3", "thumbs"));
+    const before = snapshotOutside();
+    const source = await makeJpeg(600, 800);
+
+    await expect(importImageIntoLesson({ mediaRoot, lessonId: 3, source })).rejects.toBeInstanceOf(UnsafePathError);
+
+    // The thumbnail must not have been published outside; the web copy either,
+    // because the run must stop before writing anything at all.
+    expect(snapshotOutside()).toEqual(before);
+    expect(fs.existsSync(path.join(mediaRoot, "lessons", "3", "page-01.webp"))).toBe(false);
+  });
+
+  it("refuses when the target WebP itself is a symlink to an outside file", async () => {
+    const dir = path.join(mediaRoot, "lessons", "3");
+    fs.mkdirSync(dir, { recursive: true });
+    const victim = path.join(outside, "page-01.webp");
+    fs.writeFileSync(victim, "OUTSIDE-WEBP");
+    fs.symlinkSync(victim, path.join(dir, "page-01.webp"));
+    const before = snapshotOutside();
+    const source = await makeJpeg(600, 800);
+
+    await expect(importImageIntoLesson({ mediaRoot, lessonId: 3, source })).rejects.toBeInstanceOf(UnsafePathError);
+
+    // The file behind the link kept its bytes, and nothing else appeared.
+    expect(snapshotOutside()).toEqual(before);
+  });
+
+  it("still writes normally when the tree is clean", async () => {
+    const source = await makeJpeg(600, 800);
+    const result = await importImageIntoLesson({ mediaRoot, lessonId: 3, source });
+    expect(fs.existsSync(result.webPath)).toBe(true);
+    expect(fs.existsSync(result.thumbPath)).toBe(true);
+    // Nothing leaked into the outside directory.
+    expect(fs.readdirSync(outside)).toEqual(["secret.txt"]);
+  });
+
+  it("protects the shared primitives when called directly", async () => {
+    fs.symlinkSync(outside, path.join(mediaRoot, "lessons"));
+    expect(() => resolveInside(mediaRoot, path.join(mediaRoot, "lessons", "3", "x.webp"))).toThrow(UnsafePathError);
+    expect(() => writeFileInside(mediaRoot, path.join(mediaRoot, "lessons", "3", "x.webp"), Buffer.from("x"))).toThrow(
+      UnsafePathError,
+    );
+    expect(fs.readdirSync(outside)).toEqual(["secret.txt"]);
+  });
+});
 
 describe("reference tracking — never delete a used image", () => {
   const lessons = [

@@ -83,3 +83,99 @@ describe("lesson image storage", () => {
     expect(meta.exif).toBeUndefined();
   });
 });
+
+/**
+ * The upload directory is written by the admin server, not only by the media
+ * CLI, so it needs the same rule: a symlink planted inside it must not redirect
+ * a write or a delete outside the root.
+ */
+describe("upload storage refuses symlink escapes", () => {
+  let base: string;
+  let uploadRoot: string;
+  let outside: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-store-symlink-"));
+    uploadRoot = path.join(base, "uploads");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "keep.txt"), "ORIGINAL-BYTES");
+    fs.symlinkSync(outside, path.join(uploadRoot, "images"));
+    process.env.UPLOAD_DIR = uploadRoot;
+  });
+
+  afterAll(() => {
+    process.env.UPLOAD_DIR = tmp;
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("refuses to write through a symlinked directory", async () => {
+    const { writeKey } = await import("@/lib/storage");
+    await expect(writeKey("images/evil.bin", Buffer.from("PAYLOAD"))).rejects.toThrow(/symbolic link/);
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("refuses to delete through a symlinked directory", async () => {
+    const { resolveKey } = await import("@/lib/storage");
+    expect(() => resolveKey("images/keep.txt")).toThrow(/symbolic link/);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("still stores and reads a legitimate key", async () => {
+    const { writeKey, readKey } = await import("@/lib/storage");
+    await writeKey("real/ok.bin", Buffer.from("OK"));
+    expect((await readKey("real/ok.bin"))?.toString("utf8")).toBe("OK");
+  });
+});
+
+/**
+ * Point 5 of the review: the root policy used to be documented one way and
+ * implemented the other. The root is chosen by the operator, so it may itself
+ * be a symlink (macOS `/tmp` is); everything below it may not.
+ */
+describe("root symlink policy", () => {
+  let base: string;
+  let real: string;
+  let link: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-rootpolicy-"));
+    real = path.join(base, "real");
+    link = path.join(base, "link");
+    fs.mkdirSync(real, { recursive: true });
+    fs.symlinkSync(real, link);
+  });
+
+  afterAll(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("accepts a root that is itself a symlink", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    // Targets are expressed in the root's own namespace, which is what every
+    // caller does (`path.join(root, …)`).
+    expect(() => resolveInside(link, path.join(link, "lessons", "1.json"))).not.toThrow();
+  });
+
+  it("refuses a target expressed through the real path of a symlinked root", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    // Two names for the same directory: accepting a mix would mean the caller
+    // and the guard disagree about which string is the boundary.
+    expect(() => resolveInside(link, path.join(real, "lessons", "1.json"))).toThrow(/outside/);
+  });
+
+  it("still refuses a symlink below the root", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    const escape = path.join(base, "escape");
+    fs.mkdirSync(escape, { recursive: true });
+    fs.symlinkSync(escape, path.join(real, "linked"));
+    expect(() => resolveInside(link, path.join(link, "linked", "x.json"))).toThrow(/symbolic link/);
+  });
+
+  it("refuses a target outside the root even when the root is a symlink", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    expect(() => resolveInside(link, path.join(base, "elsewhere.json"))).toThrow(/outside/);
+  });
+});

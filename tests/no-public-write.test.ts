@@ -207,14 +207,42 @@ describe("media tooling only writes inside the repository's own tree", () => {
     }
   });
 
-  it("refuses writes outside the media root", () => {
+  it("refuses writes outside the media root", async () => {
     const text = fs.readFileSync(path.join(ROOT, "src/media/import.ts"), "utf8");
-    expect(text).toContain("refusing to write outside the media root");
-    // Every file write uses the exclusive "wx" flag, so an existing page is
-    // never overwritten by a name collision.
-    const writes = text.match(/writeFileSync\([^;]+/g) ?? [];
-    expect(writes.length).toBeGreaterThanOrEqual(2);
-    for (const call of writes) expect(call).toContain('flag: "wx"');
+    // The containment rule now lives in one place, so `import.ts` must route
+    // every write through it rather than carrying its own lexical check.
+    expect(text).not.toMatch(/function assertInside/);
+    expect(text).toContain("resolveInside(mediaRoot, webPath)");
+    expect(text).toContain("resolveInside(mediaRoot, thumbPath)");
+
+    // Behaviour, not source text: a symlinked directory inside the media root
+    // must not receive a file, and the outside victim must keep its bytes.
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "no-public-write-import-"));
+    try {
+      const { importImageIntoLesson } = await import("@/media/import");
+      const { UnsafePathError } = await import("@/media/tree");
+      const mediaRoot = path.join(sandbox, "public", "media");
+      const outside = path.join(sandbox, "outside");
+      fs.mkdirSync(mediaRoot, { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      fs.writeFileSync(path.join(outside, "keep.txt"), "ORIGINAL");
+      fs.symlinkSync(outside, path.join(mediaRoot, "lessons"));
+
+      const sharpModule = (await import("sharp")).default;
+      const source = await sharpModule({
+        create: { width: 64, height: 64, channels: 3, background: "#fff" },
+      })
+        .jpeg()
+        .toBuffer();
+
+      await expect(importImageIntoLesson({ mediaRoot, lessonId: 1, source })).rejects.toBeInstanceOf(
+        UnsafePathError,
+      );
+      expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+      expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL");
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 });
 

@@ -92,6 +92,48 @@ export function writeJson(root: string, target: string, value: unknown): void {
 }
 
 /**
+ * Writes a new file inside `root` and refuses to traverse a symlink.
+ *
+ * The single write primitive shared by every producer (`media:import`,
+ * `media:sync`): `O_CREAT|O_EXCL|O_NOFOLLOW` so a link at the target can never
+ * be followed, an exclusive create so an existing page is never clobbered, and
+ * a re-check of every directory component immediately before the open.
+ * `exclusive: false` truncates an existing real file instead (used for derived
+ * thumbnails, which are regenerated).
+ */
+export function writeFileInside(
+  root: string,
+  target: string,
+  data: Buffer,
+  options: { exclusive?: boolean; mode?: number } = {},
+): SafePath {
+  const safeTarget = resolveInside(root, target);
+  const directory = path.dirname(safeTarget);
+  fs.mkdirSync(directory, { recursive: true });
+  // `recursive: true` creates through a symlink if one appeared, so the whole
+  // chain is verified after creation as well as before.
+  resolveInside(root, directory);
+
+  const exclusive = options.exclusive ?? true;
+  const flags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_NOFOLLOW |
+    (exclusive ? fs.constants.O_EXCL : fs.constants.O_TRUNC);
+
+  // Verified again right before the open, which is as close to the syscall as
+  // this API allows.
+  resolveInside(root, directory);
+  const fd = fs.openSync(safeTarget, flags, options.mode ?? 0o644);
+  try {
+    fs.writeFileSync(fd, data);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return safeTarget;
+}
+
+/**
  * A path that is proven to stay inside a permitted root and to contain no
  * symbolic link anywhere below it.
  *
@@ -131,33 +173,56 @@ function lstatOrNull(target: string): fs.Stats | null {
  * symbolic link. Returns the real path string (absolute, `..` free) or throws
  * `UnsafePathError`.
  *
- * `root` itself is normalised and is allowed to exist; it is not required to be
- * a symlink-free name, because the operator chooses it (e.g. macOS `/tmp`).
- * Everything *below* it must be real.
+ * **The root is the trust boundary, and it is chosen by the operator.** If the
+ * root path itself (or one of its ancestors) is a symlink it is resolved with
+ * `realpath` and the walk continues from there: refusing would break legitimate
+ * layouts, notably macOS where `/tmp` is a symlink to `/private/tmp`, and the
+ * operator asked for that directory explicitly. Everything *below* the resolved
+ * root must be a real directory — that is the part an attacker who can plant
+ * links inside the tree controls.
+ *
+ * Threat model: this stops **pre-existing** symlinks (a checked-in link, one
+ * created by an earlier run, or one placed by someone who can write into the
+ * media tree). It does not, and cannot with this API, make a *concurrent*
+ * swap of a directory component atomic — Node exposes no dirfd-relative
+ * openat, so `lstat` + re-check narrows that window instead of closing it. The
+ * final component is protected by the kernel (`O_NOFOLLOW`), and every
+ * directory component is re-verified immediately before the write.
  */
 export function resolveInside(root: string, target: string): SafePath {
-  const absoluteRoot = path.resolve(root);
-  const absoluteTarget = path.resolve(target);
+  const declaredRoot = path.resolve(root);
+  let absoluteTarget = path.resolve(target);
 
-  // 1. Lexical containment: cheap, and it makes the component walk finite.
-  const relative = path.relative(absoluteRoot, absoluteTarget);
-  if (relative !== "" && (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) {
-    throw new UnsafePathError(`${absoluteTarget} is outside ${absoluteRoot}`);
+  // 1. Lexical containment against the declared root: cheap, and it keeps the
+  //    component walk finite.
+  const declaredRelative = path.relative(declaredRoot, absoluteTarget);
+  if (
+    declaredRelative !== "" &&
+    (declaredRelative === ".." ||
+      declaredRelative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(declaredRelative))
+  ) {
+    throw new UnsafePathError(`${absoluteTarget} is outside ${declaredRoot}`);
   }
 
-  // 2. The root must be a real directory (or absent, in which case there is
-  //    nothing to write into yet).
-  const rootStat = lstatOrNull(absoluteRoot);
-  if (rootStat !== null && rootStat.isSymbolicLink()) {
-    throw new UnsafePathError(`root ${absoluteRoot} is a symbolic link`);
-  }
-  if (rootStat !== null && !rootStat.isDirectory()) {
-    throw new UnsafePathError(`root ${absoluteRoot} is not a directory`);
+  // 2. The root may exist as a symlink (see above). Resolve it so the walk below
+  //    starts at the real directory, and remap the target onto the same base.
+  let absoluteRoot = declaredRoot;
+  const rootStat = lstatOrNull(declaredRoot);
+  if (rootStat !== null) {
+    if (!rootStat.isDirectory() && !rootStat.isSymbolicLink()) {
+      throw new UnsafePathError(`root ${declaredRoot} is not a directory`);
+    }
+    if (rootStat.isSymbolicLink()) {
+      absoluteRoot = fs.realpathSync(declaredRoot);
+      absoluteTarget = path.join(absoluteRoot, declaredRelative);
+    }
   }
 
   // 3. Walk every component below the root. A symlink anywhere is refused, and
   //    the first non-existent component ends the walk: nothing below it exists,
   //    so nothing below it can be a symlink.
+  const relative = path.relative(absoluteRoot, absoluteTarget);
   const parts = relative === "" ? [] : relative.split(path.sep);
   let current = absoluteRoot;
   for (const [index, part] of parts.entries()) {

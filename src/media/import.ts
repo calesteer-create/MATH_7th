@@ -23,6 +23,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { isLegalMediaName, nextFreeName, positionalStem, sanitizeBase } from "./naming";
 import { MediaError, processSourceImage, sha256Hex, type ProcessedImage } from "./process";
+import { UnsafePathError, resolveInside, writeFileInside } from "./tree";
 import type { LessonImageContent } from "../content/model";
 
 export const MAX_IMAGES_PER_LESSON = 300;
@@ -119,15 +120,17 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
 
   const webPath = path.join(dir, fileName);
   const thumbPath = path.join(dir, "thumbs", fileName);
-  assertInside(mediaRoot, webPath);
-  assertInside(mediaRoot, thumbPath);
+  // Same containment rule as media:sync, applied inside the library function so
+  // a direct caller is protected too — not only the CLI. A pre-existing symlink
+  // anywhere below mediaRoot is refused before anything is created.
+  resolveInside(mediaRoot, webPath);
+  resolveInside(mediaRoot, thumbPath);
 
   if (!options.dryRun && !reused) {
-    fs.mkdirSync(path.join(dir, "thumbs"), { recursive: true });
-    // "wx" fails instead of overwriting: a name that slipped past the collision
-    // check can never clobber an existing page.
-    fs.writeFileSync(webPath, processed.web, { flag: "wx" });
-    fs.writeFileSync(thumbPath, processed.thumb, { flag: "wx" });
+    // Exclusive create: a name that slipped past the collision check can never
+    // clobber an existing page, and a symlink at either target is not followed.
+    writeFileInside(mediaRoot, webPath, processed.web, { exclusive: true });
+    writeFileInside(mediaRoot, thumbPath, processed.thumb, { exclusive: true });
   }
 
   const position =
@@ -154,13 +157,4 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
 function processedStem(label: string | undefined, existing: readonly LessonImageContent[], next: number): string {
   if (!label) return positionalStem(next);
   return label;
-}
-
-/** Defence in depth: every write path must stay under the media root. */
-function assertInside(mediaRoot: string, target: string): void {
-  const root = path.resolve(mediaRoot);
-  const resolved = path.resolve(target);
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-    throw new Error(`refusing to write outside the media root: ${resolved}`);
-  }
 }

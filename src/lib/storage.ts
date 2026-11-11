@@ -2,6 +2,11 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import {
+  deleteInsideUploadRoot,
+  resolveInsideUploadRoot,
+  writeInsideUploadRoot,
+} from "./storage-safe";
 
 /**
  * Local-disk media store.
@@ -21,16 +26,17 @@ export function resolveKey(key: string): string {
   // turbopackIgnore keeps the bundler from tracing the whole project for this
   // dynamic root; the media directory lives outside the server output.
   const target = path.resolve(/* turbopackIgnore: true */ base, key);
+  // Lexical containment first (cheap, and it rejects hostile keys outright),
+  // then the symlink walk: a link inside the upload root must not redirect a
+  // write or a delete outside it.
   if (target !== base && !target.startsWith(base + path.sep)) {
     throw new Error("invalid storage key");
   }
-  return target;
+  return resolveInsideUploadRoot(base, target);
 }
 
 export async function writeKey(key: string, data: Buffer): Promise<void> {
-  const target = resolveKey(key);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, data);
+  await writeInsideUploadRoot(root(), resolveKey(key), data);
 }
 
 export async function readKey(key: string): Promise<Buffer | null> {
@@ -44,7 +50,7 @@ export async function readKey(key: string): Promise<Buffer | null> {
 export async function deleteKey(key: string | null | undefined): Promise<void> {
   if (!key) return;
   try {
-    await fs.unlink(resolveKey(key));
+    await deleteInsideUploadRoot(root(), resolveKey(key));
   } catch {
     /* already gone — deleting twice must not fail a request */
   }
