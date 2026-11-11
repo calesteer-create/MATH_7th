@@ -487,3 +487,40 @@ describe("media containment guard", () => {
     expect(result.errors).toEqual([]);
   });
 });
+
+/**
+ * Orphan scan must not enter a folder through a link.
+ *
+ * The scan used to `readdirSync(path)` each lesson folder. A lesson name that is a
+ * symlink to a directory outside the repository made the validator list that
+ * directory, so files that are not part of the tree produced `IMAGE_ORPHAN`
+ * warnings — and real orphans inside the tree could be masked.
+ */
+describe("orphan scan stays inside the media root", () => {
+  it("does not descend into a symlinked lesson folder", () => {
+    const outside = path.join(tmp, "outside-lessons");
+    fs.mkdirSync(outside, { recursive: true });
+    // A WebP outside the repository that no lesson references.
+    fs.writeFileSync(path.join(outside, "stray.webp"), fs.readFileSync(path.join(tmp, "media", "lessons", "1", "page-01.webp")));
+    // Lesson folder "2" is a link to that outside directory.
+    const linked = path.join(tmp, "media", "lessons", "2");
+    fs.rmSync(linked, { recursive: true, force: true });
+    fs.symlinkSync(outside, linked);
+
+    const result = tree();
+    const orphans = result.warnings.filter((w) => w.code === "IMAGE_ORPHAN");
+
+    // No warning was manufactured from the outside file.
+    expect(orphans.map((w) => w.path)).not.toContain("lessons/2/stray.webp");
+    expect(orphans.some((w) => String(w.path).includes("stray.webp"))).toBe(false);
+    // The outside directory was not modified.
+    expect(fs.readdirSync(outside)).toEqual(["stray.webp"]);
+  });
+
+  it("still reports a real orphan inside the tree", () => {
+    const inside = path.join(tmp, "media", "lessons", "1", "unreferenced.webp");
+    fs.writeFileSync(inside, fs.readFileSync(path.join(tmp, "media", "lessons", "1", "page-01.webp")));
+    const result = tree();
+    expect(result.warnings.map((w) => w.path)).toContain("lessons/1/unreferenced.webp");
+  });
+});

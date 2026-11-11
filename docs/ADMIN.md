@@ -385,6 +385,21 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
 | تعدد العمليات (`serialize()` داخل العملية الواحدة) | التزامن بين عمليات مختلفة ليس مُسلسَلًا |
 | macOS/BSD | لديها `/dev/fd` لكن **غير مختبرة**؛ الضمان المُثبت هو Linux فقط |
 
+ما أُغلق في هذه الجولة، بعد أن كان مفتوحًا:
+
+| كان | صار |
+|---|---|
+| `fileExistsAt` تُعيد `false` لأي مدخل ليس ملفًا عاديًا (رابط، FIFO، مجلد) | تُعيد `false` للغياب (`ENOENT`) وحده؛ غير ذلك **رفض صريح** |
+| `remember()` يسجّل المسار في `createdFiles` عند `false`، فيحذفه rollback لاحق | التسجيل يقع **فقط** بعد أن يُبلّغ `writeFileAt` أنه أنشأ الملف |
+| `rollbackWrites` يرفض المجلدات فقط ويحذف ما عداها (ومنها الروابط) | يحذف **ملفًا عاديًا** فقط؛ الرابط وFIFO والجهاز رفض |
+| `thumbExists` تبتلع كل خطأ وتُعيد "لا مصغرة" | يمرّر الرفض؛ `ENOENT` وحده يعني الغياب |
+| جرد الـorphans في `content:validate` بـ`readdirSync(path)` يدخل مجلد درس عبر رابط | جرد عبر `OpenDir.list()` و`openDirUnder()`؛ الرابط يُتخطّى ولا يُتبع |
+| فتح FIFO يعلّق العملية قبل `fstat` | `O_NONBLOCK` على كل فتح (`readFileAt`, `writeFileAt`, `readKey`, rollback, `import.ts`, `storage-safe`) |
+
+اختبارات هذه الجولة: `tests/media-pipeline.test.ts` (ملكية المدخلات ونوعها)،
+`tests/content-model.test.ts` (جرد الـorphans عبر رابط)، `tests/images.test.ts`
+(FIFO بلا تعليق)، `tests/media-sync.test.ts` (رابط في مكان المصغرة).
+
 اختبارات هذا الضمان في `tests/media-sync.test.ts` (سباق `media:sync` نفسه مع
 شاهد `atime`)، `tests/images.test.ts` (عدّ الواصفات في `/proc/self/fd`)،
 و`tests/media-pipeline.test.ts` (ملكية الملف المؤقت، والاستعادة، وفحص مساحة

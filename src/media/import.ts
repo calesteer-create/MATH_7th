@@ -159,7 +159,12 @@ export function fileSha256(file: string, root?: string): string | null {
       return null;
     }
     try {
-      fd = parent.open(leaf, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      // `O_NONBLOCK` keeps the open from blocking on a FIFO planted at the name;
+      // the `fstat` below then refuses anything that is not a regular file.
+      fd = parent.open(
+        leaf,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+      );
       // `fstat` on the descriptor itself: not a re-stat of a name.
       if (!fs.fstatSync(fd).isFile()) return null;
       return sha256Hex(fs.readFileSync(fd));

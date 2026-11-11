@@ -96,7 +96,13 @@ export async function readKey(key: string): Promise<Buffer | null> {
 
     rootHandle = openDir(resolvedBase);
     parent = openDirUnder(rootHandle, parts);
-    fd = parent.open(leaf, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+    // `O_NONBLOCK` keeps the *open* from blocking when the entry is a FIFO: opening
+    // one for reading waits for a writer, which would hang the request before the
+    // type could be checked. The flag does not change how a regular file is read.
+    fd = parent.open(
+      leaf,
+      fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK,
+    );
     // `fstat` on the descriptor: a symlinked leaf is refused by O_NOFOLLOW
     // already, and anything that is not a regular file is not served.
     if (!fsSync.fstatSync(fd).isFile()) return null;

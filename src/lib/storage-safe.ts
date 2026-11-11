@@ -268,7 +268,7 @@ async function writeSerializedInner(root: string, dirParts: string[], leaf: stri
       // `O_EXCL` refuses an existing entry instead of truncating it.
       handle = await fs.open(
         at(pinned.fd, leaf),
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NONBLOCK,
         0o644,
       );
       created = true;
@@ -276,7 +276,11 @@ async function writeSerializedInner(root: string, dirParts: string[], leaf: stri
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       // It exists: open for writing without truncating, then prove — on the
       // descriptor — that it is a regular file inside this directory.
-      handle = await fs.open(at(pinned.fd, leaf), constants.O_WRONLY | constants.O_NOFOLLOW, 0o644);
+      handle = await fs.open(
+        at(pinned.fd, leaf),
+        constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        0o644,
+      );
     }
 
     const stat = await handle.stat();

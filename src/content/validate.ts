@@ -826,6 +826,89 @@ function readMediaInside(resolvedMediaRoot: string, relative: string): Buffer | 
   }
 }
 
+/**
+ * Walks `mediaRoot/lessons` and reports unreferenced `.webp` files.
+ *
+ * Every step is relative to an open directory descriptor, and a level that is a
+ * symbolic link is skipped: its target is not part of this repository, so neither
+ * its files nor its absence may influence the result. Descriptors are closed in
+ * `finally` at each level.
+ */
+function scanOrphansByDescriptor(
+  resolvedMediaRoot: string,
+  referencedMedia: Set<string>,
+  warn: (code: string, file: string, message: string) => void,
+): void {
+  if (!fs.existsSync(resolvedMediaRoot)) return;
+  let rootHandle: ReturnType<typeof openDir> | null = null;
+  let lessonsHandle: ReturnType<typeof openDirUnder> | null = null;
+  try {
+    rootHandle = openDir(resolvedMediaRoot);
+    try {
+      lessonsHandle = openDirUnder(rootHandle, ["lessons"]);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // no media yet
+      throw error;
+    }
+    if (lessonsHandle === null) return;
+
+    for (const entry of lessonsHandle.list()) {
+      const lessonDirName = entry.name;
+      if (!/^\d+$/.test(lessonDirName)) continue;
+      // A lesson "folder" that is a link is not walked: its contents are outside.
+      // `lstat` on the entry: a link is skipped, never traversed.
+      if (entry.isSymbolicLink()) continue;
+      if (!entry.isDirectory()) continue;
+
+      let lessonHandle: ReturnType<typeof openDirUnder> | null = null;
+      try {
+        lessonHandle = openDirUnder(lessonsHandle, [lessonDirName]);
+        walkOrphanDir(lessonHandle, `lessons/${lessonDirName}`, "", referencedMedia, warn);
+      } catch {
+        // A folder that cannot be opened is not evidence of anything; skip it.
+        continue;
+      } finally {
+        lessonHandle?.close();
+      }
+    }
+  } finally {
+    lessonsHandle?.close();
+    rootHandle?.close();
+  }
+}
+
+/** Recursive half of `scanOrphansByDescriptor`, one descriptor per level. */
+function walkOrphanDir(
+  dir: ReturnType<typeof openDirUnder>,
+  sitePrefix: string,
+  prefix: string,
+  referencedMedia: Set<string>,
+  warn: (code: string, file: string, message: string) => void,
+): void {
+  for (const entry of dir.list()) {
+    const name = entry.name;
+    const rel = prefix === "" ? name : `${prefix}/${name}`;
+    if (entry.isSymbolicLink()) continue; // never followed
+    if (entry.isDirectory()) {
+      let child: ReturnType<typeof openDirUnder> | null = null;
+      try {
+        child = openDirUnder(dir, [name]);
+        walkOrphanDir(child, sitePrefix, rel, referencedMedia, warn);
+      } catch {
+        continue;
+      } finally {
+        child?.close();
+      }
+      continue;
+    }
+    if (!entry.isFile()) continue; // FIFO, socket, device: not a media file
+    const siteRel = `${sitePrefix}/${rel}`;
+    if (name.toLowerCase().endsWith(".webp") && !referencedMedia.has(siteRel)) {
+      warn("IMAGE_ORPHAN", siteRel, "file on disk is not referenced by any lesson");
+    }
+  }
+}
+
 export function validateContentTree(
   contentRoot: string,
   mediaRoot?: string,
@@ -1059,27 +1142,12 @@ export function validateContentTree(
       }
     }
     /* Orphan detection: files on disk not referenced by any lesson. */
-    const lessonsMedia = path.join(resolvedMediaRoot, "lessons");
-    if (fs.existsSync(lessonsMedia)) {
-      for (const lessonDirName of fs.readdirSync(lessonsMedia)) {
-        if (!/^\d+$/.test(lessonDirName)) continue;
-        const walk = (dir: string, prefix: string): void => {
-          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-            const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-            const full = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-              walk(full, rel);
-              continue;
-            }
-            const siteRel = `lessons/${lessonDirName}/${rel}`;
-            if (entry.name.toLowerCase().endsWith(".webp") && !referencedMedia.has(siteRel)) {
-              warn("IMAGE_ORPHAN", siteRel, "file on disk is not referenced by any lesson");
-            }
-          }
-        };
-        walk(path.join(lessonsMedia, lessonDirName), "");
-      }
-    }
+    // Walked by descriptor, not by path. `readdirSync(dir)` on `public/media` would
+    // enter whatever a symlinked lesson folder points at, so a directory outside
+    // the repository could both hide real orphans and manufacture warnings from
+    // files that are not part of the tree. `lstat` decides the type, so a link is
+    // skipped rather than followed.
+    scanOrphansByDescriptor(resolvedMediaRoot, referencedMedia, warn);
   }
 
   /* Cross-checks between quizzes and assessments. */

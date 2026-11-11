@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -900,4 +901,51 @@ describe("descriptor bookkeeping", () => {
       fs.rmSync(base, { recursive: true, force: true });
     }
   }, 60_000);
+});
+
+/**
+ * A FIFO where a media file is expected must not hang the process.
+ *
+ * Opening a FIFO blocks until the other end appears. `O_NONBLOCK` makes the open
+ * return immediately so `fstat` can refuse the entry, instead of the request
+ * hanging forever on an attacker-planted entry.
+ */
+describe("special files are refused, not waited on", () => {
+  const canMkfifo = spawnSync("mkfifo", ["--version"], { encoding: "utf8" }).status === 0;
+
+  it.skipIf(!canMkfifo)("refuses a FIFO at a media name without blocking", async () => {
+    const storage = await import("@/lib/storage");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fifo-"));
+    const uploads = path.join(base, "uploads");
+    fs.mkdirSync(path.join(uploads, "lesson"), { recursive: true });
+    const fifo = path.join(uploads, "lesson", "page.webp");
+    expect(spawnSync("mkfifo", [fifo], { encoding: "utf8" }).status).toBe(0);
+
+    const previous = process.env.UPLOAD_DIR;
+    process.env.UPLOAD_DIR = uploads;
+    try {
+      // The assertion is that this resolves at all: without O_NONBLOCK the open
+      // would block forever and the test would time out instead of failing cleanly.
+      const result = await storage.readKey("lesson/page.webp");
+      expect(result).toBeNull(); // a FIFO is not served
+    } finally {
+      if (previous === undefined) delete process.env.UPLOAD_DIR;
+      else process.env.UPLOAD_DIR = previous;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.skipIf(!canMkfifo)("refuses a FIFO in readFileAt", async () => {
+    const { openDir, readFileAt } = await import("@/lib/dirfd");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fifo2-"));
+    expect(spawnSync("mkfifo", [path.join(dir, "page.webp")], { encoding: "utf8" }).status).toBe(0);
+    const handle = openDir(dir);
+    try {
+      // Returns or throws promptly; the `it` timeout is the real assertion.
+      expect(() => readFileAt(handle, "page.webp")).toThrow(/FIFO/i);
+    } finally {
+      handle.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });

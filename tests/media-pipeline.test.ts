@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -957,5 +958,110 @@ describe("the descriptor namespace is proved, not assumed", () => {
       fs.renameSync(moved, dir);
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * Ownership: "absent" and "present but not a regular file" are different answers.
+ *
+ * `fileExistsAt` used to collapse both into `false`. `remember()` in `media:sync`
+ * read that `false` as "nothing there, I am creating this", pushed the path into
+ * `createdFiles`, and a later failure let the rollback delete an entry this run
+ * never created — a symlink that was already at the thumbnail name.
+ */
+describe("an entry this run did not create is never adopted as its own", () => {
+  let base: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-own-"));
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("reports absence only for a genuinely missing name", async () => {
+    const { openDir, fileExistsAt } = await import("@/lib/dirfd");
+    const dir = path.join(base, "d");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "real.webp"), "REAL");
+    const handle = openDir(dir);
+    try {
+      expect(fileExistsAt(handle, "real.webp")).toBe(true);
+      // Absence — and only absence — is false.
+      expect(fileExistsAt(handle, "missing.webp")).toBe(false);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it("refuses a symlink instead of reporting it absent", async () => {
+    const { openDir, fileExistsAt } = await import("@/lib/dirfd");
+    const dir = path.join(base, "d2");
+    fs.mkdirSync(dir);
+    const victim = path.join(base, "victim.webp");
+    fs.writeFileSync(victim, "VICTIM");
+    fs.symlinkSync(victim, path.join(dir, "thumb.webp"));
+
+    const handle = openDir(dir);
+    try {
+      // The old behaviour — `false` — is what made the rollback delete this link.
+      expect(() => fileExistsAt(handle, "thumb.webp")).toThrow(/symbolic link/i);
+    } finally {
+      handle.close();
+    }
+    expect(fs.lstatSync(path.join(dir, "thumb.webp")).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(victim, "utf8")).toBe("VICTIM");
+  });
+
+  it("refuses a directory at a file name", async () => {
+    const { openDir, fileExistsAt } = await import("@/lib/dirfd");
+    const dir = path.join(base, "d3");
+    fs.mkdirSync(path.join(dir, "thumb.webp"), { recursive: true });
+    const handle = openDir(dir);
+    try {
+      expect(() => fileExistsAt(handle, "thumb.webp")).toThrow(/directory/i);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it("refuses a FIFO at a file name without blocking", async () => {
+    // Creating a FIFO needs `mkfifo`; skip explicitly where it is unavailable.
+    const probe = spawnSync("mkfifo", ["--version"], { encoding: "utf8" });
+    if (probe.error || probe.status !== 0) {
+      console.warn("skipping: mkfifo is unavailable on this platform");
+      return;
+    }
+    const { openDir, fileExistsAt } = await import("@/lib/dirfd");
+    const dir = path.join(base, "d4");
+    fs.mkdirSync(dir);
+    const made = spawnSync("mkfifo", [path.join(dir, "thumb.webp")], { encoding: "utf8" });
+    expect(made.status).toBe(0);
+
+    const handle = openDir(dir);
+    try {
+      expect(() => fileExistsAt(handle, "thumb.webp")).toThrow(/FIFO/i);
+    } finally {
+      handle.close();
+    }
+  });
+
+  it("does not delete a symlink listed for removal, even if a path was recorded", async () => {
+    const { rollbackWrites } = await import("@/media/tree");
+    const root = path.join(base, "media");
+    fs.mkdirSync(path.join(root, "lessons", "1", "thumbs"), { recursive: true });
+    const victim = path.join(base, "outside.webp");
+    fs.writeFileSync(victim, "OUTSIDE");
+    const link = path.join(root, "lessons", "1", "thumbs", "page-01.webp");
+    fs.symlinkSync(victim, link);
+
+    // A path wrongly recorded as "created by this run" must still not be deleted
+    // when what sits there is not a regular file.
+    const result = rollbackWrites([link], [], [], [root]);
+
+    expect(result.created).toBe(0);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(victim, "utf8")).toBe("OUTSIDE");
+    expect(result.failures.join("\n")).toMatch(/symbolic link/i);
   });
 });

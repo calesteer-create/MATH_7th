@@ -237,9 +237,20 @@ async function main(): Promise<void> {
         let thumbs: ReturnType<typeof openDir> | null = null;
         try {
           thumbs = openDirUnder(lessonDir, ["thumbs"]);
-          return fileExistsAt(thumbs, file);
-        } catch {
-          return false;
+          // A missing `thumbs` folder is genuine absence; anything else — a link at
+          // the name, a FIFO — must propagate. Swallowing it here would turn a
+          // refusal into "no thumbnail yet" and the run would then try to create
+          // one over an entry it does not own.
+          try {
+            return fileExistsAt(thumbs, file);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
+          }
+        } catch (error) {
+          // `openDirUnder` on an absent `thumbs` also reports ENOENT.
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
         } finally {
           thumbs?.close();
         }
@@ -423,19 +434,35 @@ async function main(): Promise<void> {
    * would then come from outside the tree. Here the parent is pinned and the read
    * goes through it, and the same handle is reused for the write below.
    */
+  /**
+   * Records that this run created `absolute`, so a rollback may remove it.
+   * Called only after the write reported a successful creation.
+   */
+  const recordCreated = (absolute: string): void => {
+    createdFiles.push(absolute);
+  };
+
   const remember = (
     parent: ReturnType<typeof openDir>,
     name: string,
     absolute: string,
   ): void => {
+    // `fileExistsAt` answers "false" only for genuine absence. A link, FIFO or
+    // directory at this name throws, and the throw is the correct outcome: this
+    // run did not create that entry, so it must neither adopt it as a file it may
+    // delete nor write through it. Without this a symlink left at the thumbnail
+    // name was recorded in `createdFiles` and the rollback removed it.
     const existing = fileExistsAt(parent, name);
     if (!existing) {
-      createdFiles.push(absolute);
+      // Absence is not ownership. The path is recorded only after `writeFileAt`
+      // has actually created it (see the `exclusive` result below), so a write
+      // that fails before creating anything never appears in `createdFiles`.
       return;
     }
     const previous = readFileAt(parent, name);
     if (previous === null) {
-      createdFiles.push(absolute);
+      // The entry vanished between the two descriptor calls: treat it as absent
+      // for ownership, and let the write create it as a new file.
       return;
     }
     overwrittenFiles.push({ path: absolute, previous });
@@ -454,10 +481,13 @@ async function main(): Promise<void> {
           const { dir, created } = ensureDirPath(mediaHandle, parts);
           try {
             for (const name of created) createdDirectories.push(path.join(mediaRootForWrites, name));
-            remember(dir, leaf, path.join(mediaRootForWrites, ...parts, leaf));
+            const absolute = path.join(mediaRootForWrites, ...parts, leaf);
+            remember(dir, leaf, absolute);
             // `writeFileAt` creates with O_EXCL, or truncates only after the
             // descriptor is proven to be a regular file. No O_TRUNC on a path.
-            writeFileAt(dir, leaf, thumb.buffer, { exclusive: false });
+            // Its return value is the ownership proof: the path is recorded for
+            // rollback only when this call actually created the file.
+            if (writeFileAt(dir, leaf, thumb.buffer, { exclusive: false })) recordCreated(absolute);
           } finally {
             dir.close();
           }

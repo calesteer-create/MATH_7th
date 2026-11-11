@@ -718,9 +718,14 @@ describe("media:sync is atomic when the writes themselves fail", () => {
     }
 
     expect(result.status).toBe(1);
-    // The write is refused for the real reason...
-    expect(result.stderr).toContain("writing failed");
-    expect(result.stderr).toContain("symbolic link");
+    // The run refuses for the real reason. It now refuses *earlier* than the write:
+    // `thumbExists` no longer swallows the refusal and reports "no thumbnail yet",
+    // so the symlinked `thumbs` is rejected while the plan is built, before any
+    // write and therefore before any rollback. Both messages are the real cause;
+    // the important assertion is that the cause names the link and nothing outside
+    // was touched.
+    expect(`${result.stdout}${result.stderr}`).toMatch(/writing failed|symbolic link/i);
+    expect(`${result.stdout}${result.stderr}`).toContain("symbolic link");
     // ...and nothing was published outside the root, not even an empty dir.
     expect(fs.readdirSync(outsideDir)).toEqual([]);
 
@@ -1065,5 +1070,75 @@ describe("media:sync never reads or writes outside the media root", () => {
     // No image was written outside, and nothing was left behind — the thumbnail
     // must not have been published through the link.
     expect(fs.readdirSync(outside)).toEqual([]);
+  }, 180_000);
+});
+
+/**
+ * A symlink already sitting at the thumbnail name.
+ *
+ * `fileExistsAt` used to answer "not a regular file" as `false`, which `remember()`
+ * read as "nothing is there, I am creating it" — so the path entered
+ * `createdFiles`, and a later failure made the rollback unlink the link. The link
+ * was never this run's to delete, and the file it pointed at was outside the tree.
+ *
+ * This drives the real CLI, so it fails on the behaviour, not on a helper's shape.
+ */
+describe("media:sync never adopts or deletes an entry it did not create", () => {
+  let base = "";
+  let contentRoot = "";
+  let mediaRoot = "";
+
+  beforeEach(async () => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-symlink-thumb-"));
+    contentRoot = path.join(base, "content");
+    mediaRoot = path.join(base, "public", "media");
+    fs.mkdirSync(path.join(contentRoot, "units"), { recursive: true });
+    fs.mkdirSync(path.join(contentRoot, "lessons"), { recursive: true });
+    fs.mkdirSync(path.join(contentRoot, "quizzes"), { recursive: true });
+    writeJson(path.join(contentRoot, "units", "1.json"), unit(1, 1));
+    writeJson(
+      path.join(contentRoot, "lessons", "1.json"),
+      lesson(1, 1, [{ position: 1, file: "page-01.webp", thumb: "thumbs/page-01.webp" }]),
+    );
+    const lessonDir = path.join(mediaRoot, "lessons", "1");
+    fs.mkdirSync(path.join(lessonDir, "thumbs"), { recursive: true });
+    await sharp({ create: { width: 900, height: 1200, channels: 3, background: { r: 7, g: 8, b: 9 } } })
+      .webp()
+      .toFile(path.join(lessonDir, "page-01.webp"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  /** Runs the CLI against *this* describe block's trees, not the module-level `root`. */
+  function runLocal(...args: string[]) {
+    return spawnSync(
+      process.execPath,
+      ["--import", "tsx", "scripts/media-sync.ts", "--content", contentRoot, "--media", mediaRoot, ...args],
+      { cwd: process.cwd(), encoding: "utf8", timeout: 120_000 },
+    );
+  }
+
+  it("refuses and leaves the link and its target untouched", () => {
+    const outsideTarget = path.join(base, "outside-victim.webp");
+    const victimBytes = Buffer.from("OUTSIDE-VICTIM-BYTES");
+    fs.writeFileSync(outsideTarget, victimBytes);
+    // The thumbnail name the run is about to write is already a link out.
+    const thumbPath = path.join(mediaRoot, "lessons", "1", "thumbs", "page-01.webp");
+    fs.symlinkSync(outsideTarget, thumbPath);
+
+    const result = runLocal();
+
+    // 1. The run refuses.
+    expect(result.status).toBe(1);
+    // 2. The link is still there, still a link to the same place.
+    expect(fs.lstatSync(thumbPath).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(thumbPath)).toBe(outsideTarget);
+    // 3. The outside target is byte-identical: nothing written through, nothing
+    //    truncated, nothing deleted.
+    expect(fs.readFileSync(outsideTarget)).toEqual(victimBytes);
+    // 4. The refusal is reported, not silently swallowed.
+    expect(`${result.stdout}${result.stderr}`).toMatch(/symbolic link|not a regular file/i);
   }, 180_000);
 });

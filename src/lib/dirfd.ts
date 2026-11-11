@@ -424,11 +424,16 @@ export function withDir<T>(dir: string, fn: (handle: OpenDir) => T): T {
 export function readFileAt(parent: OpenDir, name: string): Buffer | null {
   let fd: number | null = null;
   try {
-    fd = parent.open(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    // `O_NONBLOCK` is about the open, not the read: opening a FIFO is the call that
+    // blocks (waiting for the other end), and it would block *before* `fstat` could
+    // reject the type. With the flag the open returns and the check below refuses.
+    // A regular file is unaffected by the flag.
+    fd = parent.open(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     // `fstat` on the descriptor that was actually opened: the type check and the
     // read refer to one file, with no name re-resolved in between.
-    if (!fs.fstatSync(fd).isFile()) {
-      throw new UnsafeComponentError(`${name} is not a regular file`);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
+      throw new UnsafeComponentError(`${name} is ${describeEntryType(stat)}, not a regular file`);
     }
     return fs.readFileSync(fd);
   } catch (error) {
@@ -443,45 +448,86 @@ export function readFileAt(parent: OpenDir, name: string): Buffer | null {
 /** True when `name` exists inside `parent` and is a regular file. */
 export function fileExistsAt(parent: OpenDir, name: string): boolean {
   try {
-    return parent.lstat(name).isFile();
-  } catch {
-    return false;
+    const stat = parent.lstat(name);
+    if (!stat.isFile()) {
+      // A link, directory, FIFO or socket at this name is *not* "nothing here".
+      // Returning false for it is what turned an unowned entry into a file this
+      // run believed it had created — and then the rollback deleted it. The caller
+      // must decide, so this is an error, not a boolean.
+      throw new UnsafeComponentError(
+        `${name} exists but is not a regular file (${describeEntryType(stat)}); refusing to treat it as absent`,
+      );
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 
+/** A short, accurate name for what an `lstat` result is, for error messages. */
+export function describeEntryType(stat: fs.Stats): string {
+  if (stat.isSymbolicLink()) return "a symbolic link";
+  if (stat.isDirectory()) return "a directory";
+  if (stat.isFIFO()) return "a FIFO";
+  if (stat.isSocket()) return "a socket";
+  if (stat.isCharacterDevice()) return "a character device";
+  if (stat.isBlockDevice()) return "a block device";
+  if (stat.isFile()) return "a regular file";
+  return "an unrecognised entry";
+}
+
 /**
- * Writes `data` to `name` inside a pinned parent directory.
+ * Writes `data` to `name` inside a pinned parent directory, reporting whether this
+ * call created the file.
  *
- * `exclusive: false` truncates an existing file — but only after the descriptor
- * is open and `fstat` has confirmed it is a regular file, so truncation can never
- * reach something that was not validated.
+ * The return value is what makes ownership provable: a caller may only record the
+ * path as "created by me, safe to delete on rollback" when this returns `true`.
+ *
+ * `exclusive: false` truncates an existing file — but only after the descriptor is
+ * open and `fstat` has confirmed it is a regular file, so truncation can never
+ * reach something that was not validated. `O_NOFOLLOW` makes a symlink at the name
+ * a refusal rather than a write through it.
+ *
+ * `O_NONBLOCK` guards the open itself: opening a FIFO for writing blocks until a
+ * reader appears, which would hang the process before `fstat` could reject it. With
+ * the flag the open returns and the type check below refuses it.
  */
 export function writeFileAt(
   parent: OpenDir,
   name: string,
   data: Buffer,
   options: { exclusive?: boolean; mode?: number } = {},
-): void {
+): boolean {
   const exclusive = options.exclusive ?? true;
   const mode = options.mode ?? 0o644;
+  const createFlags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NONBLOCK;
   let fd: number | null = null;
+  let created = false;
   try {
     if (exclusive) {
-      fd = parent.open(name, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, mode);
+      fd = parent.open(name, createFlags, mode);
+      created = true;
     } else {
       try {
-        fd = parent.open(name, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, mode);
+        fd = parent.open(name, createFlags, mode);
+        created = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         // Existing: open without truncating, prove the type, then truncate.
-        fd = parent.open(name, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, mode);
-        if (!fs.fstatSync(fd).isFile()) {
-          throw new UnsafeComponentError(`${name} is not a regular file`);
+        fd = parent.open(name, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, mode);
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile()) {
+          throw new UnsafeComponentError(
+            `${name} exists but is ${describeEntryType(stat)}; refusing to write through it`,
+          );
         }
         fs.ftruncateSync(fd, 0);
       }
     }
     fs.writeFileSync(fd, data);
+    return created;
   } finally {
     if (fd !== null) fs.closeSync(fd);
   }

@@ -10,7 +10,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { validateContentTree, type TreeValidation } from "../content/validate";
-import { UnsafeComponentError, at as fdAt, makeDirPath, openDir, openDirUnder, relativeParts } from "../lib/dirfd";
+import {
+  UnsafeComponentError,
+  at as fdAt,
+  describeEntryType,
+  makeDirPath,
+  openDir,
+  openDirUnder,
+  relativeParts,
+} from "../lib/dirfd";
 import type { LessonContent, UnitContent } from "../content/model";
 
 export interface ContentPaths {
@@ -522,8 +530,13 @@ export function rollbackWrites(
         }
         throw error;
       }
-      if (stat.isDirectory()) {
-        failures.push(`refused to delete ${target}: it is a directory`);
+      // Only a regular file this run created may be removed. A link, FIFO or
+      // device at the same name is *not* ours: the earlier design refused only
+      // directories and then unlinked everything else, so a symlink that was
+      // already at the thumbnail name — or replaced ours — was deleted by the
+      // rollback. Deleting a link is still deleting an entry we did not create.
+      if (!stat.isFile()) {
+        failures.push(`refused to delete ${target}: it is ${describeEntryType(stat)}, not a file this run created`);
         continue;
       }
       handle.parent.unlink(handle.leaf);
@@ -558,14 +571,23 @@ export function rollbackWrites(
       try {
         // `O_RDONLY` first: a restored record may legitimately be mode 0444, and
         // `O_RDWR` would fail on it before the bytes could even be compared.
-        fd = handle.parent.open(handle.leaf, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        // `O_NONBLOCK` so a FIFO at the name cannot hang the rollback during the
+        // open; the `fstat` check below then refuses it.
+        fd = handle.parent.open(
+          handle.leaf,
+          fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+        );
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         // Absent: create it exclusively, so a file that appeared meanwhile is not
         // silently adopted, and write through the new descriptor.
         const created = handle.parent.open(
           handle.leaf,
-          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+          fs.constants.O_WRONLY |
+            fs.constants.O_CREAT |
+            fs.constants.O_EXCL |
+            fs.constants.O_NOFOLLOW |
+            fs.constants.O_NONBLOCK,
           0o644,
         );
         try {
