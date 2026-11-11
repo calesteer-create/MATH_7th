@@ -23,7 +23,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { isLegalMediaName, nextFreeName, positionalStem, sanitizeBase } from "./naming";
 import { MediaError, processSourceImage, sha256Hex, type ProcessedImage } from "./process";
-import { openDirInside, resolveInside, writeFileInside } from "./tree";
+import { UnsafePathError, resolveInside, writeFileInside } from "./tree";
+import { UnsafeComponentError, openDir, openDirUnder, relativeParts } from "../lib/dirfd";
 import type { LessonImageContent } from "../content/model";
 
 export const MAX_IMAGES_PER_LESSON = 300;
@@ -72,13 +73,36 @@ export function assertLessonId(lessonId: number): void {
  * a different boundary from writing, and it needs its own guard.
  */
 export function listLessonMediaFiles(mediaRoot: string, lessonId: number): string[] {
-  // The directory is opened component by component relative to its parent's
-  // descriptor, then listed *through that descriptor*. A component swapped in the
-  // textual path after the walk began cannot redirect the listing: the kernel
-  // resolves against the pinned inode, and `readdir` on the fd has no path to
-  // re-resolve.
-  const dir = openDirInside(mediaRoot, lessonMediaDir(mediaRoot, lessonId));
-  if (dir === null) return [];
+  // Opened component by component relative to the parent descriptor and listed
+  // *through* that descriptor. A component swapped in the textual path after the
+  // walk began cannot redirect the listing: the kernel resolves against the
+  // pinned inode and `readdir` on the descriptor has no path to re-resolve.
+  const resolvedRoot = ((): string => {
+    const declared = path.resolve(mediaRoot);
+    try {
+      return fs.realpathSync(declared);
+    } catch {
+      return declared;
+    }
+  })();
+  const dirParts = relativeParts(resolvedRoot, path.join(resolvedRoot, "lessons", String(lessonId)));
+  let rootHandle;
+  try {
+    rootHandle = openDir(resolvedRoot);
+  } catch {
+    return []; // the media root does not exist yet
+  }
+  let dir;
+  try {
+    dir = openDirUnder(rootHandle, dirParts);
+  } catch (error) {
+    rootHandle.close();
+    // A missing folder is an empty listing; a symlinked or non-directory
+    // component is a refusal, and must not be flattened into "no files".
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    if (error instanceof UnsafeComponentError) throw new UnsafePathError(error.message);
+    throw error;
+  }
   try {
     return dir
       .list()
@@ -87,6 +111,7 @@ export function listLessonMediaFiles(mediaRoot: string, lessonId: number): strin
       .sort();
   } finally {
     dir.close();
+    rootHandle.close();
   }
 }
 
@@ -108,33 +133,44 @@ export function fileSha256(file: string, root?: string): string | null {
       return null;
     }
   }
-  let parent: ReturnType<typeof openDirInside> = null;
+  let parent: ReturnType<typeof openDir> | null = null;
+  let fd: number | null = null;
   try {
-    // Open the *parent* directory fd-relatively and then the leaf relative to it.
-    // No path is resolved twice, so there is no window between a check and a read
-    // for a swap to exploit: the descriptor is the authority.
+    // Open the parent directory fd-relatively, then the leaf relative to it. No
+    // path is resolved twice, so there is no check-then-read window: the
+    // descriptor is the authority and the bytes come from it.
     const safe = resolveInside(root, file);
-    parent = openDirInside(root, path.dirname(safe));
-    if (parent === null) return null;
-    const name = path.basename(safe);
-    let fd: number;
+    const resolvedRoot = ((): string => {
+      try {
+        return fs.realpathSync(path.resolve(root));
+      } catch {
+        return path.resolve(root);
+      }
+    })();
+    const parts = relativeParts(resolvedRoot, safe);
+    const leaf = parts.pop();
+    if (leaf === undefined) return null;
+
+    const rootHandle = openDir(resolvedRoot);
     try {
-      fd = parent.open(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      parent = openDirUnder(rootHandle, parts);
     } catch {
+      rootHandle.close();
       return null;
     }
     try {
-      // Belt and braces: the entry must be a regular file, checked on the
-      // descriptor itself rather than on a name.
+      fd = parent.open(leaf, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      // `fstat` on the descriptor itself: not a re-stat of a name.
       if (!fs.fstatSync(fd).isFile()) return null;
       return sha256Hex(fs.readFileSync(fd));
+    } catch {
+      return null;
     } finally {
-      fs.closeSync(fd);
+      if (fd !== null) fs.closeSync(fd);
+      parent.close();
     }
   } catch {
     return null;
-  } finally {
-    parent?.close();
   }
 }
 

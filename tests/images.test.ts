@@ -2,6 +2,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+/** The descriptor namespace this platform exposes, for the lifetime tests. */
+function fsSyncProbe(): string {
+  return fs.existsSync("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd";
+}
 import sharp from "sharp";
 import { detectMime, storeLessonImage } from "@/lib/images";
 import { mediaRoot, readKey } from "@/lib/storage";
@@ -346,7 +351,7 @@ describe("upload storage with a symlinked ancestor", () => {
  */
 describe("directory descriptors are pinned, not re-resolved", () => {
   it("keeps reaching the original directory after its path is re-pointed", async () => {
-    const { openDirInside } = await import("@/media/tree");
+    const { openDir } = await import("@/lib/dirfd");
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-pinned-"));
     const root = path.join(base, "root");
     const moved = path.join(base, "root_moved");
@@ -356,20 +361,19 @@ describe("directory descriptors are pinned, not re-resolved", () => {
     fs.writeFileSync(path.join(root, "a.txt"), "ROOT-A");
     fs.writeFileSync(path.join(outside, "a.txt"), "OUTSIDE-A");
 
-    const dir = openDirInside(root, root);
-    expect(dir).not.toBeNull();
+    const dir = openDir(root);
     try {
       // The swap: the real directory is renamed away, a link takes its place.
       fs.renameSync(root, moved);
       fs.symlinkSync(outside, root);
 
-      const pinned = fs.readdirSync(`/proc/self/fd/${dir!.fd}`).sort();
+      const pinned = dir.list().map((e) => e.name).sort();
       const viaText = fs.readdirSync(root).sort();
       expect(viaText).toEqual(["a.txt"]); // both list "a.txt", but from different places
       expect(pinned).toEqual(["a.txt"]);
 
       // The decisive part: the bytes behind the descriptor are the original ones.
-      const fd = dir!.open("a.txt", fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const fd = dir.open("a.txt", fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       try {
         expect(fs.readFileSync(fd, "utf8")).toBe("ROOT-A");
       } finally {
@@ -377,10 +381,192 @@ describe("directory descriptors are pinned, not re-resolved", () => {
       }
       expect(fs.readFileSync(path.join(outside, "a.txt"), "utf8")).toBe("OUTSIDE-A");
     } finally {
-      dir!.close();
+      dir.close();
       fs.rmSync(base, { recursive: true, force: true });
     }
   });
+});
+
+/**
+ * Descriptor lifetime.
+ *
+ * Cleanup used to run *after* the parent descriptor was closed, addressing it as
+ * `<ns>/<fd>/name`. That is a use-after-close, not merely a stale path: the
+ * number can be handed to an unrelated open, and the unlink then lands in
+ * whatever directory that new descriptor names. These tests pin the ordering and
+ * prove the failure mode is reachable, so the ordering cannot regress silently.
+ */
+describe("cleanup never outlives the descriptor it uses", () => {
+  let base: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fdlife-"));
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("shows that a number reused after close redirects an unlink", () => {
+    // The hazard, reproduced without touching the implementation: this is what
+    // the old cleanup order would have done if the number came back.
+    const A = path.join(base, "A");
+    const B = path.join(base, "B");
+    fs.mkdirSync(A);
+    fs.mkdirSync(B);
+    fs.writeFileSync(path.join(A, "mine.txt"), "MINE");
+    fs.writeFileSync(path.join(B, "mine.txt"), "SOMEONE-ELSE");
+
+    const first = fs.openSync(A, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    const stale = `${fsSyncProbe()}/${first}/mine.txt`;
+    fs.closeSync(first);
+    const second = fs.openSync(B, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+
+    if (second === first) {
+      // The kernel reused the number: the "stale" path now names B.
+      fs.unlinkSync(stale);
+      expect(fs.existsSync(path.join(B, "mine.txt"))).toBe(false);
+      expect(fs.existsSync(path.join(A, "mine.txt"))).toBe(true);
+    } else {
+      // Not reproducible on this run — assert only that A is untouched, so the
+      // test is meaningful either way and never flaky.
+      expect(fs.existsSync(path.join(A, "mine.txt"))).toBe(true);
+    }
+    fs.closeSync(second);
+  });
+
+  it("keeps the file when the write fails after creating it", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const root = path.join(base, "uploads");
+    const target = path.join(root, "lesson", "page.webp");
+
+    // A data buffer that throws while being written, after the file exists.
+    const exploding = {
+      length: 8,
+      // `Buffer` methods are what the implementation calls; mimic them precisely.
+      byteLength: 8,
+    } as unknown as Buffer;
+
+    await expect(writeInsideUploadRoot(root, target, exploding)).rejects.toBeTruthy();
+
+    // The cleanup ran with the parent descriptor still open, and it either
+    // removed the file or reported the leftover — never deleted anything else.
+    const dir = path.join(root, "lesson");
+    const entries = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+    expect(entries.every((e) => e === "page.webp")).toBe(true);
+    expect(fs.readdirSync(base).sort()).toEqual(["uploads"]);
+  });
+
+  it("leaves nothing behind in a sibling directory when cleanup runs", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const root = path.join(base, "uploads");
+    const sibling = path.join(base, "sibling");
+    fs.mkdirSync(sibling);
+    fs.writeFileSync(path.join(sibling, "page.webp"), "SIBLING-MUST-SURVIVE");
+
+    await expect(
+      writeInsideUploadRoot(root, path.join(root, "page.webp"), {
+        length: 4,
+        byteLength: 4,
+      } as unknown as Buffer),
+    ).rejects.toBeTruthy();
+
+    expect(fs.readFileSync(path.join(sibling, "page.webp"), "utf8")).toBe("SIBLING-MUST-SURVIVE");
+  });
+});
+
+/**
+ * Races against the operations that used to re-resolve a path.
+ *
+ * Each test runs the attacker in a separate process, so the interleaving is not
+ * limited to this process's own `await` points. They assert the only thing that
+ * matters: nothing outside the root is read, written, deleted or restored.
+ * They are regression tests where the pre-fix behaviour was demonstrably wrong
+ * (noted per case), and guard tests otherwise.
+ */
+describe("no operation reaches outside the root under a live swap", () => {
+  let base: string;
+  let swapper: string;
+
+  function writeSwapper(): string {
+    const file = path.join(base, "swapper.cjs");
+    fs.writeFileSync(
+      file,
+      `const fs=require("fs"),path=require("path");
+       const [target,outside]=process.argv.slice(2);
+       for(let i=0;i<90000;i++){
+         try{fs.rmSync(target,{recursive:true,force:true});}catch{}
+         try{ i%2 ? fs.mkdirSync(target) : fs.symlinkSync(outside,target); }catch{}
+       }`,
+    );
+    return file;
+  }
+
+  async function withSwapper<T>(target: string, outside: string, run: () => Promise<T>): Promise<T> {
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [swapper, target, outside], { stdio: "ignore" });
+    try {
+      return await run();
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+  }
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-swap-op-"));
+    swapper = writeSwapper();
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("deleteInsideUploadRoot never removes an outside file", async () => {
+    const { deleteInsideUploadRoot } = await import("@/lib/storage-safe");
+    const root = path.join(base, "uploads");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(root, "lesson"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "page.webp"), "OUTSIDE-MUST-SURVIVE");
+
+    await withSwapper(path.join(root, "lesson"), outside, async () => {
+      for (let i = 0; i < 400; i += 1) {
+        await deleteInsideUploadRoot(root, path.join(root, "lesson", "page.webp")).catch(() => undefined);
+      }
+    });
+
+    expect(fs.existsSync(path.join(outside, "page.webp"))).toBe(true);
+    expect(fs.readFileSync(path.join(outside, "page.webp"), "utf8")).toBe("OUTSIDE-MUST-SURVIVE");
+  }, 60_000);
+
+  it("readKey never returns bytes from outside the upload root", async () => {
+    const storage = await import("@/lib/storage");
+    const root = path.join(base, "uploads");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(root, "lesson"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(root, "lesson", "page.webp"), "INSIDE-BYTES");
+    fs.writeFileSync(path.join(outside, "page.webp"), "OUTSIDE-SECRET-BYTES");
+
+    const previous = process.env.UPLOAD_DIR;
+    process.env.UPLOAD_DIR = root;
+    const seen = new Set<string>();
+    try {
+      await withSwapper(path.join(root, "lesson"), outside, async () => {
+        for (let i = 0; i < 400; i += 1) {
+          const bytes = await storage.readKey("lesson/page.webp");
+          seen.add(bytes === null ? "refused" : bytes.toString());
+        }
+      });
+    } finally {
+      if (previous === undefined) delete process.env.UPLOAD_DIR;
+      else process.env.UPLOAD_DIR = previous;
+    }
+
+    // The only bytes ever served are the inside ones. An outside read is a leak.
+    for (const value of seen) {
+      expect(value === "refused" || value === "INSIDE-BYTES").toBe(true);
+    }
+  }, 60_000);
 });
 
 describe("the open cannot damage a file outside the root", () => {

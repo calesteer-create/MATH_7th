@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { validateContentTree, type TreeValidation } from "../content/validate";
+import { UnsafeComponentError, at as fdAt, makeDirPath, openDir, openDirUnder, relativeParts } from "../lib/dirfd";
 import type { LessonContent, UnitContent } from "../content/model";
 
 export interface ContentPaths {
@@ -51,44 +52,120 @@ export function readLesson(contentRoot: string, lessonId: number): { file: strin
   return { file: `${lessonId}.json`, value: JSON.parse(fs.readFileSync(file, "utf8")) as LessonContent };
 }
 
-/** Writes JSON with a trailing newline, creating the parent directory. */
 /**
- * Writes JSON atomically: the payload goes to a sibling temporary file which is
- * then renamed over the target. A crash or a failing write can therefore never
- * leave a truncated or half-encoded record — the target is either the old bytes
- * or the new ones. The temporary file is removed if anything goes wrong.
+ * Opens `root` and walks to the directory that holds `target`, creating missing
+ * levels relative to descriptors. Returns the parent handle and the leaf name.
+ *
+ * The root itself is resolved once (`realpath`), because the operator names it
+ * and its ancestors may legitimately be symlinks; everything below it is opened
+ * `O_NOFOLLOW|O_DIRECTORY` relative to its parent's descriptor.
+ */
+function openParent(
+  root: string,
+  target: string,
+  options: { create: boolean },
+): { root: ReturnType<typeof openDir>; parent: ReturnType<typeof openDir>; leaf: string } {
+  const parts = relativeParts(root, target);
+  const leaf = parts.pop();
+  if (leaf === undefined) throw new UnsafePathError(`cannot write the root itself: ${target}`);
+
+  const resolvedRoot = resolveExistingPrefix(path.resolve(root));
+  const missing: string[] = [];
+  let base = resolvedRoot;
+  while (!fs.existsSync(base)) {
+    missing.push(path.basename(base));
+    const parent = path.dirname(base);
+    if (parent === base) break;
+    base = parent;
+  }
+  const ordered = missing.reverse();
+
+  const baseHandle = openDir(base);
+  let rootHandle: ReturnType<typeof openDir> | null = null;
+  try {
+    if (ordered.length > 0) {
+      if (!options.create) throw new UnsafePathError(`${resolvedRoot} does not exist`);
+      makeDirPath(baseHandle, ordered);
+    }
+    rootHandle = openDirUnder(baseHandle, ordered);
+  } finally {
+    baseHandle.close();
+  }
+
+  try {
+    makeDirPath(rootHandle, parts);
+    const parent = openDirUnder(rootHandle, parts);
+    return { root: rootHandle, parent, leaf };
+  } catch (error) {
+    rootHandle.close();
+    throw error;
+  }
+}
+
+/**
+ * Writes JSON atomically **and** descriptor-relatively.
+ *
+ * The payload goes to a sibling temporary file created with `O_CREAT|O_EXCL`
+ * relative to the pinned parent descriptor, is written through that descriptor,
+ * and is then `renameat`-ed over the target using two descriptors — so neither
+ * the temporary file nor the destination name is ever resolved as a path that
+ * could be swapped. The target therefore holds either the old bytes or the new
+ * ones, never a half-encoded record.
  */
 export function writeJson(root: string, target: string, value: unknown): void {
-  const safeTarget = resolveInside(root, target);
-  const directory = path.dirname(safeTarget);
-  // `recursive: true` would happily create directories through a symlink, so
-  // the parent is verified *after* creation as well as before it.
-  fs.mkdirSync(directory, { recursive: true });
-  resolveInside(root, directory);
-
-  const temporary = `${safeTarget}.tmp-${process.pid}`;
-  // O_NOFOLLOW: the last component must not be — nor become — a symlink.
-  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW;
   try {
-    const fd = fs.openSync(temporary, flags, 0o644);
+    writeJsonInner(root, target, value);
+  } catch (error) {
+    throw asUnsafePathError(error);
+  }
+}
+
+/** Keeps this module's public error type stable for callers and tests. */
+function asUnsafePathError(error: unknown): unknown {
+  if (error instanceof UnsafeComponentError) return new UnsafePathError(error.message);
+  return error;
+}
+
+function writeJsonInner(root: string, target: string, value: unknown): void {
+  const handle = openParent(root, target, { create: true });
+  const temporary = `.${handle.leaf}.tmp-${process.pid}`;
+  try {
+    // Refuse a link at the destination explicitly. `renameat` would replace the
+    // link itself rather than writing through it — the victim's bytes are safe —
+    // but silently replacing a link is not the same as accepting the write, and
+    // the documented policy is to refuse rather than to redefine the target.
+    try {
+      if (handle.parent.lstat(handle.leaf).isSymbolicLink()) {
+        throw new UnsafePathError(`${target} is a symbolic link`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const fd = handle.parent.open(
+      temporary,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o644,
+    );
     try {
       fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
     } finally {
       fs.closeSync(fd);
     }
-    // Verified again immediately before the rename, which follows a symlinked
-    // directory component and would otherwise publish outside the root.
-    resolveInside(root, safeTarget);
-    fs.renameSync(temporary, safeTarget);
+    // `renameat`: both operands are descriptors, so the destination directory
+    // cannot be swapped between the write and the publication.
+    handle.parent.rename(temporary, handle.parent, handle.leaf);
   } catch (error) {
     // Never let cleanup mask the real failure: on a read-only directory even
     // removing the temporary file is refused, and the caller needs the cause.
     try {
-      fs.rmSync(temporary, { force: true });
+      handle.parent.unlink(temporary);
     } catch {
       /* as above */
     }
     throw error;
+  } finally {
+    handle.parent.close();
+    handle.root.close();
   }
 }
 
@@ -96,11 +173,10 @@ export function writeJson(root: string, target: string, value: unknown): void {
  * Writes a new file inside `root` and refuses to traverse a symlink.
  *
  * The single write primitive shared by every producer (`media:import`,
- * `media:sync`): `O_CREAT|O_EXCL|O_NOFOLLOW` so a link at the target can never
- * be followed, an exclusive create so an existing page is never clobbered, and
- * a re-check of every directory component immediately before the open.
- * `exclusive: false` truncates an existing real file instead (used for derived
- * thumbnails, which are regenerated).
+ * `media:sync`). Every directory level is created relative to a descriptor, and
+ * the leaf is opened `O_NOFOLLOW` relative to the pinned parent: `O_EXCL` errors
+ * rather than clobbering an existing page, while `exclusive: false` truncates an
+ * existing real file (derived thumbnails, which are regenerated).
  */
 export function writeFileInside(
   root: string,
@@ -108,30 +184,54 @@ export function writeFileInside(
   data: Buffer,
   options: { exclusive?: boolean; mode?: number } = {},
 ): SafePath {
-  const safeTarget = resolveInside(root, target);
-  const directory = path.dirname(safeTarget);
-  fs.mkdirSync(directory, { recursive: true });
-  // `recursive: true` creates through a symlink if one appeared, so the whole
-  // chain is verified after creation as well as before.
-  resolveInside(root, directory);
-
-  const exclusive = options.exclusive ?? true;
-  const flags =
-    fs.constants.O_WRONLY |
-    fs.constants.O_CREAT |
-    fs.constants.O_NOFOLLOW |
-    (exclusive ? fs.constants.O_EXCL : fs.constants.O_TRUNC);
-
-  // Verified again right before the open, which is as close to the syscall as
-  // this API allows.
-  resolveInside(root, directory);
-  const fd = fs.openSync(safeTarget, flags, options.mode ?? 0o644);
   try {
-    fs.writeFileSync(fd, data);
-  } finally {
-    fs.closeSync(fd);
+    return writeFileInsideInner(root, target, data, options);
+  } catch (error) {
+    throw asUnsafePathError(error);
   }
-  return safeTarget;
+}
+
+function writeFileInsideInner(
+  root: string,
+  target: string,
+  data: Buffer,
+  options: { exclusive?: boolean; mode?: number },
+): SafePath {
+  const resolvedRoot = resolveExistingPrefix(path.resolve(root));
+  const handle = openParent(root, target, { create: true });
+  const exclusive = options.exclusive ?? true;
+  try {
+    let fd: number;
+    try {
+      fd = handle.parent.open(
+        handle.leaf,
+        fs.constants.O_WRONLY |
+          fs.constants.O_CREAT |
+          fs.constants.O_NOFOLLOW |
+          (exclusive ? fs.constants.O_EXCL : 0),
+        options.mode ?? 0o644,
+      );
+    } catch (error) {
+      if (exclusive || (error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      fd = handle.parent.open(
+        handle.leaf,
+        fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+        options.mode ?? 0o644,
+      );
+    }
+    try {
+      // Truncation happens on the descriptor, after the open succeeded through
+      // the pinned chain, so `O_TRUNC` cannot empty a file before it is proven.
+      if (!exclusive) fs.ftruncateSync(fd, 0);
+      fs.writeFileSync(fd, data);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return path.join(resolvedRoot, ...relativeParts(resolvedRoot, path.resolve(target))) as SafePath;
+  } finally {
+    handle.parent.close();
+    handle.root.close();
+  }
 }
 
 /**
@@ -291,115 +391,6 @@ function resolveExistingPrefix(target: string): string {
  * Returns `null` when a component does not exist (`ENOENT`), which for a reader
  * means "nothing there" rather than an error.
  */
-/**
- * The directory descriptor namespace: Linux `/proc/self/fd`, and macOS/BSD
- * `/dev/fd` (which is the same mechanism). Resolved once, and *proved* by
- * opening a real descriptor and listing it — a platform without either is
- * detected here rather than failing later with a confusing `ENOENT`.
- */
-let fdNamespace: string | null | undefined;
-
-function resolveFdNamespace(): string {
-  if (fdNamespace !== undefined) {
-    if (fdNamespace === null) {
-      throw new UnsafePathError(
-        "this platform exposes no /proc/self/fd or /dev/fd descriptor namespace, so directory " +
-          "descriptor-relative access is unavailable; refusing to fall back to path re-resolution",
-      );
-    }
-    return fdNamespace;
-  }
-  for (const candidate of ["/proc/self/fd", "/dev/fd"]) {
-    try {
-      const probe = fs.openSync(os.tmpdir(), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
-      try {
-        fs.readdirSync(`${candidate}/${probe}`);
-      } finally {
-        fs.closeSync(probe);
-      }
-      fdNamespace = candidate;
-      return candidate;
-    } catch {
-      /* try the next one */
-    }
-  }
-  fdNamespace = null;
-  return resolveFdNamespace();
-}
-
-/** `<namespace>/<fd>/<child>`: the closest thing to `openat` Node exposes. */
-function at(fd: number, child?: string): string {
-  const base = `${resolveFdNamespace()}/${fd}`;
-  return child === undefined ? base : `${base}/${child}`;
-}
-
-export interface DirHandle {
-  fd: number;
-  /** Opens an entry inside this directory, resolved against the pinned inode. */
-  open: (name: string, flags: number) => number;
-  /** Lists this directory through the descriptor. */
-  list: () => fs.Dirent[];
-  close: () => void;
-}
-
-export function openDirInside(root: string, target: string): DirHandle | null {
-  const declaredRoot = path.resolve(root);
-  const resolvedRoot = resolveExistingPrefix(declaredRoot);
-  const candidates = resolvedRoot === declaredRoot ? [declaredRoot] : [declaredRoot, resolvedRoot];
-  const absoluteTarget = path.resolve(target);
-  let relative: string | null = null;
-  for (const candidate of candidates) {
-    const under = path.relative(candidate, absoluteTarget);
-    const escapes =
-      under !== "" && (under === ".." || under.startsWith(`..${path.sep}`) || path.isAbsolute(under));
-    if (!escapes) {
-      relative = under;
-      break;
-    }
-  }
-  if (relative === null) throw new UnsafePathError(`${absoluteTarget} is outside ${declaredRoot}`);
-
-  const parts = relative === "" ? [] : relative.split(path.sep);
-  const opened: number[] = [];
-  const closeAll = (): void => {
-    for (const fd of opened.reverse()) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        /* already closed */
-      }
-    }
-  };
-  try {
-    let current = fs.openSync(resolvedRoot, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
-    opened.push(current);
-    for (const part of parts) {
-      current = fs.openSync(
-        at(current, part),
-        fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
-      );
-      opened.push(current);
-    }
-    return {
-      fd: current,
-      open: (name: string, flags: number) => fs.openSync(at(current, name), flags),
-      list: () => fs.readdirSync(at(current), { withFileTypes: true }),
-      close: closeAll,
-    };
-  } catch (error) {
-    closeAll();
-    const code = (error as NodeJS.ErrnoException).code;
-    // Only "it is not there" is a quiet absence. A symlinked component (`ELOOP`)
-    // or a non-directory (`ENOTDIR`) is a refusal, not an empty result — silently
-    // returning "no files" would hide exactly the case the guard exists for.
-    if (code === "ENOENT") return null;
-    if (code === "ELOOP" || code === "ENOTDIR") {
-      throw new UnsafePathError(`${target} reaches through a symbolic link or a non-directory`);
-    }
-    throw error;
-  }
-}
-
 /** Throws unless `target` is safe to write to under `root`. */
 export function assertSafePath(root: string, target: string): SafePath {
   return resolveInside(root, target);
@@ -447,6 +438,49 @@ export function rollbackWrites(
     return { ok: false, reason };
   };
 
+  /**
+   * Locates a permitted target as (parent handle, leaf) using descriptors only.
+   *
+   * The lexical check decides whether a root is allowed to be considered at all;
+   * the descriptors decide what is actually touched. Returns `null` when the
+   * path does not exist any more, and throws a reason when it must be refused.
+   */
+  const locate = (target: string): { parent: ReturnType<typeof openDir>; root?: ReturnType<typeof openDir>; leaf: string; close: () => void } | null => {
+    for (const root of allowedRoots) {
+      let parts: string[];
+      try {
+        parts = relativeParts(root, target);
+      } catch {
+        continue; // not under this root; try the next
+      }
+      if (parts.length === 0) continue;
+      const leaf = parts[parts.length - 1] as string;
+      let rootHandle: ReturnType<typeof openDir> | null = null;
+      let parent: ReturnType<typeof openDir> | null = null;
+      try {
+        const resolvedRoot = resolveExistingPrefix(path.resolve(root));
+        if (!fs.existsSync(resolvedRoot)) continue;
+        rootHandle = openDir(resolvedRoot);
+        parent = openDirUnder(rootHandle, parts.slice(0, -1));
+        const handle = parent;
+        const base = rootHandle;
+        return {
+          parent: handle,
+          leaf,
+          close: () => {
+            handle.close();
+            base.close();
+          },
+        };
+      } catch {
+        parent?.close();
+        rootHandle?.close();
+        continue;
+      }
+    }
+    return null;
+  };
+
   for (const target of [...createdFiles].reverse()) {
     const check = permitted(target);
     if (!check.ok) {
@@ -454,13 +488,39 @@ export function rollbackWrites(
       failures.push(`refused to delete ${target}: ${check.reason}`);
       continue;
     }
+    let handle: ReturnType<typeof locate> = null;
     try {
-      fs.rmSync(target, { force: true });
+      handle = locate(target);
+      if (handle === null) {
+        failures.push(`could not delete ${target}: no writable descriptor path`);
+        continue;
+      }
+      // `lstat` through the descriptor, then `unlinkat` against the same one: the
+      // directory cannot move between the check and the removal, so a deletion
+      // cannot land outside the root.
+      let stat: fs.Stats;
+      try {
+        stat = handle.parent.lstat(handle.leaf);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          created += 1; // already gone counts as undone
+          continue;
+        }
+        throw error;
+      }
+      if (stat.isDirectory()) {
+        failures.push(`refused to delete ${target}: it is a directory`);
+        continue;
+      }
+      handle.parent.unlink(handle.leaf);
       created += 1;
     } catch (error) {
       failures.push(`could not delete ${target}: ${(error as Error).message}`);
+    } finally {
+      handle?.close();
     }
   }
+
   for (const file of [...overwrittenFiles].reverse()) {
     const check = permitted(file.path);
     if (!check.ok) {
@@ -468,18 +528,50 @@ export function rollbackWrites(
       failures.push(`refused to restore ${file.path}: ${check.reason}`);
       continue;
     }
+    let handle: ReturnType<typeof locate> = null;
     try {
-      const current = fs.existsSync(file.path) ? fs.readFileSync(file.path) : null;
+      handle = locate(file.path);
+      if (handle === null) {
+        failures.push(`could not restore ${file.path}: no writable descriptor path`);
+        continue;
+      }
+      // Read the current bytes *through a descriptor* opened O_NOFOLLOW relative
+      // to the pinned parent, so the comparison and the rewrite refer to one file.
+      let current: Buffer | null = null;
+      try {
+        const fd = handle.parent.open(handle.leaf, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        try {
+          current = fs.readFileSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
       if (current !== null && current.equals(file.previous)) continue;
-      fs.writeFileSync(file.path, file.previous);
+
+      const fd = handle.parent.open(
+        handle.leaf,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW,
+        0o644,
+      );
+      try {
+        fs.ftruncateSync(fd, 0);
+        fs.writeFileSync(fd, file.previous);
+      } finally {
+        fs.closeSync(fd);
+      }
       restored += 1;
     } catch (error) {
       failures.push(`could not restore ${file.path}: ${(error as Error).message}`);
+    } finally {
+      handle?.close();
     }
   }
-  // Directories the run created are removed too, deepest first, but only if
-  // they are empty: leaving `thumbs/` behind would be a visible leftover even
-  // though every file in it was undone.
+
+  // Directories the run created are removed too, deepest first, but only if they
+  // are empty: leaving `thumbs/` behind would be a visible leftover even though
+  // every file in it was undone.
   for (const dir of [...createdDirectories].reverse()) {
     const check = permitted(dir);
     if (!check.ok) {
@@ -487,14 +579,26 @@ export function rollbackWrites(
       failures.push(`refused to remove ${dir}: ${check.reason}`);
       continue;
     }
+    let handle: ReturnType<typeof locate> = null;
     try {
-      fs.rmdirSync(dir); // empty directories only; never recursive
+      handle = locate(dir);
+      if (handle === null) {
+        failures.push(`could not remove ${dir}: no writable descriptor path`);
+        continue;
+      }
+      // `unlinkat(AT_REMOVEDIR)`: Node has no direct form, so the empty-directory
+      // rule is checked through the descriptor first and the removal is attempted
+      // relative to it. A directory that is not empty fails with ENOTEMPTY, which
+      // is a successful no-op here.
+      fs.rmdirSync(fdAt(handle.parent.fd, handle.leaf));
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       // "Not empty" or "already gone" is a successful no-op, not a failure.
       if (code !== "ENOTEMPTY" && code !== "ENOENT") {
         failures.push(`could not remove ${dir}: ${(error as Error).message}`);
       }
+    } finally {
+      handle?.close();
     }
   }
   return { created, restored, skipped, failures };

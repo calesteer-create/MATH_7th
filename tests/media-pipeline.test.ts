@@ -128,6 +128,183 @@ describe("processSourceImage — conversion and metadata strip", () => {
   });
 });
 
+/**
+ * The descriptor mechanism itself.
+ *
+ * `probeNamespace` exercises open, create, stat, child-open and unlink inside a
+ * throwaway directory before the namespace is accepted, so a platform whose
+ * `readdir` works but whose `open` beneath a descriptor does not is rejected.
+ * These tests record what this platform actually supports rather than assuming
+ * that the presence of a directory implies the operations work.
+ */
+/**
+ * The media-tree writers and the rollback, under a live swap.
+ *
+ * Before the descriptor rewrite these called `mkdirSync({recursive:true})` and
+ * opened by path, so a swapped component could create, write, delete or restore
+ * outside the root. The assertions are the outside tree is untouched, which is
+ * the only claim that matters.
+ */
+describe("media tree writes and rollback stay inside their roots", () => {
+  let base: string;
+  let swapper: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-tree-swap-"));
+    swapper = path.join(base, "swapper.cjs");
+    fs.writeFileSync(
+      swapper,
+      `const fs=require("fs"),path=require("path");
+       const [target,outside]=process.argv.slice(2);
+       for(let i=0;i<90000;i++){
+         try{fs.rmSync(target,{recursive:true,force:true});}catch{}
+         try{ i%2 ? fs.mkdirSync(target) : fs.symlinkSync(outside,target); }catch{}
+       }`,
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  async function underSwapper<T>(target: string, outside: string, run: () => Promise<T> | T): Promise<T> {
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [swapper, target, outside], { stdio: "ignore" });
+    try {
+      return await run();
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+  }
+
+  it("writeFileInside never writes outside the root", async () => {
+    const { writeFileInside } = await import("@/media/tree");
+    const root = path.join(base, "media");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(root, "lessons"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "page.webp"), "OUTSIDE-ORIGINAL");
+
+    await underSwapper(path.join(root, "lessons", "5"), outside, async () => {
+      for (let i = 0; i < 400; i += 1) {
+        try {
+          writeFileInside(root, path.join(root, "lessons", "5", "page.webp"), Buffer.from("PAYLOAD"), {
+            exclusive: false,
+          });
+        } catch {
+          /* refusals are expected */
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    });
+
+    expect(fs.readFileSync(path.join(outside, "page.webp"), "utf8")).toBe("OUTSIDE-ORIGINAL");
+    expect(fs.readdirSync(outside)).toEqual(["page.webp"]);
+  }, 60_000);
+
+  it("writeJson never publishes a record outside the root", async () => {
+    const { writeJson } = await import("@/media/tree");
+    const root = path.join(base, "content");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(root, "lessons"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+
+    await underSwapper(path.join(root, "lessons"), outside, async () => {
+      for (let i = 0; i < 300; i += 1) {
+        try {
+          writeJson(root, path.join(root, "lessons", "1.json"), { id: 1 });
+        } catch {
+          /* refusals are expected */
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    });
+
+    const leaked = fs.readdirSync(outside, { recursive: true }).filter((entry) => String(entry).endsWith(".json"));
+    expect(leaked).toEqual([]);
+  }, 60_000);
+
+  it("rollbackWrites never deletes or restores outside the allowed roots", async () => {
+    const { rollbackWrites } = await import("@/media/tree");
+    const mediaRoot = path.join(base, "media");
+    const contentRoot = path.join(base, "content");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(mediaRoot, "lessons"), { recursive: true });
+    fs.mkdirSync(contentRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "page.webp"), "OUTSIDE-VICTIM");
+    fs.writeFileSync(path.join(outside, "1.json"), "OUTSIDE-RECORD");
+
+    const created = path.join(mediaRoot, "lessons", "page.webp");
+    await underSwapper(path.join(mediaRoot, "lessons"), outside, async () => {
+      for (let i = 0; i < 300; i += 1) {
+        // The path is inside mediaRoot *lexically*; the attacker is moving the
+        // directory it names. A rollback may partially undo our own files, but it
+        // must never touch the outside ones.
+        rollbackWrites(
+          [created],
+          [{ path: path.join(contentRoot, "1.json"), previous: Buffer.from("RESTORED") }],
+          [],
+          [mediaRoot, contentRoot],
+        );
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    });
+
+    expect(fs.readFileSync(path.join(outside, "page.webp"), "utf8")).toBe("OUTSIDE-VICTIM");
+    expect(fs.readFileSync(path.join(outside, "1.json"), "utf8")).toBe("OUTSIDE-RECORD");
+  }, 60_000);
+});
+
+describe("descriptor-relative primitives work on this platform", () => {
+  it("reports whether the platform supports descriptor-relative access", async () => {
+    const { supportsDirFd, fdNamespace } = await import("@/lib/dirfd");
+    const supported = supportsDirFd();
+    // Documented, not asserted blindly: Linux and macOS/BSD are expected to pass,
+    // anything else is expected to refuse rather than degrade. The test asserts
+    // the *consistency* of the answer on every platform.
+    if (supported) {
+      expect(["/proc/self/fd", "/dev/fd"]).toContain(fdNamespace());
+    } else {
+      expect(() => fdNamespace()).toThrow(/descriptor/i);
+    }
+  });
+
+  it("performs open, create, stat, child-open and unlink through a descriptor", async () => {
+    const { openDir } = await import("@/lib/dirfd");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "math7-prims-"));
+    try {
+      fs.writeFileSync(path.join(dir, "a.txt"), "A");
+      const h = openDir(dir);
+      try {
+        expect(h.list().map((e) => e.name)).toEqual(["a.txt"]);
+        expect(h.stat("a.txt").isFile()).toBe(true);
+
+        h.mkdir("sub");
+        const sub = (await import("@/lib/dirfd")).openDirUnder(h, ["sub"]);
+        try {
+          h.rename("a.txt", sub, "b.txt");
+          expect(sub.list().map((e) => e.name)).toEqual(["b.txt"]);
+          const fd = sub.open("b.txt", fs.constants.O_RDONLY);
+          try {
+            expect(fs.readFileSync(fd, "utf8")).toBe("A");
+          } finally {
+            fs.closeSync(fd);
+          }
+          sub.unlink("b.txt");
+          expect(sub.list()).toEqual([]);
+        } finally {
+          sub.close();
+        }
+      } finally {
+        h.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("media reads never cross mediaRoot", () => {
   let root: string;
   let mediaRoot: string;
