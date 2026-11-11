@@ -37,6 +37,7 @@
  */
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 export class UnsafeStoragePathError extends Error {
@@ -169,59 +170,211 @@ export async function writeInsideUploadRoot(root: string, target: string, data: 
   return serialize(safeTarget, () => writeSerialized(root, safeTarget, data));
 }
 
-async function writeSerialized(root: string, safeTarget: string, data: Buffer): Promise<void> {
-  const directory = path.dirname(safeTarget);
-  await fs.mkdir(directory, { recursive: true });
-
-  // Re-verified against the *upload root*, never against `directory`: passing
-  // the directory as its own root is a vacuous check (any path is inside
-  // itself), so a component that became a symlink after `mkdir` would sail
-  // through. Both the parent chain and the full target are re-walked, which also
-  // catches a symlink at the final component.
-  resolveInsideUploadRoot(root, safeTarget);
-
-  // Again as close to the open as this API allows. `O_NOFOLLOW` then stops the
-  // final component from being a link at the instant of the syscall.
-  resolveInsideUploadRoot(root, safeTarget);
-
-  // The open must not be able to destroy anything, because at this point the
-  // destination is still unproven: a component swapped between the check above
-  // and this call sends the open outside the root, and `O_TRUNC` would empty an
-  // outside file *before* any post-open check could refuse it. So: no `O_TRUNC`
-  // and no `O_CREAT` yet. `O_EXCL` fails with `EEXIST` instead of touching an
-  // existing file, and an absent file is created empty — harmless even at the
-  // wrong location. The real (truncating) open happens below, only after the
-  // descriptor has been proved to be the file the guard approved.
-  const probeFlags = fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_EXCL;
-  let handle: Awaited<ReturnType<typeof fs.open>>;
+/**
+ * Walks from an already-open directory descriptor down to `target`'s parent.
+ *
+ * This is the `openat` loop Node does not expose directly: each component is
+ * opened *relative to the previous descriptor* via `/proc/self/fd/<n>`, so a
+ * component swapped in the textual path cannot redirect the walk. The descriptor
+ * the kernel hands back is pinned to the directory it actually opened, which is
+ * what every later step works from.
+ *
+ * `O_NOFOLLOW` on each `open` refuses a symlinked component; `O_DIRECTORY`
+ * refuses anything that is not a directory. Both are enforced by the kernel, not
+ * re-checked afterwards.
+ */
+function openDirChain(root: string, parts: string[]): { fd: number; close: () => void } {
+  const constants = fsSync.constants;
+  const opened: number[] = [];
+  const closeAll = (): void => {
+    for (const fd of opened.reverse()) {
+      try {
+        fsSync.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    }
+  };
+  let current: number;
   try {
-    handle = await fs.open(safeTarget, probeFlags, 0o644);
+    // `makeDirChain` runs first in the write path, so the root exists here; the
+    // resolved prefix is used for the same reason as there.
+    current = fsSync.openSync(
+      resolveExistingPrefix(path.resolve(root)),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    opened.push(current);
+    for (const part of parts) {
+      // Creating a missing component is a separate, explicit step: the caller
+      // truncates the walk where the first missing component begins.
+      current = fsSync.openSync(
+        fdPath(current, part),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      opened.push(current);
+    }
+    return { fd: current, close: closeAll };
   } catch (error) {
-    handle = await openExistingInsideRoot(root, safeTarget, error);
+    closeAll();
+    throw error;
+  }
+}
+
+/**
+ * The path that lets a descriptor be used as an `*at` base: Linux
+ * `/proc/self/fd`, macOS/BSD `/dev/fd`. Resolved once and proved by listing a
+ * real descriptor, so an unsupported platform fails loudly here instead of
+ * silently degrading to path re-resolution.
+ */
+let fdNamespace: string | null | undefined;
+
+function resolveFdNamespace(): string {
+  if (fdNamespace !== undefined) {
+    if (fdNamespace === null) {
+      throw new UnsafeStoragePathError(
+        "no /proc/self/fd or /dev/fd: descriptor-relative access is unavailable on this platform, " +
+          "and falling back to path re-resolution would reintroduce the race",
+      );
+    }
+    return fdNamespace;
+  }
+  for (const candidate of ["/proc/self/fd", "/dev/fd"]) {
+    try {
+      const probe = fsSync.openSync(os.tmpdir(), fsSync.constants.O_RDONLY | fsSync.constants.O_DIRECTORY);
+      try {
+        fsSync.readdirSync(`${candidate}/${probe}`);
+      } finally {
+        fsSync.closeSync(probe);
+      }
+      fdNamespace = candidate;
+      return candidate;
+    } catch {
+      /* try the next one */
+    }
+  }
+  fdNamespace = null;
+  return resolveFdNamespace();
+}
+
+function fdPath(fd: number, child?: string): string {
+  const base = `${resolveFdNamespace()}/${fd}`;
+  return child === undefined ? base : `${base}/${child}`;
+}
+
+/**
+ * Creates the missing directories of `parts` one level at a time, each `mkdir`
+ * relative to a pinned descriptor.
+ *
+ * `fs.mkdir(recursive: true)` is avoided deliberately: it follows a symlinked
+ * component and is not atomic with respect to any check. Here every level is an
+ * `mkdirat` against the descriptor of its parent, so a swap of the textual path
+ * is irrelevant — the descriptor is the base. A pre-existing component is opened
+ * as a directory, which refuses a symlink (`O_NOFOLLOW`) rather than following
+ * it.
+ */
+function makeDirChain(root: string, parts: string[]): void {
+  const constants = fsSync.constants;
+  const opened: number[] = [];
+  const closeAll = (): void => {
+    for (const fd of opened.reverse()) {
+      try {
+        fsSync.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    }
+  };
+  try {
+    // The root itself may not exist yet (the first write creates it), and its
+    // ancestors may be symlinks the operator chose. It is therefore the one
+    // component resolved through `realpath`; everything below it is fd-relative.
+    const resolvedRoot = resolveExistingPrefix(path.resolve(root));
+    const missingRoot: string[] = [];
+    let existingBase = resolvedRoot;
+    while (lstatOrNull(existingBase) === null) {
+      missingRoot.push(path.basename(existingBase));
+      const parent = path.dirname(existingBase);
+      if (parent === existingBase) break;
+      existingBase = parent;
+    }
+    let current = fsSync.openSync(
+      existingBase,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    opened.push(current);
+    for (const part of [...missingRoot.reverse(), ...parts]) {
+      try {
+        fsSync.mkdirSync(fdPath(current, part));
+      } catch (error) {
+        // EEXIST is acceptable only if the entry is a real directory; the open
+        // below enforces that with O_NOFOLLOW | O_DIRECTORY.
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      current = fsSync.openSync(
+        fdPath(current, part),
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      opened.push(current);
+    }
+  } finally {
+    closeAll();
+  }
+}
+
+async function writeSerialized(root: string, safeTarget: string, data: Buffer): Promise<void> {
+  const relative = path.relative(resolveExistingPrefix(path.resolve(root)), safeTarget);
+  const parts = relative === "" ? [] : relative.split(path.sep);
+  const leaf = parts.pop();
+  if (leaf === undefined) throw new UnsafeStoragePathError(`cannot write to the upload root itself: ${safeTarget}`);
+
+  // Every directory below the root is created fd-relative, so `mkdir` can no
+  // longer be redirected by a swap of the textual path.
+  makeDirChain(root, parts);
+  const parent = openDirChain(root, parts);
+  const target = fdPath(parent.fd, leaf);
+  const constants = fsSync.constants;
+
+  let handle: Awaited<ReturnType<typeof fs.open>>;
+  let created = false;
+  try {
+    // The leaf is opened *relative to the pinned parent descriptor*, so the
+    // resolved path cannot move under us. `O_EXCL` refuses an existing entry
+    // instead of truncating it; `O_NOFOLLOW` refuses a link.
+    handle = await fs.open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o644);
+    created = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      parent.close();
+      throw error;
+    }
+    // It exists: open it for writing without truncating, then prove the
+    // descriptor is a file inside the pinned directory before emptying it.
+    handle = await fs.open(target, constants.O_WRONLY | constants.O_NOFOLLOW, 0o644);
   }
 
   let committed = false;
-  let identity: { dev: number; ino: number } | undefined;
   try {
-    // Proves what the *kernel* actually opened, not what the path resolves to
-    // now: `realpath` alone is defeated by a swap that is undone before it runs.
-    identity = await assertOpenedInsideRoot(root, safeTarget, handle);
-    // Truncation is now safe: this descriptor was just proven to be a file inside
-    // the root (both by path and by inode), so emptying it destroys nothing that
-    // lives outside. `truncate` acts on the descriptor, not on a path, so no
-    // swap can redirect it anywhere else.
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      throw new UnsafeStoragePathError(`${safeTarget} is not a regular file`);
+    }
+    // Truncation happens here and only here: on a descriptor obtained through a
+    // pinned directory chain, so there is no path left to swap.
     await handle.truncate(0);
     await handle.write(data, 0, data.length, 0);
     committed = true;
-    return;
   } finally {
+    parent.close();
     await handle.close().catch(() => undefined);
-    if (!committed) {
-      // Only the file this call created is removed, and only by identity: the
-      // path is re-proved to name the same inode as the closed descriptor, so a
-      // swap between the check and the unlink cannot point the deletion outside
-      // the root. If it cannot be proved, the leftover is reported, not removed.
-      await removeIfStillOurs(root, safeTarget, identity);
+    if (!committed && created) {
+      // The unlink is relative to the still-pinned parent descriptor, so it can
+      // only ever remove the entry this call created. If the descriptor is gone,
+      // the file is reported rather than removed through a re-resolved path.
+      try {
+        fsSync.unlinkSync(target);
+      } catch {
+        /* reported below by the caller's error */
+      }
     }
   }
 }

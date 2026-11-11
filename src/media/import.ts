@@ -23,7 +23,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { isLegalMediaName, nextFreeName, positionalStem, sanitizeBase } from "./naming";
 import { MediaError, processSourceImage, sha256Hex, type ProcessedImage } from "./process";
-import { UnsafePathError, resolveInside, writeFileInside } from "./tree";
+import { openDirInside, resolveInside, writeFileInside } from "./tree";
 import type { LessonImageContent } from "../content/model";
 
 export const MAX_IMAGES_PER_LESSON = 300;
@@ -72,13 +72,22 @@ export function assertLessonId(lessonId: number): void {
  * a different boundary from writing, and it needs its own guard.
  */
 export function listLessonMediaFiles(mediaRoot: string, lessonId: number): string[] {
-  const dir = resolveInside(mediaRoot, lessonMediaDir(mediaRoot, lessonId));
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".webp"))
-    .map((entry) => entry.name)
-    .sort();
+  // The directory is opened component by component relative to its parent's
+  // descriptor, then listed *through that descriptor*. A component swapped in the
+  // textual path after the walk began cannot redirect the listing: the kernel
+  // resolves against the pinned inode, and `readdir` on the fd has no path to
+  // re-resolve.
+  const dir = openDirInside(mediaRoot, lessonMediaDir(mediaRoot, lessonId));
+  if (dir === null) return [];
+  try {
+    return dir
+      .list()
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".webp"))
+      .map((entry) => entry.name)
+      .sort();
+  } finally {
+    dir.close();
+  }
 }
 
 /**
@@ -99,31 +108,33 @@ export function fileSha256(file: string, root?: string): string | null {
       return null;
     }
   }
-  let safe: string;
+  let parent: ReturnType<typeof openDirInside> = null;
   try {
-    safe = resolveInside(root, file);
-    // O_NOFOLLOW: the name we hash must not itself be a link.
-    const fd = fs.openSync(safe, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    // Open the *parent* directory fd-relatively and then the leaf relative to it.
+    // No path is resolved twice, so there is no window between a check and a read
+    // for a swap to exploit: the descriptor is the authority.
+    const safe = resolveInside(root, file);
+    parent = openDirInside(root, path.dirname(safe));
+    if (parent === null) return null;
+    const name = path.basename(safe);
+    let fd: number;
     try {
-      // `realpath` re-walks the chain the kernel walked, so a component that is a
-      // link right now is caught. It is not sufficient alone: an attacker can
-      // point a component outside for the open and restore it before this runs,
-      // leaving `realpath` reporting an inside path while the descriptor refers
-      // to an outside file. So the descriptor's identity is compared as well —
-      // inode and device must be the ones the resolved path names. And the bytes
-      // are read from the *descriptor*, never from a re-opened path.
-      const resolved = resolveInside(root, fs.realpathSync(safe));
-      const opened = fs.fstatSync(fd);
-      const named = fs.statSync(resolved);
-      if (opened.dev !== named.dev || opened.ino !== named.ino) {
-        throw new UnsafePathError(`${safe} was opened at a file it no longer names`);
-      }
+      fd = parent.open(name, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    } catch {
+      return null;
+    }
+    try {
+      // Belt and braces: the entry must be a regular file, checked on the
+      // descriptor itself rather than on a name.
+      if (!fs.fstatSync(fd).isFile()) return null;
       return sha256Hex(fs.readFileSync(fd));
     } finally {
       fs.closeSync(fd);
     }
   } catch {
     return null;
+  } finally {
+    parent?.close();
   }
 }
 

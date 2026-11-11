@@ -7,6 +7,7 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { validateContentTree, type TreeValidation } from "../content/validate";
 import type { LessonContent, UnitContent } from "../content/model";
@@ -272,6 +273,131 @@ function resolveExistingPrefix(target: string): string {
   const exists = lstatOrNull(current) !== null;
   const resolvedBase = exists ? fs.realpathSync(current) : current;
   return missing.length === 0 ? resolvedBase : path.join(resolvedBase, ...missing.reverse());
+}
+
+/**
+ * Opens an installed directory chain, one component at a time, relative to the
+ * descriptor of its parent.
+ *
+ * `openat` is not exposed by Node, but `/proc/self/fd/<n>/<child>` is the same
+ * operation: the kernel resolves `<child>` against the *inode* the descriptor is
+ * pinned to, so renaming or symlinking components of the textual path after the
+ * walk has begun cannot redirect it. `O_NOFOLLOW` refuses a symlinked component
+ * and `O_DIRECTORY` refuses a non-directory, both enforced by the kernel.
+ *
+ * The reader gets a descriptor, not a path: reading, listing and unlinking then
+ * happen relative to it, so there is no second resolution to race against.
+ *
+ * Returns `null` when a component does not exist (`ENOENT`), which for a reader
+ * means "nothing there" rather than an error.
+ */
+/**
+ * The directory descriptor namespace: Linux `/proc/self/fd`, and macOS/BSD
+ * `/dev/fd` (which is the same mechanism). Resolved once, and *proved* by
+ * opening a real descriptor and listing it — a platform without either is
+ * detected here rather than failing later with a confusing `ENOENT`.
+ */
+let fdNamespace: string | null | undefined;
+
+function resolveFdNamespace(): string {
+  if (fdNamespace !== undefined) {
+    if (fdNamespace === null) {
+      throw new UnsafePathError(
+        "this platform exposes no /proc/self/fd or /dev/fd descriptor namespace, so directory " +
+          "descriptor-relative access is unavailable; refusing to fall back to path re-resolution",
+      );
+    }
+    return fdNamespace;
+  }
+  for (const candidate of ["/proc/self/fd", "/dev/fd"]) {
+    try {
+      const probe = fs.openSync(os.tmpdir(), fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+      try {
+        fs.readdirSync(`${candidate}/${probe}`);
+      } finally {
+        fs.closeSync(probe);
+      }
+      fdNamespace = candidate;
+      return candidate;
+    } catch {
+      /* try the next one */
+    }
+  }
+  fdNamespace = null;
+  return resolveFdNamespace();
+}
+
+/** `<namespace>/<fd>/<child>`: the closest thing to `openat` Node exposes. */
+function at(fd: number, child?: string): string {
+  const base = `${resolveFdNamespace()}/${fd}`;
+  return child === undefined ? base : `${base}/${child}`;
+}
+
+export interface DirHandle {
+  fd: number;
+  /** Opens an entry inside this directory, resolved against the pinned inode. */
+  open: (name: string, flags: number) => number;
+  /** Lists this directory through the descriptor. */
+  list: () => fs.Dirent[];
+  close: () => void;
+}
+
+export function openDirInside(root: string, target: string): DirHandle | null {
+  const declaredRoot = path.resolve(root);
+  const resolvedRoot = resolveExistingPrefix(declaredRoot);
+  const candidates = resolvedRoot === declaredRoot ? [declaredRoot] : [declaredRoot, resolvedRoot];
+  const absoluteTarget = path.resolve(target);
+  let relative: string | null = null;
+  for (const candidate of candidates) {
+    const under = path.relative(candidate, absoluteTarget);
+    const escapes =
+      under !== "" && (under === ".." || under.startsWith(`..${path.sep}`) || path.isAbsolute(under));
+    if (!escapes) {
+      relative = under;
+      break;
+    }
+  }
+  if (relative === null) throw new UnsafePathError(`${absoluteTarget} is outside ${declaredRoot}`);
+
+  const parts = relative === "" ? [] : relative.split(path.sep);
+  const opened: number[] = [];
+  const closeAll = (): void => {
+    for (const fd of opened.reverse()) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    }
+  };
+  try {
+    let current = fs.openSync(resolvedRoot, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    opened.push(current);
+    for (const part of parts) {
+      current = fs.openSync(
+        at(current, part),
+        fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+      );
+      opened.push(current);
+    }
+    return {
+      fd: current,
+      open: (name: string, flags: number) => fs.openSync(at(current, name), flags),
+      list: () => fs.readdirSync(at(current), { withFileTypes: true }),
+      close: closeAll,
+    };
+  } catch (error) {
+    closeAll();
+    const code = (error as NodeJS.ErrnoException).code;
+    // Only "it is not there" is a quiet absence. A symlinked component (`ELOOP`)
+    // or a non-directory (`ENOTDIR`) is a refusal, not an empty result — silently
+    // returning "no files" would hide exactly the case the guard exists for.
+    if (code === "ENOENT") return null;
+    if (code === "ELOOP" || code === "ENOTDIR") {
+      throw new UnsafePathError(`${target} reaches through a symbolic link or a non-directory`);
+    }
+    throw error;
+  }
 }
 
 /** Throws unless `target` is safe to write to under `root`. */

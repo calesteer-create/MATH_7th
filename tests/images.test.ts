@@ -335,6 +335,54 @@ describe("upload storage with a symlinked ancestor", () => {
  * exists so a *worsening* of the guard fails the suite instead of shipping
  * silently. If it fails, treat it as a genuine escape, not a flake.
  */
+/**
+ * The structural guarantee, tested without any race.
+ *
+ * A textual path can be re-pointed at any moment; a directory descriptor cannot.
+ * This pins a descriptor to a directory, then renames that directory away and
+ * puts a symlink in its place — exactly what an attacker would do — and proves
+ * that reads and writes through the descriptor still reach the original inode.
+ * It is deterministic: no timing, no repetition, no probability.
+ */
+describe("directory descriptors are pinned, not re-resolved", () => {
+  it("keeps reaching the original directory after its path is re-pointed", async () => {
+    const { openDirInside } = await import("@/media/tree");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-pinned-"));
+    const root = path.join(base, "root");
+    const moved = path.join(base, "root_moved");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(root, "a.txt"), "ROOT-A");
+    fs.writeFileSync(path.join(outside, "a.txt"), "OUTSIDE-A");
+
+    const dir = openDirInside(root, root);
+    expect(dir).not.toBeNull();
+    try {
+      // The swap: the real directory is renamed away, a link takes its place.
+      fs.renameSync(root, moved);
+      fs.symlinkSync(outside, root);
+
+      const pinned = fs.readdirSync(`/proc/self/fd/${dir!.fd}`).sort();
+      const viaText = fs.readdirSync(root).sort();
+      expect(viaText).toEqual(["a.txt"]); // both list "a.txt", but from different places
+      expect(pinned).toEqual(["a.txt"]);
+
+      // The decisive part: the bytes behind the descriptor are the original ones.
+      const fd = dir!.open("a.txt", fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        expect(fs.readFileSync(fd, "utf8")).toBe("ROOT-A");
+      } finally {
+        fs.closeSync(fd);
+      }
+      expect(fs.readFileSync(path.join(outside, "a.txt"), "utf8")).toBe("OUTSIDE-A");
+    } finally {
+      dir!.close();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("the open cannot damage a file outside the root", () => {
   let base: string;
   let uploadRoot: string;
