@@ -57,33 +57,128 @@ export function readLesson(contentRoot: string, lessonId: number): { file: strin
  * leave a truncated or half-encoded record — the target is either the old bytes
  * or the new ones. The temporary file is removed if anything goes wrong.
  */
-export function writeJson(target: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  const temporary = `${target}.tmp-${process.pid}`;
+export function writeJson(root: string, target: string, value: unknown): void {
+  const safeTarget = resolveInside(root, target);
+  const directory = path.dirname(safeTarget);
+  // `recursive: true` would happily create directories through a symlink, so
+  // the parent is verified *after* creation as well as before it.
+  fs.mkdirSync(directory, { recursive: true });
+  resolveInside(root, directory);
+
+  const temporary = `${safeTarget}.tmp-${process.pid}`;
+  // O_NOFOLLOW: the last component must not be — nor become — a symlink.
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW;
   try {
-    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-    fs.renameSync(temporary, target);
+    const fd = fs.openSync(temporary, flags, 0o644);
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+    // Verified again immediately before the rename, which follows a symlinked
+    // directory component and would otherwise publish outside the root.
+    resolveInside(root, safeTarget);
+    fs.renameSync(temporary, safeTarget);
   } catch (error) {
     // Never let cleanup mask the real failure: on a read-only directory even
     // removing the temporary file is refused, and the caller needs the cause.
     try {
       fs.rmSync(temporary, { force: true });
     } catch {
-      /* the original error is the one that matters */
+      /* as above */
     }
     throw error;
   }
 }
 
 /**
- * True when `target` is `root` itself or lives beneath it, after resolving both.
- * Used to keep cleanup inside the tree the run was allowed to touch: a rollback
- * is a deletion path, so it must never act on a path it did not create.
+ * A path that is proven to stay inside a permitted root and to contain no
+ * symbolic link anywhere below it.
+ *
+ * Why not just `realpath` or `startsWith`: both are checks, and a check is
+ * separated from the write by a window in which the path can change. Worse,
+ * neither survives contact with the filesystem — `rename(2)` and `open(2)`
+ * follow a symlinked *directory* component, so `mediaRoot/thumbs -> /etc` is
+ * traversed by the kernel even though the string starts with `mediaRoot`.
+ *
+ * So this type means: every component below the root was verified with
+ * `lstat` to be a real directory, or (for the last component) the path does not
+ * exist yet. Anything that exists as a symlink — directory or file — or as a
+ * non-directory where a directory is required, is refused before any write.
  */
-function isInside(root: string, target: string): boolean {
-  const resolvedRoot = path.resolve(root);
-  const resolvedTarget = path.resolve(target);
-  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(resolvedRoot + path.sep);
+export type SafePath = string & { readonly __safePath: unique symbol };
+
+/** Thrown when a path is outside its root or reaches through a symlink. */
+export class UnsafePathError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnsafePathError";
+  }
+}
+
+function lstatOrNull(target: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(target);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/**
+ * Resolves `target` and proves it is inside `root` without traversing any
+ * symbolic link. Returns the real path string (absolute, `..` free) or throws
+ * `UnsafePathError`.
+ *
+ * `root` itself is normalised and is allowed to exist; it is not required to be
+ * a symlink-free name, because the operator chooses it (e.g. macOS `/tmp`).
+ * Everything *below* it must be real.
+ */
+export function resolveInside(root: string, target: string): SafePath {
+  const absoluteRoot = path.resolve(root);
+  const absoluteTarget = path.resolve(target);
+
+  // 1. Lexical containment: cheap, and it makes the component walk finite.
+  const relative = path.relative(absoluteRoot, absoluteTarget);
+  if (relative !== "" && (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))) {
+    throw new UnsafePathError(`${absoluteTarget} is outside ${absoluteRoot}`);
+  }
+
+  // 2. The root must be a real directory (or absent, in which case there is
+  //    nothing to write into yet).
+  const rootStat = lstatOrNull(absoluteRoot);
+  if (rootStat !== null && rootStat.isSymbolicLink()) {
+    throw new UnsafePathError(`root ${absoluteRoot} is a symbolic link`);
+  }
+  if (rootStat !== null && !rootStat.isDirectory()) {
+    throw new UnsafePathError(`root ${absoluteRoot} is not a directory`);
+  }
+
+  // 3. Walk every component below the root. A symlink anywhere is refused, and
+  //    the first non-existent component ends the walk: nothing below it exists,
+  //    so nothing below it can be a symlink.
+  const parts = relative === "" ? [] : relative.split(path.sep);
+  let current = absoluteRoot;
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    const stat = lstatOrNull(current);
+    if (stat === null) break;
+    if (stat.isSymbolicLink()) {
+      throw new UnsafePathError(`${current} is a symbolic link`);
+    }
+    const isLast = index === parts.length - 1;
+    if (!isLast && !stat.isDirectory()) {
+      throw new UnsafePathError(`${current} is not a directory`);
+    }
+  }
+
+  return absoluteTarget as SafePath;
+}
+
+/** Throws unless `target` is safe to write to under `root`. */
+export function assertSafePath(root: string, target: string): SafePath {
+  return resolveInside(root, target);
 }
 
 /**
@@ -109,13 +204,30 @@ export function rollbackWrites(
   let restored = 0;
   let skipped = 0;
   const failures: string[] = [];
-  const permitted = (target: string): boolean =>
-    allowedRoots.length > 0 && allowedRoots.some((root) => isInside(root, target));
+  /**
+   * A target is permitted only if it lies inside one of the allowed roots *and*
+   * reaches it without traversing a symlink. `resolveInside` is the same guard
+   * the write path uses, so deletion cannot be looser than creation.
+   */
+  const permitted = (target: string): { ok: true } | { ok: false; reason: string } => {
+    if (allowedRoots.length === 0) return { ok: false, reason: "no writable root was declared" };
+    let reason = "outside the writable tree";
+    for (const root of allowedRoots) {
+      try {
+        resolveInside(root, target);
+        return { ok: true };
+      } catch (error) {
+        if (error instanceof UnsafePathError) reason = error.message;
+      }
+    }
+    return { ok: false, reason };
+  };
 
   for (const target of [...createdFiles].reverse()) {
-    if (!permitted(target)) {
+    const check = permitted(target);
+    if (!check.ok) {
       skipped += 1;
-      failures.push(`refused to delete ${target}: outside the writable tree`);
+      failures.push(`refused to delete ${target}: ${check.reason}`);
       continue;
     }
     try {
@@ -126,9 +238,10 @@ export function rollbackWrites(
     }
   }
   for (const file of [...overwrittenFiles].reverse()) {
-    if (!permitted(file.path)) {
+    const check = permitted(file.path);
+    if (!check.ok) {
       skipped += 1;
-      failures.push(`refused to restore ${file.path}: outside the writable tree`);
+      failures.push(`refused to restore ${file.path}: ${check.reason}`);
       continue;
     }
     try {
@@ -144,9 +257,10 @@ export function rollbackWrites(
   // they are empty: leaving `thumbs/` behind would be a visible leftover even
   // though every file in it was undone.
   for (const dir of [...createdDirectories].reverse()) {
-    if (!permitted(dir)) {
+    const check = permitted(dir);
+    if (!check.ok) {
       skipped += 1;
-      failures.push(`refused to remove ${dir}: outside the writable tree`);
+      failures.push(`refused to remove ${dir}: ${check.reason}`);
       continue;
     }
     try {
@@ -163,13 +277,50 @@ export function rollbackWrites(
 }
 
 /**
+ * The lines `media:sync` prints after a failed commit phase.
+ *
+ * Kept here, not inline, so the "tree is unchanged" claim can be tested against
+ * every possible rollback outcome: it is only allowed when the rollback
+ * reported no failures at all. A rollback that could not finish must say so and
+ * keep the original cause visible — hiding it would describe a tree that is not
+ * the one on disk.
+ */
+export function formatRollbackReport(
+  cause: unknown,
+  rolled: { created: number; restored: number; skipped: number; failures: string[] },
+): { lines: string[]; failureLines: string[]; complete: boolean } {
+  const causeMessage = cause instanceof Error ? cause.message : String(cause);
+  const lines = [
+    `✗ writing failed: ${causeMessage}`,
+    `rollback: ${rolled.created} new file(s) deleted, ${rolled.restored} restored, ` +
+      `${rolled.skipped} refused (outside the tree)`,
+  ];
+  const complete = rolled.failures.length === 0;
+  if (complete) {
+    lines.push("the tree is unchanged.");
+    return { lines, failureLines: [], complete };
+  }
+  const failureLines = rolled.failures.map((failure) => `✗ rollback: ${failure}`);
+  lines.push(...failureLines);
+  lines.push(
+    "⚠ ROLLBACK INCOMPLETE — the tree may differ from how it was found; " +
+      "inspect the files listed above before re-running.",
+  );
+  return { lines, failureLines, complete };
+}
+
+/**
  * `mkdir -p` that records which directories it actually created, so a failed
  * commit can remove exactly those and nothing that was already there.
  */
-export function makeDirsTracked(dir: string, created: string[]): void {
+export function makeDirsTracked(root: string, dir: string, created: string[]): void {
+  // The whole chain is validated first: a symlinked component below the root is
+  // refused here rather than allowed to redirect every directory created below.
+  resolveInside(root, dir);
   const missing: string[] = [];
-  let current = dir;
-  while (!fs.existsSync(current)) {
+  let current = path.resolve(dir);
+  const absoluteRoot = path.resolve(root);
+  while (current !== absoluteRoot && lstatOrNull(current) === null) {
     missing.push(current);
     const parent = path.dirname(current);
     if (parent === current) break;
@@ -179,11 +330,12 @@ export function makeDirsTracked(dir: string, created: string[]): void {
     fs.mkdirSync(target);
     created.push(target);
   }
+  resolveInside(root, dir);
 }
 
 export function writeLesson(contentRoot: string, lesson: LessonContent): string {
   const target = path.join(contentRoot, "lessons", `${lesson.id}.json`);
-  writeJson(target, lesson);
+  writeJson(contentRoot, target, lesson);
   return target;
 }
 

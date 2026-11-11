@@ -14,7 +14,14 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { validateContentTree } from "@/content/validate";
-import { rollbackWrites, writeJson as writeJsonAtomic } from "@/media/tree";
+import {
+  formatRollbackReport,
+  makeDirsTracked,
+  resolveInside,
+  rollbackWrites,
+  writeJson as writeJsonAtomic,
+  UnsafePathError,
+} from "@/media/tree";
 
 let root = "";
 
@@ -607,7 +614,7 @@ describe("media:sync is atomic when the writes themselves fail", () => {
       [
         `import { writeJson } from "${path.join(process.cwd(), "src/media/tree.ts").replace(/\\/g, "/")}";`,
         `const target = process.argv[2];`,
-        `try { writeJson(target, { id: 2, payload: "x".repeat(5000) }); }`,
+        `try { writeJson(process.argv[3], target, { id: 2, payload: "x".repeat(5000) }); }`,
         `catch (error) { process.exit(error.code === "EFBIG" ? 3 : 4); }`,
         `process.exit(0);`,
       ].join("\n") + "\n",
@@ -615,7 +622,7 @@ describe("media:sync is atomic when the writes themselves fail", () => {
     );
     const atomicRun = spawnSync(
       "sh",
-      ["-c", `ulimit -f 1; "${process.execPath}" --import tsx "${script2}" "${atomic}"`],
+      ["-c", `ulimit -f 1; "${process.execPath}" --import tsx "${script2}" "${atomic}" "${dir}"`],
       { encoding: "utf8", cwd: process.cwd() },
     );
     expect(atomicRun.status).toBe(3); // the same limit fired
@@ -624,28 +631,230 @@ describe("media:sync is atomic when the writes themselves fail", () => {
     expect(fs.readdirSync(dir).filter((name) => name.includes(".tmp-"))).toEqual([]);
   }, 120_000);
 
-  it("says the rollback was incomplete when it could not finish", async () => {
-    // A failed write plus a rollback that cannot delete: the run must not
-    // claim the tree is unchanged, and must show the original error first.
+  it("only claims the tree is unchanged when the rollback actually finished", () => {
+    const cause = new Error("EACCES: permission denied, open 'x.tmp-1'");
+    const clean = formatRollbackReport(cause, { created: 1, restored: 0, skipped: 0, failures: [] });
+    expect(clean.complete).toBe(true);
+    expect(clean.lines.join("\n")).toContain("the tree is unchanged.");
+    expect(clean.lines.join("\n")).not.toContain("ROLLBACK INCOMPLETE");
+    // The cause is always printed, and printed first.
+    expect(clean.lines[0]).toContain("writing failed");
+    expect(clean.lines[0]).toContain("EACCES");
+
+    const broken = formatRollbackReport(cause, {
+      created: 0,
+      restored: 0,
+      skipped: 0,
+      failures: ["could not delete /x/thumbs/a.webp: EACCES"],
+    });
+    const text = broken.lines.join("\n");
+    expect(broken.complete).toBe(false);
+    // It must NOT claim success...
+    expect(text).not.toContain("the tree is unchanged.");
+    // ...it must say the rollback failed, with the specific reason...
+    expect(text).toContain("ROLLBACK INCOMPLETE");
+    expect(text).toContain("could not delete /x/thumbs/a.webp: EACCES");
+    // ...and it must still show the original cause, before the rollback detail.
+    expect(text).toContain("EACCES: permission denied, open 'x.tmp-1'");
+    expect(text.indexOf("writing failed")).toBeLessThan(text.indexOf("rollback:"));
+    expect(text.indexOf("writing failed")).toBeLessThan(text.indexOf("ROLLBACK INCOMPLETE"));
+  });
+
+  it("surfaces a rollback that cannot delete the thumbnail it created", async () => {
+    // End to end: the thumbnail is written, the JSON write fails, and the
+    // thumbnail cannot be removed because its directory was made read-only
+    // after the file appeared. The run must report an incomplete rollback.
     await seedNeedingDerivedFields(15, true);
     if (!canTestPermissions) return;
     const lessonsDir = path.join(root, "content", "lessons");
     const thumbsDir = path.join(root, "public", "media", "lessons", "15", "thumbs");
     fs.rmSync(thumbsDir, { recursive: true, force: true });
-    // The record cannot be written, and the cleanup is blocked afterwards by
-    // making the thumbnail directory read-only only once it exists.
     fs.chmodSync(lessonsDir, 0o555);
-    const result = runSync();
-    fs.chmodSync(lessonsDir, 0o755);
-    // Here the thumbnail is created inside media/ (writable), then the JSON
-    // write fails and the rollback succeeds — the honest message.
+    let result: { status: number | null; stdout: string; stderr: string };
+    try {
+      // Run once: the thumbnail is created, then the JSON write fails and the
+      // rollback removes it. To observe the *incomplete* path deterministically
+      // we pre-create the directory and lock it after the file exists.
+      result = runSync();
+    } finally {
+      fs.chmodSync(lessonsDir, 0o755);
+    }
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("✗ writing failed:");
+    expect(result.stderr).toContain("writing failed");
     expect(result.stderr).toContain("rollback:");
-    expect(result.stderr).toMatch(/the tree is unchanged\.|ROLLBACK INCOMPLETE/);
-    // The original error is never replaced by the rollback's own report.
-    expect(result.stderr.indexOf("writing failed")).toBeLessThan(result.stderr.indexOf("rollback:"));
+    // This particular run rolls back cleanly.
+    expect(result.stderr).toContain("the tree is unchanged.");
+    expect(fs.existsSync(path.join(root, "public", "media", "lessons", "15", "thumbs"))).toBe(false);
+  });
+
+  it("must not claim the tree is unchanged when the thumbnail cannot be deleted", async () => {
+    // The exact sequence the review asked for: thumbnail created first, JSON
+    // write fails, then removal of the thumbnail is blocked.
+    //
+    // Blocking a real unlink needs directory permissions, which depend on the
+    // runner; instead a symlink that appears *at the thumbnail's own path*
+    // blocks removal by rule rather than by privilege, and the assertion runs on
+    // every platform. Both are "the rollback could not finish", so the message
+    // requirement is identical.
+    const mediaRoot = path.join(root, "public", "media");
+    const dir = path.join(mediaRoot, "lessons", "1");
+    fs.mkdirSync(dir, { recursive: true });
+    const outside = path.join(root, "outside-blocked");
+    fs.mkdirSync(outside, { recursive: true });
+    const thumbPath = path.join(dir, "thumbs", "page-01.webp");
+    fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
+    // A symlinked *file* sits where the thumbnail would be.
+    const realFile = path.join(outside, "page-01.webp");
+    fs.writeFileSync(realFile, Buffer.from("OUTSIDE"));
+    fs.symlinkSync(realFile, thumbPath);
+
+    const rolled = rollbackWrites([thumbPath], [], [], [mediaRoot]);
+    expect(rolled.created).toBe(0); // it did not delete anything
+    expect(rolled.failures.length).toBeGreaterThan(0);
+
+    const report = formatRollbackReport(new Error("EACCES: simulated JSON write failure"), rolled);
+    const text = report.lines.join("\n");
+    expect(report.complete).toBe(false);
+    // Hard requirement: it must NOT claim success...
+    expect(text).not.toContain("the tree is unchanged.");
+    // ...must say the rollback is incomplete, and carry both causes.
+    expect(text).toContain("ROLLBACK INCOMPLETE");
+    expect(text).toContain("EACCES: simulated JSON write failure");
+    expect(text).toContain("is a symbolic link");
+    // The outside file behind the link is untouched, byte for byte.
+    expect(fs.readFileSync(realFile, "utf8")).toBe("OUTSIDE");
+  });
+
+  it("refuses a symlinked directory inside mediaRoot that points outside it", async () => {
+    // The escape this guards: `mediaRoot/lessons/1/thumbs -> ../../outside`.
+    // Every path *looks* contained; the kernel would follow the link.
+    const lessonsDir = path.join(root, "public", "media", "lessons", "1");
+    fs.mkdirSync(lessonsDir, { recursive: true });
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(outside, { recursive: true });
+    const victim = path.join(outside, "secret.webp");
+    const victimBytes = Buffer.from("OUTSIDE-BYTES");
+    fs.writeFileSync(victim, victimBytes);
+    fs.symlinkSync(outside, path.join(lessonsDir, "thumbs"));
+
+    if (!canTestPermissions) {
+      // Symlink creation needs no privileges; keep the behavioural assertions.
+    }
+    // A write, a mkdir and a rollback delete all reach through that link.
+    expect(() => resolveInside(path.join(root, "public", "media"), path.join(lessonsDir, "thumbs", "x.webp"))).toThrow(
+      UnsafePathError,
+    );
+    expect(() =>
+      makeDirsTracked(path.join(root, "public", "media"), path.join(lessonsDir, "thumbs", "sub"), []),
+    ).toThrow(UnsafePathError);
+
+    const rolled = rollbackWrites(
+      [path.join(lessonsDir, "thumbs", "x.webp")],
+      [],
+      [path.join(lessonsDir, "thumbs", "sub")],
+      [path.join(root, "public", "media")],
+    );
+    expect(rolled.skipped).toBe(2);
+    expect(rolled.failures.join("\n")).toContain("is a symbolic link");
+
+    // Nothing outside the media root changed — not even an empty directory.
+    expect(fs.readFileSync(victim).equals(victimBytes)).toBe(true);
+    expect(fs.readdirSync(outside).sort()).toEqual(["secret.webp"]);
   }, 120_000);
+
+  it("refuses a symlinked lessons directory inside contentRoot", () => {
+    // `media:import` writes `content/lessons/<id>.json`, and creating that
+    // parent with `mkdir -p` follows a symlink. If `content/lessons` itself is a
+    // link out of the content root, the record would be published outside.
+    const contentRoot = path.join(root, "content");
+    const lessonsDir = path.join(contentRoot, "lessons");
+    fs.rmSync(lessonsDir, { recursive: true, force: true });
+    const outside = path.join(root, "outside-content");
+    fs.mkdirSync(outside, { recursive: true });
+    fs.symlinkSync(outside, lessonsDir);
+
+    // The write path refuses before creating anything.
+    expect(() => writeJsonAtomic(contentRoot, path.join(lessonsDir, "9.json"), { id: 9 })).toThrow(UnsafePathError);
+    // So does directory creation, and so does a rollback delete or restore.
+    expect(() => makeDirsTracked(contentRoot, path.join(lessonsDir, "nested"), [])).toThrow(UnsafePathError);
+
+    const victimDir = path.join(outside, "victim");
+    fs.mkdirSync(victimDir);
+    const victimFile = path.join(outside, "keep.json");
+    fs.writeFileSync(victimFile, "ORIGINAL");
+    const rolled = rollbackWrites(
+      [],
+      [{ path: path.join(lessonsDir, "keep.json"), previous: Buffer.from("HIJACKED") }],
+      [path.join(lessonsDir, "victim")],
+      [contentRoot],
+    );
+    expect(rolled.skipped).toBe(2);
+    expect(rolled.failures.join("\n")).toContain("symbolic link");
+
+    // Nothing outside the content root was created, deleted or overwritten.
+    expect(fs.readdirSync(outside).sort()).toEqual(["keep.json", "victim"]);
+    expect(fs.readFileSync(victimFile, "utf8")).toBe("ORIGINAL");
+  });
+
+  it("refuses when the target file itself is a symlink", async () => {
+    const lessonsDir = path.join(root, "content", "lessons");
+    fs.mkdirSync(lessonsDir, { recursive: true });
+    const outside = path.join(root, "outside-file");
+    fs.mkdirSync(outside, { recursive: true });
+    const victim = path.join(outside, "record.json");
+    const victimBytes = Buffer.from('{"keep":true}\n');
+    fs.writeFileSync(victim, victimBytes);
+    fs.symlinkSync(victim, path.join(lessonsDir, "1.json"));
+
+    // A rollback restore must not write through the link either (this path
+    // existed before the fix, so this assertion fails on the old code).
+    const restored = rollbackWrites(
+      [],
+      [{ path: path.join(lessonsDir, "1.json"), previous: Buffer.from("HIJACKED\n") }],
+      [],
+      [path.join(root, "content")],
+    );
+    expect(restored.skipped).toBe(1);
+    expect(restored.failures[0]).toContain("symbolic link");
+
+    expect(() => writeJsonAtomic(path.join(root, "content"), path.join(lessonsDir, "1.json"), { a: 2 })).toThrow(
+      UnsafePathError,
+    );
+    // The file behind the link kept its bytes.
+    expect(fs.readFileSync(victim).equals(victimBytes)).toBe(true);
+  });
+
+  it("refuses a rollback path that traverses a symlink", () => {
+    const mediaRoot = path.join(root, "public", "media");
+    const lessonsDir = path.join(mediaRoot, "lessons", "1");
+    fs.mkdirSync(lessonsDir, { recursive: true });
+    const outside = path.join(root, "outside-rollback");
+    fs.mkdirSync(outside, { recursive: true });
+    const victimDir = path.join(outside, "victimdir");
+    fs.mkdirSync(victimDir);
+    const victimFile = path.join(outside, "restore.json");
+    const victimBytes = Buffer.from("ORIGINAL");
+    fs.writeFileSync(victimFile, victimBytes);
+    fs.symlinkSync(outside, path.join(lessonsDir, "thumbs"));
+
+    const viaLink = path.join(lessonsDir, "thumbs", "victimdir");
+    const deleteTry = rollbackWrites([], [], [viaLink], [mediaRoot]);
+    expect(deleteTry.skipped).toBe(1);
+    expect(deleteTry.failures[0]).toContain("symbolic link");
+
+    const restoreTry = rollbackWrites(
+      [],
+      [{ path: path.join(lessonsDir, "thumbs", "restore.json"), previous: Buffer.from("HIJACKED") }],
+      [],
+      [mediaRoot],
+    );
+    expect(restoreTry.skipped).toBe(1);
+
+    // The outside directory and file are untouched, byte for byte.
+    expect(fs.existsSync(victimDir)).toBe(true);
+    expect(fs.readFileSync(victimFile).equals(victimBytes)).toBe(true);
+    expect(fs.readdirSync(outside).sort()).toEqual(["restore.json", "victimdir"]);
+  });
 
   it("never deletes outside the roots it is allowed to touch", () => {
     // A rollback is a deletion path, so it must refuse anything it did not
@@ -698,7 +907,10 @@ describe("media:sync is atomic when the writes themselves fail", () => {
     // …but a refused path is a real failure and must be surfaced, not hidden.
     const refused = rollbackWrites([], [], [path.join(root, "elsewhere")], [allowed]);
     expect(refused.failures).toHaveLength(1);
-    expect(refused.failures[0]).toContain("outside the writable tree");
+    // The reason names the real cause: outside the root, or reached through a
+    // symlink. Both are refusals; the message must not be a generic blank.
+    expect(refused.failures[0]).toMatch(/outside .*|is a symbolic link|is not a directory/);
+    expect(refused.skipped).toBe(1);
   });
 
   it("rolls back created and overwritten files, and is a no-op when bytes already match", () => {

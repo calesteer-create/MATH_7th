@@ -27,7 +27,17 @@ import { THUMB_MAX_EDGE, THUMB_QUALITY, detectMime } from "../src/media/format";
 import { sha256Hex } from "../src/media/process";
 import { canonicalMediaFile, isLegalMediaName } from "../src/media/naming";
 import { buildReferenceIndex, collectedQuizReferences } from "../src/media/sync-helpers";
-import { defaultPaths, makeDirsTracked, nowIso, readLessons, readQuizFiles, rollbackWrites, writeJson } from "../src/media/tree";
+import {
+  defaultPaths,
+  makeDirsTracked,
+  nowIso,
+  readLessons,
+  readQuizFiles,
+  formatRollbackReport,
+  resolveInside,
+  rollbackWrites,
+  writeJson,
+} from "../src/media/tree";
 import { validateContentTree } from "../src/content/validate";
 import type { LessonContent, LessonImageContent } from "../src/content/model";
 
@@ -350,14 +360,28 @@ async function main(): Promise<void> {
   };
   try {
     for (const thumb of pendingThumbs) {
-      rememberFile(thumb.path);
-      makeDirsTracked(path.dirname(thumb.path), createdDirectories);
-      fs.writeFileSync(thumb.path, thumb.buffer);
+      // Thumbnail writes go through the same containment guard: a symlinked
+      // directory inside mediaRoot must not become a route out of it.
+      const safeThumb = resolveInside(paths.mediaRoot, thumb.path);
+      rememberFile(safeThumb);
+      makeDirsTracked(paths.mediaRoot, path.dirname(safeThumb), createdDirectories);
+      // O_NOFOLLOW so the final component cannot be (or become) a symlink.
+      const thumbFlags =
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+      const thumbFd = fs.openSync(safeThumb, thumbFlags, 0o644);
+      try {
+        fs.writeFileSync(thumbFd, thumb.buffer);
+      } finally {
+        fs.closeSync(thumbFd);
+      }
     }
     for (const pending of pendingWrites) {
-      const target = path.join(paths.contentRoot, "lessons", pending.file);
+      const target = resolveInside(
+        paths.contentRoot,
+        path.join(paths.contentRoot, "lessons", pending.file),
+      );
       rememberFile(target);
-      writeJson(target, pending.lesson);
+      writeJson(paths.contentRoot, target, pending.lesson);
     }
   } catch (error) {
     const rolled = rollbackWrites(
@@ -368,20 +392,9 @@ async function main(): Promise<void> {
       [paths.contentRoot, paths.mediaRoot],
     );
     // The original failure is reported first and in full — it is the cause.
-    console.error(`\n✗ writing failed: ${(error as Error).message}`);
-    console.error(
-      `  rollback: ${rolled.created} new file(s) deleted, ${rolled.restored} restored, ` +
-        `${rolled.skipped} refused (outside the tree)`,
-    );
-    for (const failure of rolled.failures) console.error(`  ✗ rollback: ${failure}`);
-    if (rolled.failures.length === 0) {
-      console.error("  the tree is unchanged.");
-    } else {
-      console.error(
-        "  ⚠ ROLLBACK INCOMPLETE — the tree may differ from how it was found; " +
-          "inspect the files listed above before re-running.",
-      );
-    }
+    const report = formatRollbackReport(error, rolled);
+    console.error("");
+    for (const line of report.lines) console.error(`  ${line}`);
     process.exit(1);
   }
   if (pendingWrites.length > 0) {
