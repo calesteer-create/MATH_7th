@@ -360,11 +360,28 @@ async function main(): Promise<void> {
       writeJson(target, pending.lesson);
     }
   } catch (error) {
-    const restored = rollbackWrites(createdFiles, overwrittenFiles, createdDirectories);
-    console.error(
-      `\n✗ writing failed (${(error as Error).message}); ` +
-        `rolled back ${restored.created} new and ${restored.restored} overwritten file(s) — the tree is unchanged`,
+    const rolled = rollbackWrites(
+      createdFiles,
+      overwrittenFiles,
+      createdDirectories,
+      // A rollback deletes: confine it to the two trees this run may write.
+      [paths.contentRoot, paths.mediaRoot],
     );
+    // The original failure is reported first and in full — it is the cause.
+    console.error(`\n✗ writing failed: ${(error as Error).message}`);
+    console.error(
+      `  rollback: ${rolled.created} new file(s) deleted, ${rolled.restored} restored, ` +
+        `${rolled.skipped} refused (outside the tree)`,
+    );
+    for (const failure of rolled.failures) console.error(`  ✗ rollback: ${failure}`);
+    if (rolled.failures.length === 0) {
+      console.error("  the tree is unchanged.");
+    } else {
+      console.error(
+        "  ⚠ ROLLBACK INCOMPLETE — the tree may differ from how it was found; " +
+          "inspect the files listed above before re-running.",
+      );
+    }
     process.exit(1);
   }
   if (pendingWrites.length > 0) {

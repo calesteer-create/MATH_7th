@@ -7,6 +7,7 @@
  * that quietly reintroduces a public write path fails CI instead of shipping.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
@@ -153,6 +154,56 @@ describe("media tooling only writes inside the repository's own tree", () => {
       // Empty-directory cleanup is allowed only under the repository's own
       // tree; what must never appear is a directory removal by path string.
       expect(text).not.toMatch(/\brmdir\b(?!Sync)/);
+    }
+  });
+
+  it("deletion helpers are confined to an explicit, caller-supplied root", async () => {
+    // The textual check above cannot see behaviour: `rmdirSync(path)` looks
+    // identical whether the path is contained or not. These assertions call the
+    // API directly, so a future helper that deletes whatever it is given — or
+    // one that silently ignores a refused path — fails here.
+    const { rollbackWrites } = await import("@/media/tree");
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "no-public-write-"));
+    try {
+      const allowed = path.join(sandbox, "public", "media");
+      const victim = path.join(sandbox, "outside", "victim");
+      fs.mkdirSync(path.join(allowed, "lessons", "1"), { recursive: true });
+      fs.mkdirSync(victim, { recursive: true });
+      const fileVictim = path.join(sandbox, "outside", "keep.txt");
+      fs.writeFileSync(fileVictim, "must survive");
+
+      const targets = [
+        victim, // absolute, outside the allowed root
+        path.join(sandbox, "outside", "not-there", "..", "victim"), // traversal
+        "/tmp", // unrelated absolute path
+        process.cwd(), // the repository root
+      ];
+      // Deleting a *file* and restoring over one is refused on the same rule.
+      for (const target of targets) {
+        const dirResult = rollbackWrites([], [], [target], [allowed]);
+        expect(dirResult.skipped, target).toBe(1);
+        expect(dirResult.failures.length, target).toBeGreaterThan(0);
+
+        const fileResult = rollbackWrites([target], [], [], [allowed]);
+        expect(fileResult.skipped, target).toBe(1);
+        expect(fileResult.failures.length, target).toBeGreaterThan(0);
+
+        const restoreResult = rollbackWrites([], [{ path: target, previous: Buffer.from("x") }], [], [allowed]);
+        expect(restoreResult.skipped, target).toBe(1);
+      }
+
+      // Nothing outside the allowed root was deleted or overwritten.
+      expect(fs.existsSync(victim)).toBe(true);
+      expect(fs.readFileSync(fileVictim, "utf8")).toBe("must survive");
+      expect(fs.existsSync(path.join(process.cwd(), "package.json"))).toBe(true);
+      expect(fs.existsSync("/tmp")).toBe(true);
+
+      // Sanity: without any allowed root nothing is deletable at all.
+      const noRoots = rollbackWrites([targets[0]!], [], [targets[0]!]);
+      expect(noRoots.skipped).toBe(2);
+      expect(fs.existsSync(victim)).toBe(true);
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
     }
   });
 

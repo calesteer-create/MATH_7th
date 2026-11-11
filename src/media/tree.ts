@@ -76,46 +76,90 @@ export function writeJson(target: string, value: unknown): void {
 }
 
 /**
+ * True when `target` is `root` itself or lives beneath it, after resolving both.
+ * Used to keep cleanup inside the tree the run was allowed to touch: a rollback
+ * is a deletion path, so it must never act on a path it did not create.
+ */
+function isInside(root: string, target: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(resolvedRoot + path.sep);
+}
+
+/**
  * Undoes the files a failed commit phase touched: deletes what it created and
  * restores the previous bytes of what it overwrote. A file whose bytes already
  * match is left alone, so this is safe to call after a partially applied batch.
+ *
+ * Deletion is confined to `allowedRoots`: an entry that resolves outside every
+ * one of them is **refused**, never removed, and reported as a failure. The
+ * caller records the paths, but a rollback must not be a way to reach the rest
+ * of the filesystem if a path is ever wrong or hostile.
+ *
+ * Failures are returned, never swallowed: the caller has to be able to say
+ * whether the tree really is unchanged instead of assuming it.
  */
 export function rollbackWrites(
   createdFiles: string[],
   overwrittenFiles: Array<{ path: string; previous: Buffer }>,
   createdDirectories: string[] = [],
-): { created: number; restored: number } {
+  allowedRoots: string[] = [],
+): { created: number; restored: number; skipped: number; failures: string[] } {
   let created = 0;
   let restored = 0;
+  let skipped = 0;
+  const failures: string[] = [];
+  const permitted = (target: string): boolean =>
+    allowedRoots.length > 0 && allowedRoots.some((root) => isInside(root, target));
+
   for (const target of [...createdFiles].reverse()) {
+    if (!permitted(target)) {
+      skipped += 1;
+      failures.push(`refused to delete ${target}: outside the writable tree`);
+      continue;
+    }
     try {
       fs.rmSync(target, { force: true });
       created += 1;
-    } catch {
-      /* reported by the shortfall in the counts */
+    } catch (error) {
+      failures.push(`could not delete ${target}: ${(error as Error).message}`);
     }
   }
   for (const file of [...overwrittenFiles].reverse()) {
+    if (!permitted(file.path)) {
+      skipped += 1;
+      failures.push(`refused to restore ${file.path}: outside the writable tree`);
+      continue;
+    }
     try {
       const current = fs.existsSync(file.path) ? fs.readFileSync(file.path) : null;
       if (current !== null && current.equals(file.previous)) continue;
       fs.writeFileSync(file.path, file.previous);
       restored += 1;
-    } catch {
-      /* as above */
+    } catch (error) {
+      failures.push(`could not restore ${file.path}: ${(error as Error).message}`);
     }
   }
   // Directories the run created are removed too, deepest first, but only if
   // they are empty: leaving `thumbs/` behind would be a visible leftover even
   // though every file in it was undone.
   for (const dir of [...createdDirectories].reverse()) {
+    if (!permitted(dir)) {
+      skipped += 1;
+      failures.push(`refused to remove ${dir}: outside the writable tree`);
+      continue;
+    }
     try {
-      fs.rmdirSync(dir);
-    } catch {
-      /* not empty or already gone — either way, nothing to do */
+      fs.rmdirSync(dir); // empty directories only; never recursive
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // "Not empty" or "already gone" is a successful no-op, not a failure.
+      if (code !== "ENOTEMPTY" && code !== "ENOENT") {
+        failures.push(`could not remove ${dir}: ${(error as Error).message}`);
+      }
     }
   }
-  return { created, restored };
+  return { created, restored, skipped, failures };
 }
 
 /**

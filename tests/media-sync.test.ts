@@ -624,6 +624,83 @@ describe("media:sync is atomic when the writes themselves fail", () => {
     expect(fs.readdirSync(dir).filter((name) => name.includes(".tmp-"))).toEqual([]);
   }, 120_000);
 
+  it("says the rollback was incomplete when it could not finish", async () => {
+    // A failed write plus a rollback that cannot delete: the run must not
+    // claim the tree is unchanged, and must show the original error first.
+    await seedNeedingDerivedFields(15, true);
+    if (!canTestPermissions) return;
+    const lessonsDir = path.join(root, "content", "lessons");
+    const thumbsDir = path.join(root, "public", "media", "lessons", "15", "thumbs");
+    fs.rmSync(thumbsDir, { recursive: true, force: true });
+    // The record cannot be written, and the cleanup is blocked afterwards by
+    // making the thumbnail directory read-only only once it exists.
+    fs.chmodSync(lessonsDir, 0o555);
+    const result = runSync();
+    fs.chmodSync(lessonsDir, 0o755);
+    // Here the thumbnail is created inside media/ (writable), then the JSON
+    // write fails and the rollback succeeds — the honest message.
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("✗ writing failed:");
+    expect(result.stderr).toContain("rollback:");
+    expect(result.stderr).toMatch(/the tree is unchanged\.|ROLLBACK INCOMPLETE/);
+    // The original error is never replaced by the rollback's own report.
+    expect(result.stderr.indexOf("writing failed")).toBeLessThan(result.stderr.indexOf("rollback:"));
+  }, 120_000);
+
+  it("never deletes outside the roots it is allowed to touch", () => {
+    // A rollback is a deletion path, so it must refuse anything it did not
+    // create — even when it is handed the path directly.
+    const allowed = path.join(root, "public", "media");
+    fs.mkdirSync(allowed, { recursive: true });
+    const victim = path.join(root, "outside", "empty-victim");
+    fs.mkdirSync(victim, { recursive: true });
+    const withFile = path.join(root, "outside", "has-file");
+    fs.mkdirSync(withFile, { recursive: true });
+    fs.writeFileSync(path.join(withFile, "keep.txt"), "must survive");
+
+    const hostile = [
+      victim, // absolute, outside the allowed root
+      path.join(root, "outside", "..", "outside", "empty-victim"), // traversal
+      "../../../../../../tmp", // dot-dot chain
+      "/home/user", // unrelated absolute path
+      process.cwd(), // the repository root itself
+      withFile, // still has a file in it
+    ];
+    for (const target of hostile) {
+      const result = rollbackWrites([], [], [target], [allowed]);
+      expect(result.failures.length, target).toBeGreaterThan(0);
+      expect(result.skipped, target).toBe(1);
+    }
+    // Nothing outside the allowed root was touched.
+    expect(fs.existsSync(victim)).toBe(true);
+    expect(fs.existsSync(path.join(withFile, "keep.txt"))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), "package.json"))).toBe(true);
+    expect(fs.existsSync("/tmp")).toBe(true);
+
+    // ...while a directory it did create, inside the root, is still cleaned up.
+    const mine = path.join(allowed, "lessons", "1", "thumbs");
+    fs.mkdirSync(mine, { recursive: true });
+    const ok = rollbackWrites([], [], [mine], [allowed]);
+    expect(ok.failures).toEqual([]);
+    expect(fs.existsSync(mine)).toBe(false);
+  });
+
+  it("reports a rollback that could not complete instead of claiming success", () => {
+    // A directory that still holds a file cannot be removed; that is a no-op…
+    const allowed = path.join(root, "public", "media");
+    const busy = path.join(allowed, "lessons", "1", "thumbs");
+    fs.mkdirSync(busy, { recursive: true });
+    fs.writeFileSync(path.join(busy, "keep.webp"), "x");
+    const noop = rollbackWrites([], [], [busy], [allowed]);
+    expect(noop.failures).toEqual([]); // ENOTEMPTY is "nothing to undo"
+    expect(fs.existsSync(busy)).toBe(true);
+
+    // …but a refused path is a real failure and must be surfaced, not hidden.
+    const refused = rollbackWrites([], [], [path.join(root, "elsewhere")], [allowed]);
+    expect(refused.failures).toHaveLength(1);
+    expect(refused.failures[0]).toContain("outside the writable tree");
+  });
+
   it("rolls back created and overwritten files, and is a no-op when bytes already match", () => {
     const created = path.join(root, "content", "lessons", "created.json");
     const overwritten = path.join(root, "content", "lessons", "overwritten.json");
@@ -640,9 +717,12 @@ describe("media:sync is atomic when the writes themselves fail", () => {
         { path: overwritten, previous },
         { path: untouched, previous: fs.readFileSync(untouched) },
       ],
+      [],
+      [path.join(root, "content")],
     );
 
-    expect(result).toEqual({ created: 1, restored: 1 });
+    expect({ created: result.created, restored: result.restored }).toEqual({ created: 1, restored: 1 });
+    expect(result.failures).toEqual([]);
     expect(fs.existsSync(created)).toBe(false);
     expect(fs.readFileSync(overwritten, "utf8")).toBe(previous.toString("utf8"));
     expect(fs.readFileSync(untouched, "utf8")).toBe('{\n  "state": "same"\n}\n');
