@@ -15,6 +15,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { openDir, openDirUnder, readFileAt } from "../lib/dirfd";
 import {
   GRADING_MODES,
   IMAGE_FILE_RE,
@@ -386,10 +387,19 @@ function validateLessonImage(
 
   const file = raw["file"];
   if (typeof file !== "string" || !IMAGE_FILE_RE.test(file)) {
+    // The CMS stores the asset's public path (`/media/lessons/3/page-01.webp`)
+    // while the model requires a bare name. That is reconciled by
+    // `npm run media:sync` (src/media/naming.ts#canonicalMediaFile), not here —
+    // the validator stays strict so an unexpected shape is never silently
+    // accepted. Point the reader at the repair, not just the rule.
+    const looksLikePath = typeof file === "string" && file.includes("/");
     issue(
       "IMAGE_FILE_INVALID",
       "/file",
-      `file must match ${IMAGE_FILE_RE} (bare lowercase webp name, no directories)`,
+      `file must match ${IMAGE_FILE_RE} (bare lowercase webp name, no directories)` +
+        (looksLikePath
+          ? ` — got ${JSON.stringify(file)}; run \`npm run media:sync\` to canonicalise CMS-written paths`
+          : ""),
     );
   }
   const thumb = raw["thumb"];
@@ -728,6 +738,21 @@ function validateQuizQuestion(
 
 /* ── tree loading & cross-file checks ──────────────────────────────────── */
 
+/**
+ * True when `target` really is inside `root` after resolution.
+ *
+ * Defence in depth for the media checks below. Today `IMAGE_FILE_RE` already
+ * makes an escaping name impossible (no separators, no dots before `.webp`), so
+ * this never fires — but the safety of `path.join(...)` here would otherwise
+ * depend on a regex in a different module. If that rule is ever widened, the
+ * containment check is what still stops a read outside the media root.
+ */
+function isInsideRoot(root: string, target: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(resolvedRoot + path.sep);
+}
+
 export interface LoadedTree {
   units: Map<number, { unit: UnitContent; file: string }>;
   lessons: Map<number, { lesson: LessonContent; file: string }>;
@@ -758,7 +783,137 @@ function isWebpMagic(buffer: Buffer): boolean {
   );
 }
 
-export function validateContentTree(contentRoot: string, mediaRoot?: string): TreeValidation {
+/**
+ * Records a caller is about to commit, keyed by `lessons/<file>`.
+ *
+ * `media:sync` uses this to validate the tree it is *about* to write: it builds
+ * every corrected record in memory, asks for a verdict on those, and only then
+ * touches the disk. Without it the validator would judge the stale file and
+ * report a path as invalid one line after the sync canonicalised it.
+ *
+ * Overrides replace the parsed record for that file only; they never introduce
+ * a file that does not exist on disk, so counts and cross-file checks are
+ * unaffected.
+ */
+export interface TreeValidationOptions {
+  lessonOverrides?: ReadonlyMap<string, LessonContent>;
+}
+
+/**
+ * Reads a media file relative to the media root, descriptor by descriptor.
+ *
+ * Returns `null` when the file is absent. A symlinked component is refused rather
+ * than followed, so validation cannot be tricked into hashing a file outside the
+ * tree — which would otherwise let a record's `sha256` be "valid" against bytes
+ * that are not part of the repository.
+ */
+function readMediaInside(resolvedMediaRoot: string, relative: string): Buffer | null {
+  let rootHandle: ReturnType<typeof openDir> | null = null;
+  let parent: ReturnType<typeof openDir> | null = null;
+  try {
+    if (!fs.existsSync(resolvedMediaRoot)) return null;
+    const parts = relative.split("/").filter((part) => part !== "" && part !== ".");
+    const leaf = parts.pop();
+    if (leaf === undefined) return null;
+    rootHandle = openDir(resolvedMediaRoot);
+    parent = openDirUnder(rootHandle, parts);
+    return readFileAt(parent, leaf);
+  } catch {
+    return null;
+  } finally {
+    parent?.close();
+    rootHandle?.close();
+  }
+}
+
+/**
+ * Walks `mediaRoot/lessons` and reports unreferenced `.webp` files.
+ *
+ * Every step is relative to an open directory descriptor, and a level that is a
+ * symbolic link is skipped: its target is not part of this repository, so neither
+ * its files nor its absence may influence the result. Descriptors are closed in
+ * `finally` at each level.
+ */
+function scanOrphansByDescriptor(
+  resolvedMediaRoot: string,
+  referencedMedia: Set<string>,
+  warn: (code: string, file: string, message: string) => void,
+): void {
+  if (!fs.existsSync(resolvedMediaRoot)) return;
+  let rootHandle: ReturnType<typeof openDir> | null = null;
+  let lessonsHandle: ReturnType<typeof openDirUnder> | null = null;
+  try {
+    rootHandle = openDir(resolvedMediaRoot);
+    try {
+      lessonsHandle = openDirUnder(rootHandle, ["lessons"]);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return; // no media yet
+      throw error;
+    }
+    if (lessonsHandle === null) return;
+
+    for (const entry of lessonsHandle.list()) {
+      const lessonDirName = entry.name;
+      if (!/^\d+$/.test(lessonDirName)) continue;
+      // A lesson "folder" that is a link is not walked: its contents are outside.
+      // `lstat` on the entry: a link is skipped, never traversed.
+      if (entry.isSymbolicLink()) continue;
+      if (!entry.isDirectory()) continue;
+
+      let lessonHandle: ReturnType<typeof openDirUnder> | null = null;
+      try {
+        lessonHandle = openDirUnder(lessonsHandle, [lessonDirName]);
+        walkOrphanDir(lessonHandle, `lessons/${lessonDirName}`, "", referencedMedia, warn);
+      } catch {
+        // A folder that cannot be opened is not evidence of anything; skip it.
+        continue;
+      } finally {
+        lessonHandle?.close();
+      }
+    }
+  } finally {
+    lessonsHandle?.close();
+    rootHandle?.close();
+  }
+}
+
+/** Recursive half of `scanOrphansByDescriptor`, one descriptor per level. */
+function walkOrphanDir(
+  dir: ReturnType<typeof openDirUnder>,
+  sitePrefix: string,
+  prefix: string,
+  referencedMedia: Set<string>,
+  warn: (code: string, file: string, message: string) => void,
+): void {
+  for (const entry of dir.list()) {
+    const name = entry.name;
+    const rel = prefix === "" ? name : `${prefix}/${name}`;
+    if (entry.isSymbolicLink()) continue; // never followed
+    if (entry.isDirectory()) {
+      let child: ReturnType<typeof openDirUnder> | null = null;
+      try {
+        child = openDirUnder(dir, [name]);
+        walkOrphanDir(child, sitePrefix, rel, referencedMedia, warn);
+      } catch {
+        continue;
+      } finally {
+        child?.close();
+      }
+      continue;
+    }
+    if (!entry.isFile()) continue; // FIFO, socket, device: not a media file
+    const siteRel = `${sitePrefix}/${rel}`;
+    if (name.toLowerCase().endsWith(".webp") && !referencedMedia.has(siteRel)) {
+      warn("IMAGE_ORPHAN", siteRel, "file on disk is not referenced by any lesson");
+    }
+  }
+}
+
+export function validateContentTree(
+  contentRoot: string,
+  mediaRoot?: string,
+  options: TreeValidationOptions = {},
+): TreeValidation {
   const errors: ContentIssue[] = [];
   const warnings: ContentIssue[] = [];
   const error = (code: string, path: string, message: string) =>
@@ -808,8 +963,11 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
 
   /* Lesson files. */
   const lessons = new Map<number, { lesson: LessonContent; file: string }>();
-  for (const { file, raw } of readJsonFiles(path.join(contentRoot, "lessons"))) {
+  for (const { file, raw: rawFromDisk } of readJsonFiles(path.join(contentRoot, "lessons"))) {
     const label = `lessons/${file}`;
+    // A pending write wins: the caller is validating what it is about to commit.
+    const override = options.lessonOverrides?.get(label);
+    const raw: unknown = override ?? rawFromDisk;
     if (raw === undefined) {
       error("INVALID_JSON", label, "file does not contain valid JSON");
       continue;
@@ -944,13 +1102,25 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
       for (const image of lesson.images) {
         const rel = `lessons/${lesson.id}/${image.file}`;
         const full = path.join(resolvedMediaRoot, "lessons", String(lesson.id), image.file);
+        const thumbFullEarly = path.join(resolvedMediaRoot, "lessons", String(lesson.id), image.thumb);
+        if (!isInsideRoot(resolvedMediaRoot, full) || !isInsideRoot(resolvedMediaRoot, thumbFullEarly)) {
+          error(
+            "IMAGE_PATH_ESCAPES_MEDIA_ROOT",
+            `${file}#/images`,
+            `${rel} resolves outside the media root; refusing to read it`,
+          );
+          continue;
+        }
         referencedMedia.add(rel);
         referencedMedia.add(`lessons/${lesson.id}/${image.thumb}`);
-        if (!fs.existsSync(full)) {
+        // Read through a pinned descriptor rather than by path: `existsSync` then
+        // `readFileSync` is a check-then-use pair, and the media tree is written by
+        // uploads. The bytes come from the descriptor that was verified.
+        const buffer = readMediaInside(resolvedMediaRoot, rel);
+        if (buffer === null) {
           error("IMAGE_NOT_FOUND", `${file}#/images`, `missing media file ${rel}`);
           continue;
         }
-        const buffer = fs.readFileSync(full);
         mediaBytes += buffer.byteLength;
         if (!isWebpMagic(buffer)) {
           error("IMAGE_NOT_WEBP", `${file}#/images`, `${rel} is not a WebP file`);
@@ -960,11 +1130,10 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
         if (digest !== image.sha256) {
           error("IMAGE_HASH_MISMATCH", `${file}#/images`, `sha256 of ${rel} does not match the lesson record`);
         }
-        const thumbFull = path.join(resolvedMediaRoot, "lessons", String(lesson.id), image.thumb);
-        if (!fs.existsSync(thumbFull)) {
+        const thumbBuffer = readMediaInside(resolvedMediaRoot, `lessons/${lesson.id}/${image.thumb}`);
+        if (thumbBuffer === null) {
           error("IMAGE_THUMB_NOT_FOUND", `${file}#/images`, `missing thumbnail lessons/${lesson.id}/${image.thumb}`);
         } else {
-          const thumbBuffer = fs.readFileSync(thumbFull);
           mediaBytes += thumbBuffer.byteLength;
           if (!isWebpMagic(thumbBuffer)) {
             error("IMAGE_NOT_WEBP", `${file}#/images`, `lessons/${lesson.id}/${image.thumb} is not a WebP file`);
@@ -973,27 +1142,12 @@ export function validateContentTree(contentRoot: string, mediaRoot?: string): Tr
       }
     }
     /* Orphan detection: files on disk not referenced by any lesson. */
-    const lessonsMedia = path.join(resolvedMediaRoot, "lessons");
-    if (fs.existsSync(lessonsMedia)) {
-      for (const lessonDirName of fs.readdirSync(lessonsMedia)) {
-        if (!/^\d+$/.test(lessonDirName)) continue;
-        const walk = (dir: string, prefix: string): void => {
-          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-            const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-            const full = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-              walk(full, rel);
-              continue;
-            }
-            const siteRel = `lessons/${lessonDirName}/${rel}`;
-            if (entry.name.toLowerCase().endsWith(".webp") && !referencedMedia.has(siteRel)) {
-              warn("IMAGE_ORPHAN", siteRel, "file on disk is not referenced by any lesson");
-            }
-          }
-        };
-        walk(path.join(lessonsMedia, lessonDirName), "");
-      }
-    }
+    // Walked by descriptor, not by path. `readdirSync(dir)` on `public/media` would
+    // enter whatever a symlinked lesson folder points at, so a directory outside
+    // the repository could both hide real orphans and manufacture warnings from
+    // files that are not part of the tree. `lstat` decides the type, so a link is
+    // skipped rather than followed.
+    scanOrphansByDescriptor(resolvedMediaRoot, referencedMedia, warn);
   }
 
   /* Cross-checks between quizzes and assessments. */

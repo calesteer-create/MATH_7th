@@ -23,6 +23,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { isLegalMediaName, nextFreeName, positionalStem, sanitizeBase } from "./naming";
 import { MediaError, processSourceImage, sha256Hex, type ProcessedImage } from "./process";
+import { UnsafePathError, resolveInside, writeFileInside } from "./tree";
+import { UnsafeComponentError, openDir, openDirUnder, relativeParts } from "../lib/dirfd";
 import type { LessonImageContent } from "../content/model";
 
 export const MAX_IMAGES_PER_LESSON = 300;
@@ -62,21 +64,116 @@ export function assertLessonId(lessonId: number): void {
   }
 }
 
-/** Reads `<mediaRoot>/lessons/<id>/*.webp` (not recursive, ignores thumbs/). */
+/**
+ * Reads `<mediaRoot>/lessons/<id>/*.webp` (not recursive, ignores thumbs/).
+ *
+ * The path is proved safe *before* the directory is touched: `readdir` follows a
+ * symlinked component, so a lesson folder that is a link out of `mediaRoot`
+ * would otherwise enumerate — and then hash — files outside the tree. Reading is
+ * a different boundary from writing, and it needs its own guard.
+ */
 export function listLessonMediaFiles(mediaRoot: string, lessonId: number): string[] {
-  const dir = lessonMediaDir(mediaRoot, lessonId);
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".webp"))
-    .map((entry) => entry.name)
-    .sort();
+  // Opened component by component relative to the parent descriptor and listed
+  // *through* that descriptor. A component swapped in the textual path after the
+  // walk began cannot redirect the listing: the kernel resolves against the
+  // pinned inode and `readdir` on the descriptor has no path to re-resolve.
+  const resolvedRoot = ((): string => {
+    const declared = path.resolve(mediaRoot);
+    try {
+      return fs.realpathSync(declared);
+    } catch {
+      return declared;
+    }
+  })();
+  const dirParts = relativeParts(resolvedRoot, path.join(resolvedRoot, "lessons", String(lessonId)));
+  let rootHandle;
+  try {
+    rootHandle = openDir(resolvedRoot);
+  } catch {
+    return []; // the media root does not exist yet
+  }
+  let dir;
+  try {
+    dir = openDirUnder(rootHandle, dirParts);
+  } catch (error) {
+    rootHandle.close();
+    // A missing folder is an empty listing; a symlinked or non-directory
+    // component is a refusal, and must not be flattened into "no files".
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    if (error instanceof UnsafeComponentError) throw new UnsafePathError(error.message);
+    throw error;
+  }
+  try {
+    return dir
+      .list()
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".webp"))
+      .map((entry) => entry.name)
+      .sort();
+  } finally {
+    dir.close();
+    rootHandle.close();
+  }
 }
 
-/** sha256 of an existing file, or null when it is missing/unreadable. */
-export function fileSha256(file: string): string | null {
+/**
+ * sha256 of an existing file, or null when it is missing/unreadable.
+ *
+ * When a `root` is given (every internal caller), the path is verified to stay
+ * inside it before a byte is read, and the *read* itself is then re-verified:
+ * `O_NOFOLLOW` protects the final component, and the resolved path is compared
+ * against the root afterwards so a component swapped in the interim cannot make
+ * this hash a file outside the tree. Without a root this is a plain hash and
+ * must not be handed an unverified path.
+ */
+export function fileSha256(file: string, root?: string): string | null {
+  if (root === undefined) {
+    try {
+      return sha256Hex(fs.readFileSync(file));
+    } catch {
+      return null;
+    }
+  }
+  let parent: ReturnType<typeof openDir> | null = null;
+  let fd: number | null = null;
   try {
-    return sha256Hex(fs.readFileSync(file));
+    // Open the parent directory fd-relatively, then the leaf relative to it. No
+    // path is resolved twice, so there is no check-then-read window: the
+    // descriptor is the authority and the bytes come from it.
+    const safe = resolveInside(root, file);
+    const resolvedRoot = ((): string => {
+      try {
+        return fs.realpathSync(path.resolve(root));
+      } catch {
+        return path.resolve(root);
+      }
+    })();
+    const parts = relativeParts(resolvedRoot, safe);
+    const leaf = parts.pop();
+    if (leaf === undefined) return null;
+
+    const rootHandle = openDir(resolvedRoot);
+    try {
+      parent = openDirUnder(rootHandle, parts);
+    } catch {
+      rootHandle.close();
+      return null;
+    }
+    try {
+      // `O_NONBLOCK` keeps the open from blocking on a FIFO planted at the name;
+      // the `fstat` below then refuses anything that is not a regular file.
+      fd = parent.open(
+        leaf,
+        fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+      );
+      // `fstat` on the descriptor itself: not a re-stat of a name.
+      if (!fs.fstatSync(fd).isFile()) return null;
+      return sha256Hex(fs.readFileSync(fd));
+    } catch {
+      return null;
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+      parent.close();
+    }
   } catch {
     return null;
   }
@@ -98,7 +195,7 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
 
   // 1. Same content already stored? Reuse the name (idempotent re-import).
   const onDisk = listLessonMediaFiles(mediaRoot, lessonId);
-  const reuse = onDisk.find((name) => fileSha256(path.join(dir, name)) === processed.sha256);
+  const reuse = onDisk.find((name) => fileSha256(path.join(dir, name), mediaRoot) === processed.sha256);
   const reused = reuse !== undefined;
   const record = existing.find((image) => image.sha256 === processed.sha256);
 
@@ -119,15 +216,21 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
 
   const webPath = path.join(dir, fileName);
   const thumbPath = path.join(dir, "thumbs", fileName);
-  assertInside(mediaRoot, webPath);
-  assertInside(mediaRoot, thumbPath);
+  // Same containment rule as media:sync, applied inside the library function so
+  // a direct caller is protected too — not only the CLI. A pre-existing symlink
+  // anywhere below mediaRoot is refused before anything is created.
+  //
+  // The *resolved* paths are what this function returns, so caller and disk
+  // agree even when mediaRoot is itself a symlink. Returning the unresolved
+  // spelling would describe files at a location that is not where they are.
+  const resolvedWebPath = resolveInside(mediaRoot, webPath);
+  const resolvedThumbPath = resolveInside(mediaRoot, thumbPath);
 
   if (!options.dryRun && !reused) {
-    fs.mkdirSync(path.join(dir, "thumbs"), { recursive: true });
-    // "wx" fails instead of overwriting: a name that slipped past the collision
-    // check can never clobber an existing page.
-    fs.writeFileSync(webPath, processed.web, { flag: "wx" });
-    fs.writeFileSync(thumbPath, processed.thumb, { flag: "wx" });
+    // Exclusive create: a name that slipped past the collision check can never
+    // clobber an existing page, and a symlink at either target is not followed.
+    writeFileInside(mediaRoot, resolvedWebPath, processed.web, { exclusive: true });
+    writeFileInside(mediaRoot, resolvedThumbPath, processed.thumb, { exclusive: true });
   }
 
   const position =
@@ -144,8 +247,8 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
       bytes: processed.sourceBytes,
       sha256: processed.sha256,
     },
-    webPath,
-    thumbPath,
+    webPath: resolvedWebPath,
+    thumbPath: resolvedThumbPath,
     reused,
     processed,
   };
@@ -154,13 +257,4 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
 function processedStem(label: string | undefined, existing: readonly LessonImageContent[], next: number): string {
   if (!label) return positionalStem(next);
   return label;
-}
-
-/** Defence in depth: every write path must stay under the media root. */
-function assertInside(mediaRoot: string, target: string): void {
-  const root = path.resolve(mediaRoot);
-  const resolved = path.resolve(target);
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-    throw new Error(`refusing to write outside the media root: ${resolved}`);
-  }
 }

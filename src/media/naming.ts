@@ -70,3 +70,74 @@ export function nextFreeName(base: string, isTaken: (candidate: string) => boole
 export function isLegalMediaName(name: string): boolean {
   return MEDIA_FILE_RE.test(name);
 }
+
+/* ── Canonicalisation of CMS-written paths ──────────────────────────────── */
+
+/**
+ * The forms a stored `images[].file` value may take, fully enumerated.
+ *
+ * Sveltia writes the asset's public path, built as `publicFolder + '/' + name`
+ * (`lib/utils/file/path.js` → `HJ`). With the collection folder configured as
+ * `/public/media/lessons/{{slug}}` and the public folder as
+ * `/media/lessons/{{slug}}`, the value is always one of the middle two shapes
+ * below. The bare form is accepted because it is the canonical one and the
+ * importer (`npm run media:import`) already writes it.
+ *
+ * The list is deliberately CLOSED: a value that matches none of these is not
+ * repaired by guessing, it is rejected. Every pattern is anchored, contains no
+ * `.*` across separators, and forbids `.`/`..` segments structurally — the
+ * character class `[a-z0-9][a-z0-9-]{0,60}` cannot express a dot except in the
+ * `.webp` suffix.
+ */
+const LESSON_FILE = "([a-z0-9][a-z0-9-]{0,60}\\.webp)";
+const CANONICAL_FORMS: ReadonlyArray<RegExp> = [
+  // 1. page-01.webp — what media:import writes and what the model expects.
+  new RegExp(`^${LESSON_FILE}$`),
+  // 2/3/4. A full public path for exactly this lesson.
+  new RegExp(`^/media/lessons/(\\d{1,9})/${LESSON_FILE}$`),
+  new RegExp(`^public/media/lessons/(\\d{1,9})/${LESSON_FILE}$`),
+  new RegExp(`^/public/media/lessons/(\\d{1,9})/${LESSON_FILE}$`),
+];
+
+/**
+ * Reduces a stored `images[].file` value to the bare, canonical filename.
+ *
+ * Returns `null` for anything that is not exactly one of CANONICAL_FORMS, or
+ * whose embedded lesson id disagrees with `lessonId`. It is a **parser, never a
+ * normaliser**: it does not call `path.normalize`, it does not strip `..`, `%`,
+ * `\`, `//` or a leading `./` to "make it work", and it never touches the file
+ * system. A legal name is returned unchanged (idempotent), so re-running
+ * `media:sync` cannot oscillate.
+ *
+ * Why so strict: the value ends up in a filesystem path
+ * (`path.join(mediaRoot, "lessons", id, file)`), so a permissive parser is a
+ * path-traversal hole. Refusing is always safe; a caller that gets `null` must
+ * report the record and leave it untouched.
+ */
+export function canonicalMediaFile(raw: unknown, lessonId: number): string | null {
+  if (typeof raw !== "string") return null;
+  if (!Number.isInteger(lessonId) || lessonId < 1) return null;
+  // Cheap structural refusals first, so a hostile value can never reach a regex
+  // that might be tempted to repair it. Whitespace (incl. newlines) is included
+  // because Sveltia trims file names and a mismatch means corruption, not slack.
+  if (raw.length === 0 || raw.length > 200) return null;
+  if (/[\s\\%]/.test(raw)) return null;
+  if (raw.includes("..") || raw.includes("//")) return null;
+  if (raw.startsWith("./") || raw.startsWith("@") || raw.includes(":")) return null;
+
+  for (const pattern of CANONICAL_FORMS) {
+    const match = pattern.exec(raw);
+    if (!match) continue;
+    // Forms 2–4 carry the lesson id; form 1 has no capture groups.
+    if (match.length === 2) {
+      return raw === match[1] ? match[1]! : null;
+    }
+    const [, embeddedId, fileName] = match;
+    // Exact string match, not `Number(...) === lessonId`: the entry's folder is
+    // named from `slug.template {{fields.id}}`, so `03` is never a folder this
+    // project writes. Accepting it would widen the contract for no reason.
+    if (embeddedId !== String(lessonId)) return null;
+    return fileName!;
+  }
+  return null;
+}

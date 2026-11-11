@@ -192,6 +192,35 @@ describe("lesson validation", () => {
     expect(codes(tree())).toContain("IMAGE_NOT_FOUND");
   });
 
+  /**
+   * Guard, not a regression: `30d763f` already refused this case, because the
+   * `isInsideRoot` check ran before the read. The change makes the refusal
+   * structural — the bytes now come from a pinned descriptor rather than from a
+   * path that was checked a moment earlier. So this test does not distinguish the
+   * two versions; it locks the behaviour in place for future changes.
+   */
+  it("refuses to read a media file that lives outside the root through a link", () => {
+    // `content:validate` hashes media to prove the record matches the bytes. If it
+    // follows a symlinked lesson folder it hashes a file that is not part of the
+    // repository — a record could then "validate" against bytes nobody reviewed,
+    // and an outside file would be opened by a validation run.
+    const outside = path.join(tmp, "outside-media");
+    fs.mkdirSync(outside, { recursive: true });
+    const realBytes = fs.readFileSync(path.join(tmp, "media", "lessons", "1", "page-01.webp"));
+    fs.writeFileSync(path.join(outside, "page-01.webp"), realBytes);
+    // Re-point the lesson folder at the outside copy.
+    const lessonDir = path.join(tmp, "media", "lessons", "1");
+    fs.rmSync(lessonDir, { recursive: true, force: true });
+    fs.symlinkSync(outside, lessonDir);
+
+    // The page exists through the link, so a path-based read would find it and
+    // accept the record. The descriptor read refuses the component instead.
+    const result = tree();
+    expect(codes(result)).toContain("IMAGE_NOT_FOUND");
+    // And the outside bytes were not consumed: the file is untouched.
+    expect(fs.readFileSync(path.join(outside, "page-01.webp"))).toEqual(realBytes);
+  });
+
   it("fails when a media file's hash does not match the lesson record", () => {
     const file = path.join(tmp, "media", "lessons", "1", "page-01.webp");
     const buf = fs.readFileSync(file);
@@ -389,5 +418,109 @@ describe("validateUnit (unit seeded shape)", () => {
     const { value, issues } = validateUnit(raw, "units/1.json");
     expect(issues).toEqual([]);
     expect(value?.accent).toBe("teal");
+  });
+});
+
+/**
+ * Defence in depth for the media reads (validate.ts).
+ *
+ * Today `IMAGE_FILE_RE` makes an escaping name impossible — no separators, no
+ * dots before `.webp` — so the containment guard never fires. That is exactly
+ * why it is worth pinning: the safety of `path.join(mediaRoot, "lessons", id,
+ * file)` must not rest on a regex in a different module. The guard is also
+ * checked for over-eagerness, so a legal record still validates cleanly.
+ */
+describe("media containment guard", () => {
+  const NOW = "2026-11-01T10:00:00.000Z";
+  let guardRoot = "";
+
+  function seed(file: string, thumbSha: string): { content: string; media: string } {
+    const content = path.join(guardRoot, "content");
+    const media = path.join(guardRoot, "public", "media");
+    const write = (target: string, value: unknown) => {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, JSON.stringify(value, null, 2));
+    };
+    write(path.join(content, "units", "1.json"), {
+      id: 1, position: 1, titleAr: "وحدة", titleEn: "U",
+      descriptionAr: "", descriptionEn: "", pageFrom: "", pageTo: "",
+      accent: "teal", createdAt: NOW, updatedAt: NOW,
+    });
+    write(path.join(content, "lessons", "1.json"), {
+      id: 1, unitId: 1, position: 1, titleAr: "درس", titleEn: "", pageLabel: "",
+      status: "draft", isLastInUnit: false, publishedAt: null,
+      contentUpdatedAt: NOW, createdAt: NOW, updatedAt: NOW,
+      images: [{ position: 1, file: "page-01.webp", thumb: "thumbs/page-01.webp", sha256: thumbSha }],
+    });
+    void file;
+    return { content, media };
+  }
+
+  beforeEach(() => {
+    guardRoot = fs.mkdtempSync(path.join(os.tmpdir(), "math7-guard-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(guardRoot, { recursive: true, force: true });
+  });
+
+  it("still reports a missing media root rather than throwing", () => {
+    const { content } = seed("lessons/1/page-01.webp", "a".repeat(64));
+    const result = validateContentTree(content, path.join(guardRoot, "no-such-media"));
+    expect(result.warnings.some((issue) => issue.code === "MEDIA_ROOT_MISSING")).toBe(true);
+  });
+
+  it("validates a legal record on disk with no errors (guard is not over-eager)", async () => {
+    const sharp = (await import("sharp")).default;
+    const buffer = await sharp({
+      create: { width: 40, height: 60, channels: 3, background: "#eeeeee" },
+    })
+      .webp()
+      .toBuffer();
+    const digest = crypto.createHash("sha256").update(buffer).digest("hex");
+    const { content, media } = seed("lessons/1/page-01.webp", digest);
+    fs.mkdirSync(path.join(media, "lessons", "1", "thumbs"), { recursive: true });
+    fs.writeFileSync(path.join(media, "lessons", "1", "page-01.webp"), buffer);
+    fs.writeFileSync(path.join(media, "lessons", "1", "thumbs", "page-01.webp"), buffer);
+
+    const result = validateContentTree(content, media);
+    expect(result.errors).toEqual([]);
+  });
+});
+
+/**
+ * Orphan scan must not enter a folder through a link.
+ *
+ * The scan used to `readdirSync(path)` each lesson folder. A lesson name that is a
+ * symlink to a directory outside the repository made the validator list that
+ * directory, so files that are not part of the tree produced `IMAGE_ORPHAN`
+ * warnings — and real orphans inside the tree could be masked.
+ */
+describe("orphan scan stays inside the media root", () => {
+  it("does not descend into a symlinked lesson folder", () => {
+    const outside = path.join(tmp, "outside-lessons");
+    fs.mkdirSync(outside, { recursive: true });
+    // A WebP outside the repository that no lesson references.
+    fs.writeFileSync(path.join(outside, "stray.webp"), fs.readFileSync(path.join(tmp, "media", "lessons", "1", "page-01.webp")));
+    // Lesson folder "2" is a link to that outside directory.
+    const linked = path.join(tmp, "media", "lessons", "2");
+    fs.rmSync(linked, { recursive: true, force: true });
+    fs.symlinkSync(outside, linked);
+
+    const result = tree();
+    const orphans = result.warnings.filter((w) => w.code === "IMAGE_ORPHAN");
+
+    // No warning was manufactured from the outside file.
+    expect(orphans.map((w) => w.path)).not.toContain("lessons/2/stray.webp");
+    expect(orphans.some((w) => String(w.path).includes("stray.webp"))).toBe(false);
+    // The outside directory was not modified.
+    expect(fs.readdirSync(outside)).toEqual(["stray.webp"]);
+  });
+
+  it("still reports a real orphan inside the tree", () => {
+    const inside = path.join(tmp, "media", "lessons", "1", "unreferenced.webp");
+    fs.writeFileSync(inside, fs.readFileSync(path.join(tmp, "media", "lessons", "1", "page-01.webp")));
+    const result = tree();
+    expect(result.warnings.map((w) => w.path)).toContain("lessons/1/unreferenced.webp");
   });
 });

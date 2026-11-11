@@ -7,6 +7,7 @@
  * that quietly reintroduces a public write path fails CI instead of shipping.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import YAML from "yaml";
@@ -80,13 +81,23 @@ describe("no code path writes to the public repository", () => {
     const config = YAML.parse(fs.readFileSync(path.join(ROOT, "public/admin/config.yml"), "utf8")) as {
       backend: { repo: string };
       media_folder: string;
-      collections: Array<{ name?: string; folder?: string; files?: Array<{ file: string }> }>;
+      collections: Array<{
+        name?: string;
+        folder?: string;
+        files?: Array<{ file: string }>;
+        media_folder?: string;
+      }>;
     };
     expect(config.backend.repo).toBe(DRAFT_REPO_DEFAULT);
-    expect(config.media_folder.startsWith("public/media/")).toBe(true);
+    // The root folder is `public/media` (templateless, see the G1 fix); a
+    // collection may narrow it further, but never outside `public/media/`.
+    const withinMediaRoot = (value: string) =>
+      value.replace(/^\/+/, "").startsWith("public/media/");
+    expect(config.media_folder === "public/media" || withinMediaRoot(config.media_folder)).toBe(true);
     for (const collection of config.collections) {
       if (!collection.name) continue;
       if (collection.folder) expect(collection.folder.startsWith("content/")).toBe(true);
+      if (collection.media_folder) expect(withinMediaRoot(collection.media_folder)).toBe(true);
       for (const file of collection.files ?? []) {
         expect(file.file.startsWith("content/")).toBe(true);
       }
@@ -140,18 +151,98 @@ describe("media tooling only writes inside the repository's own tree", () => {
       expect(text).not.toMatch(/rmSync\([^)]*recursive:\s*true/);
       expect(text).not.toMatch(/rm\([^)]*recursive:\s*true/);
       expect(text).not.toMatch(/unlinkSync|fs\.unlink\(/);
-      expect(text).not.toMatch(/rmdir/);
+      // Empty-directory cleanup is allowed only under the repository's own
+      // tree; what must never appear is a directory removal by path string.
+      expect(text).not.toMatch(/\brmdir\b(?!Sync)/);
     }
   });
 
-  it("refuses writes outside the media root", () => {
+  it("deletion helpers are confined to an explicit, caller-supplied root", async () => {
+    // The textual check above cannot see behaviour: `rmdirSync(path)` looks
+    // identical whether the path is contained or not. These assertions call the
+    // API directly, so a future helper that deletes whatever it is given — or
+    // one that silently ignores a refused path — fails here.
+    const { rollbackWrites } = await import("@/media/tree");
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "no-public-write-"));
+    try {
+      const allowed = path.join(sandbox, "public", "media");
+      const victim = path.join(sandbox, "outside", "victim");
+      fs.mkdirSync(path.join(allowed, "lessons", "1"), { recursive: true });
+      fs.mkdirSync(victim, { recursive: true });
+      const fileVictim = path.join(sandbox, "outside", "keep.txt");
+      fs.writeFileSync(fileVictim, "must survive");
+
+      const targets = [
+        victim, // absolute, outside the allowed root
+        path.join(sandbox, "outside", "not-there", "..", "victim"), // traversal
+        "/tmp", // unrelated absolute path
+        process.cwd(), // the repository root
+      ];
+      // Deleting a *file* and restoring over one is refused on the same rule.
+      for (const target of targets) {
+        const dirResult = rollbackWrites([], [], [target], [allowed]);
+        expect(dirResult.skipped, target).toBe(1);
+        expect(dirResult.failures.length, target).toBeGreaterThan(0);
+
+        const fileResult = rollbackWrites([target], [], [], [allowed]);
+        expect(fileResult.skipped, target).toBe(1);
+        expect(fileResult.failures.length, target).toBeGreaterThan(0);
+
+        const restoreResult = rollbackWrites([], [{ path: target, previous: Buffer.from("x") }], [], [allowed]);
+        expect(restoreResult.skipped, target).toBe(1);
+      }
+
+      // Nothing outside the allowed root was deleted or overwritten.
+      expect(fs.existsSync(victim)).toBe(true);
+      expect(fs.readFileSync(fileVictim, "utf8")).toBe("must survive");
+      expect(fs.existsSync(path.join(process.cwd(), "package.json"))).toBe(true);
+      expect(fs.existsSync("/tmp")).toBe(true);
+
+      // Sanity: without any allowed root nothing is deletable at all.
+      const noRoots = rollbackWrites([targets[0]!], [], [targets[0]!]);
+      expect(noRoots.skipped).toBe(2);
+      expect(fs.existsSync(victim)).toBe(true);
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses writes outside the media root", async () => {
     const text = fs.readFileSync(path.join(ROOT, "src/media/import.ts"), "utf8");
-    expect(text).toContain("refusing to write outside the media root");
-    // Every file write uses the exclusive "wx" flag, so an existing page is
-    // never overwritten by a name collision.
-    const writes = text.match(/writeFileSync\([^;]+/g) ?? [];
-    expect(writes.length).toBeGreaterThanOrEqual(2);
-    for (const call of writes) expect(call).toContain('flag: "wx"');
+    // The containment rule now lives in one place, so `import.ts` must route
+    // every write through it rather than carrying its own lexical check.
+    expect(text).not.toMatch(/function assertInside/);
+    expect(text).toContain("resolveInside(mediaRoot, webPath)");
+    expect(text).toContain("resolveInside(mediaRoot, thumbPath)");
+
+    // Behaviour, not source text: a symlinked directory inside the media root
+    // must not receive a file, and the outside victim must keep its bytes.
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "no-public-write-import-"));
+    try {
+      const { importImageIntoLesson } = await import("@/media/import");
+      const { UnsafePathError } = await import("@/media/tree");
+      const mediaRoot = path.join(sandbox, "public", "media");
+      const outside = path.join(sandbox, "outside");
+      fs.mkdirSync(mediaRoot, { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      fs.writeFileSync(path.join(outside, "keep.txt"), "ORIGINAL");
+      fs.symlinkSync(outside, path.join(mediaRoot, "lessons"));
+
+      const sharpModule = (await import("sharp")).default;
+      const source = await sharpModule({
+        create: { width: 64, height: 64, channels: 3, background: "#fff" },
+      })
+        .jpeg()
+        .toBuffer();
+
+      await expect(importImageIntoLesson({ mediaRoot, lessonId: 1, source })).rejects.toBeInstanceOf(
+        UnsafePathError,
+      );
+      expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+      expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL");
+    } finally {
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 });
 

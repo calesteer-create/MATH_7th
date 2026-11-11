@@ -1,7 +1,13 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+/** The descriptor namespace this platform exposes, for the lifetime tests. */
+function fsSyncProbe(): string {
+  return fs.existsSync("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd";
+}
 import sharp from "sharp";
 import { detectMime, storeLessonImage } from "@/lib/images";
 import { mediaRoot, readKey } from "@/lib/storage";
@@ -82,4 +88,864 @@ describe("lesson image storage", () => {
     const meta = await sharp((await readKey(stored.webKey))!).metadata();
     expect(meta.exif).toBeUndefined();
   });
+});
+
+/**
+ * The upload directory is written by the admin server, not only by the media
+ * CLI, so it needs the same rule: a symlink planted inside it must not redirect
+ * a write or a delete outside the root.
+ */
+describe("upload storage refuses symlink escapes", () => {
+  let base: string;
+  let uploadRoot: string;
+  let outside: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-store-symlink-"));
+    uploadRoot = path.join(base, "uploads");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "keep.txt"), "ORIGINAL-BYTES");
+    fs.symlinkSync(outside, path.join(uploadRoot, "images"));
+    process.env.UPLOAD_DIR = uploadRoot;
+  });
+
+  afterAll(() => {
+    process.env.UPLOAD_DIR = tmp;
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("refuses to write through a symlinked directory", async () => {
+    const { writeKey } = await import("@/lib/storage");
+    await expect(writeKey("images/evil.bin", Buffer.from("PAYLOAD"))).rejects.toThrow(/symbolic link/);
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("refuses to delete through a symlinked directory", async () => {
+    const { resolveKey } = await import("@/lib/storage");
+    expect(() => resolveKey("images/keep.txt")).toThrow(/symbolic link/);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("still stores and reads a legitimate key", async () => {
+    const { writeKey, readKey } = await import("@/lib/storage");
+    await writeKey("real/ok.bin", Buffer.from("OK"));
+    expect((await readKey("real/ok.bin"))?.toString("utf8")).toBe("OK");
+  });
+});
+
+/**
+ * Point 5 of the review: the root policy used to be documented one way and
+ * implemented the other. The root is chosen by the operator, so it may itself
+ * be a symlink (macOS `/tmp` is); everything below it may not.
+ */
+describe("root symlink policy", () => {
+  let base: string;
+  let real: string;
+  let link: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-rootpolicy-"));
+    real = path.join(base, "real");
+    link = path.join(base, "link");
+    fs.mkdirSync(real, { recursive: true });
+    fs.symlinkSync(real, link);
+  });
+
+  afterAll(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("accepts a root that is itself a symlink", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    // Targets are expressed in the root's own namespace, which is what every
+    // caller does (`path.join(root, …)`).
+    expect(() => resolveInside(link, path.join(link, "lessons", "1.json"))).not.toThrow();
+  });
+
+  it("accepts either spelling of a symlinked root, and returns the resolved one", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    // A root with two names ("link" and "real") is still one boundary. Both
+    // spellings must work, and both must come back in the *resolved* namespace —
+    // the earlier design returned a resolved path that its own callers then
+    // re-checked against the unresolved root, which rejected valid writes.
+    const viaLink = resolveInside(link, path.join(link, "lessons", "1.json"));
+    const viaReal = resolveInside(link, path.join(real, "lessons", "1.json"));
+    const expected = path.join(fs.realpathSync(real), "lessons", "1.json");
+    expect(viaLink).toBe(expected);
+    expect(viaReal).toBe(expected);
+  });
+
+  it("still refuses a target that is under neither spelling", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    expect(() => resolveInside(link, path.join(base, "elsewhere.json"))).toThrow(/outside/);
+  });
+
+  it("still refuses a symlink below the root", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    const escape = path.join(base, "escape");
+    fs.mkdirSync(escape, { recursive: true });
+    fs.symlinkSync(escape, path.join(real, "linked"));
+    expect(() => resolveInside(link, path.join(link, "linked", "x.json"))).toThrow(/symbolic link/);
+  });
+
+  it("refuses a target outside the root even when the root is a symlink", async () => {
+    const { resolveInside } = await import("@/media/tree");
+    expect(() => resolveInside(link, path.join(base, "elsewhere.json"))).toThrow(/outside/);
+  });
+});
+
+/**
+ * A symlinked upload root is a normal deployment (macOS `/tmp`, a mounted
+ * volume). These drive the public `writeKey`/`readKey`/`deleteKey` surface —
+ * not the resolver — because the bug this guards was that the resolver's
+ * *return value* was in a different namespace than its callers expected.
+ */
+describe("upload storage with a symlinked root", () => {
+  let base: string;
+  let realDir: string;
+  let linkDir: string;
+  let outside: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-linked-root-"));
+    realDir = path.join(base, "real_uploads");
+    linkDir = path.join(base, "uploads_link");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(realDir, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "keep.txt"), "ORIGINAL-BYTES");
+    fs.symlinkSync(realDir, linkDir);
+    process.env.UPLOAD_DIR = linkDir;
+  });
+
+  afterAll(() => {
+    process.env.UPLOAD_DIR = tmp;
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("writes through a symlinked root into the real directory", async () => {
+    const { writeKey } = await import("@/lib/storage");
+    await writeKey("lesson/page.webp", Buffer.from("PAYLOAD"));
+
+    const onReal = path.join(realDir, "lesson", "page.webp");
+    expect(fs.existsSync(onReal)).toBe(true);
+    expect(fs.readFileSync(onReal, "utf8")).toBe("PAYLOAD");
+    // Nothing appeared anywhere else.
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("reads it back through the same root", async () => {
+    const { readKey } = await import("@/lib/storage");
+    const data = await readKey("lesson/page.webp");
+    expect(data?.toString("utf8")).toBe("PAYLOAD");
+  });
+
+  it("deletes only the intended file", async () => {
+    const { writeKey, deleteKey } = await import("@/lib/storage");
+    await writeKey("lesson/other.webp", Buffer.from("SECOND"));
+    await deleteKey("lesson/page.webp");
+
+    expect(fs.existsSync(path.join(realDir, "lesson", "page.webp"))).toBe(false);
+    // The sibling survives, and so does everything outside the root.
+    expect(fs.readFileSync(path.join(realDir, "lesson", "other.webp"), "utf8")).toBe("SECOND");
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+  });
+
+  it("refuses an escaping link through the public interface, silently for deleteKey", async () => {
+    const { writeKey, deleteKey, resolveKey } = await import("@/lib/storage");
+    fs.symlinkSync(outside, path.join(realDir, "images"));
+
+    await expect(writeKey("images/evil.bin", Buffer.from("X"))).rejects.toThrow(/symbolic link/);
+    expect(() => resolveKey("images/keep.txt")).toThrow(/symbolic link/);
+    // deleteKey swallows errors by contract, so the assertion is on the bytes.
+    await deleteKey("images/keep.txt");
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+
+    fs.unlinkSync(path.join(realDir, "images"));
+  });
+});
+
+/**
+ * The root may also be reached through a symlinked *ancestor*, not only through
+ * a symlink at the root itself: `realpathSync` resolves the whole chain.
+ */
+describe("upload storage with a symlinked ancestor", () => {
+  let base: string;
+  let realParent: string;
+  let linkedParent: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-linked-parent-"));
+    realParent = path.join(base, "real_parent");
+    linkedParent = path.join(base, "linked_parent");
+    fs.mkdirSync(realParent, { recursive: true });
+    fs.symlinkSync(realParent, linkedParent);
+    process.env.UPLOAD_DIR = path.join(linkedParent, "uploads");
+  });
+
+  afterAll(() => {
+    process.env.UPLOAD_DIR = tmp;
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("resolves the ancestor chain and writes at the real location", async () => {
+    const { writeKey, readKey, resolveKey } = await import("@/lib/storage");
+
+    // The resolved namespace is what makes the rest of the design consistent:
+    // the kernel would follow the ancestor symlink on its own, so "the bytes
+    // landed somewhere" proves nothing. What must hold is that the key resolves
+    // to the real path, so callers and comparisons agree.
+    expect(resolveKey("a/b.bin")).toBe(path.join(fs.realpathSync(realParent), "uploads", "a", "b.bin"));
+    expect(resolveKey("a/b.bin").startsWith(linkedParent)).toBe(false);
+
+    await writeKey("a/b.bin", Buffer.from("ANCESTOR"));
+    const landed = path.join(realParent, "uploads", "a", "b.bin");
+    expect(fs.readFileSync(landed, "utf8")).toBe("ANCESTOR");
+    expect((await readKey("a/b.bin"))?.toString("utf8")).toBe("ANCESTOR");
+  });
+
+  it("still refuses a symlink below a root reached through a symlinked ancestor", async () => {
+    const { writeKey, resolveKey } = await import("@/lib/storage");
+    const outsideDir = path.join(base, "outside-anc");
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, "keep.txt"), "ORIGINAL");
+    // The escape sits under the *real* parent, i.e. below the resolved root.
+    fs.mkdirSync(path.join(realParent, "uploads"), { recursive: true });
+    fs.symlinkSync(outsideDir, path.join(realParent, "uploads", "escape"));
+
+    expect(() => resolveKey("escape/keep.txt")).toThrow(/symbolic link/);
+    await expect(writeKey("escape/evil.bin", Buffer.from("X"))).rejects.toThrow(/symbolic link/);
+    expect(fs.readdirSync(outsideDir)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(path.join(outsideDir, "keep.txt"), "utf8")).toBe("ORIGINAL");
+  });
+});
+
+/**
+ * The post-`mkdir` re-check must be measured against the upload root. Passing
+ * the created directory as its own root makes the check vacuous — every path is
+ * inside itself — and hides a component that has become a symlink.
+ */
+/**
+ * Concurrency evidence, deliberately labelled as such.
+ *
+ * This is **not** a regression test in the strict sense: it asserts an invariant
+ * ("no payload byte of ours ever lands outside the root") rather than a
+ * difference from a previous commit, and the invariant is only probabilistically
+ * exercised. Passing it does NOT prove the race is closed — Node exposes no
+ * dirfd-relative `openat`, so a swap that wins the window remains possible. It
+ * exists so a *worsening* of the guard fails the suite instead of shipping
+ * silently. If it fails, treat it as a genuine escape, not a flake.
+ */
+/**
+ * The structural guarantee, tested without any race.
+ *
+ * A textual path can be re-pointed at any moment; a directory descriptor cannot.
+ * This pins a descriptor to a directory, then renames that directory away and
+ * puts a symlink in its place — exactly what an attacker would do — and proves
+ * that reads and writes through the descriptor still reach the original inode.
+ * It is deterministic: no timing, no repetition, no probability.
+ */
+describe("directory descriptors are pinned, not re-resolved", () => {
+  it("keeps reaching the original directory after its path is re-pointed", async () => {
+    const { openDir } = await import("@/lib/dirfd");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-pinned-"));
+    const root = path.join(base, "root");
+    const moved = path.join(base, "root_moved");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(root, "a.txt"), "ROOT-A");
+    fs.writeFileSync(path.join(outside, "a.txt"), "OUTSIDE-A");
+
+    const dir = openDir(root);
+    try {
+      // The swap: the real directory is renamed away, a link takes its place.
+      fs.renameSync(root, moved);
+      fs.symlinkSync(outside, root);
+
+      const pinned = dir.list().map((e) => e.name).sort();
+      const viaText = fs.readdirSync(root).sort();
+      expect(viaText).toEqual(["a.txt"]); // both list "a.txt", but from different places
+      expect(pinned).toEqual(["a.txt"]);
+
+      // The decisive part: the bytes behind the descriptor are the original ones.
+      const fd = dir.open("a.txt", fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        expect(fs.readFileSync(fd, "utf8")).toBe("ROOT-A");
+      } finally {
+        fs.closeSync(fd);
+      }
+      expect(fs.readFileSync(path.join(outside, "a.txt"), "utf8")).toBe("OUTSIDE-A");
+    } finally {
+      dir.close();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Descriptor lifetime.
+ *
+ * Cleanup used to run *after* the parent descriptor was closed, addressing it as
+ * `<ns>/<fd>/name`. That is a use-after-close, not merely a stale path: the
+ * number can be handed to an unrelated open, and the unlink then lands in
+ * whatever directory that new descriptor names. These tests pin the ordering and
+ * prove the failure mode is reachable, so the ordering cannot regress silently.
+ */
+describe("cleanup never outlives the descriptor it uses", () => {
+  let base: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fdlife-"));
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("shows that a number reused after close redirects an unlink", () => {
+    // The hazard, reproduced without touching the implementation: this is what
+    // the old cleanup order would have done if the number came back.
+    const A = path.join(base, "A");
+    const B = path.join(base, "B");
+    fs.mkdirSync(A);
+    fs.mkdirSync(B);
+    fs.writeFileSync(path.join(A, "mine.txt"), "MINE");
+    fs.writeFileSync(path.join(B, "mine.txt"), "SOMEONE-ELSE");
+
+    const first = fs.openSync(A, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    const stale = `${fsSyncProbe()}/${first}/mine.txt`;
+    fs.closeSync(first);
+    const second = fs.openSync(B, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+
+    if (second === first) {
+      // The kernel reused the number: the "stale" path now names B.
+      fs.unlinkSync(stale);
+      expect(fs.existsSync(path.join(B, "mine.txt"))).toBe(false);
+      expect(fs.existsSync(path.join(A, "mine.txt"))).toBe(true);
+    } else {
+      // Not reproducible on this run — assert only that A is untouched, so the
+      // test is meaningful either way and never flaky.
+      expect(fs.existsSync(path.join(A, "mine.txt"))).toBe(true);
+    }
+    fs.closeSync(second);
+  });
+
+  it("keeps the file when the write fails after creating it", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const root = path.join(base, "uploads");
+    const target = path.join(root, "lesson", "page.webp");
+
+    // A data buffer that throws while being written, after the file exists.
+    const exploding = {
+      length: 8,
+      // `Buffer` methods are what the implementation calls; mimic them precisely.
+      byteLength: 8,
+    } as unknown as Buffer;
+
+    await expect(writeInsideUploadRoot(root, target, exploding)).rejects.toBeTruthy();
+
+    // The cleanup ran with the parent descriptor still open, and it either
+    // removed the file or reported the leftover — never deleted anything else.
+    const dir = path.join(root, "lesson");
+    const entries = fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+    expect(entries.every((e) => e === "page.webp")).toBe(true);
+    expect(fs.readdirSync(base).sort()).toEqual(["uploads"]);
+  });
+
+  it("leaves nothing behind in a sibling directory when cleanup runs", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const root = path.join(base, "uploads");
+    const sibling = path.join(base, "sibling");
+    fs.mkdirSync(sibling);
+    fs.writeFileSync(path.join(sibling, "page.webp"), "SIBLING-MUST-SURVIVE");
+
+    await expect(
+      writeInsideUploadRoot(root, path.join(root, "page.webp"), {
+        length: 4,
+        byteLength: 4,
+      } as unknown as Buffer),
+    ).rejects.toBeTruthy();
+
+    expect(fs.readFileSync(path.join(sibling, "page.webp"), "utf8")).toBe("SIBLING-MUST-SURVIVE");
+  });
+});
+
+/**
+ * Races against the operations that used to re-resolve a path.
+ *
+ * Each test runs the attacker in a separate process, so the interleaving is not
+ * limited to this process's own `await` points. They assert the only thing that
+ * matters: nothing outside the root is read, written, deleted or restored.
+ * They are regression tests where the pre-fix behaviour was demonstrably wrong
+ * (noted per case), and guard tests otherwise.
+ */
+describe("no operation reaches outside the root under a live swap", () => {
+  let base: string;
+  let swapper: string;
+
+  function writeSwapper(): string {
+    const file = path.join(base, "swapper.cjs");
+    fs.writeFileSync(
+      file,
+      `const fs=require("fs"),path=require("path");
+       const [target,outside]=process.argv.slice(2);
+       for(let i=0;i<90000;i++){
+         try{fs.rmSync(target,{recursive:true,force:true});}catch{}
+         try{ i%2 ? fs.mkdirSync(target) : fs.symlinkSync(outside,target); }catch{}
+       }`,
+    );
+    return file;
+  }
+
+  async function withSwapper<T>(target: string, outside: string, run: () => Promise<T>): Promise<T> {
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [swapper, target, outside], { stdio: "ignore" });
+    try {
+      return await run();
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+  }
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-swap-op-"));
+    swapper = writeSwapper();
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("deleteInsideUploadRoot never removes an outside file", async () => {
+    const { deleteInsideUploadRoot } = await import("@/lib/storage-safe");
+    const root = path.join(base, "uploads");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(root, "lesson"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "page.webp"), "OUTSIDE-MUST-SURVIVE");
+
+    await withSwapper(path.join(root, "lesson"), outside, async () => {
+      for (let i = 0; i < 400; i += 1) {
+        await deleteInsideUploadRoot(root, path.join(root, "lesson", "page.webp")).catch(() => undefined);
+      }
+    });
+
+    expect(fs.existsSync(path.join(outside, "page.webp"))).toBe(true);
+    expect(fs.readFileSync(path.join(outside, "page.webp"), "utf8")).toBe("OUTSIDE-MUST-SURVIVE");
+  }, 60_000);
+
+  it("readKey never returns bytes from outside the upload root", async () => {
+    const storage = await import("@/lib/storage");
+    const root = path.join(base, "uploads");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(path.join(root, "lesson"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(root, "lesson", "page.webp"), "INSIDE-BYTES");
+    fs.writeFileSync(path.join(outside, "page.webp"), "OUTSIDE-SECRET-BYTES");
+
+    const previous = process.env.UPLOAD_DIR;
+    process.env.UPLOAD_DIR = root;
+    const seen = new Set<string>();
+    try {
+      await withSwapper(path.join(root, "lesson"), outside, async () => {
+        for (let i = 0; i < 400; i += 1) {
+          const bytes = await storage.readKey("lesson/page.webp");
+          seen.add(bytes === null ? "refused" : bytes.toString());
+        }
+      });
+    } finally {
+      if (previous === undefined) delete process.env.UPLOAD_DIR;
+      else process.env.UPLOAD_DIR = previous;
+    }
+
+    // The only bytes ever served are the inside ones. An outside read is a leak.
+    for (const value of seen) {
+      expect(value === "refused" || value === "INSIDE-BYTES").toBe(true);
+    }
+  }, 60_000);
+});
+
+describe("the open cannot damage a file outside the root", () => {
+  let base: string;
+  let uploadRoot: string;
+  let outside: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-trunc-"));
+    uploadRoot = path.join(base, "uploads");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("leaves an existing outside file byte-identical when the target is refused", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const ORIGINAL = "VICTIM-IMPORTANT-DATA".repeat(10);
+    const victim = path.join(outside, "page.webp");
+    fs.writeFileSync(victim, ORIGINAL);
+    // The lesson folder is a link out: the guard refuses before opening.
+    fs.symlinkSync(outside, path.join(uploadRoot, "swapped"));
+
+    await expect(
+      writeInsideUploadRoot(uploadRoot, path.join(uploadRoot, "swapped", "page.webp"), Buffer.from("PAYLOAD")),
+    ).rejects.toMatchObject({ name: "UnsafeStoragePathError" });
+
+    // An `O_TRUNC` open here would have emptied the victim before any check.
+    expect(fs.statSync(victim).size).toBe(ORIGINAL.length);
+    expect(fs.readFileSync(victim, "utf8")).toBe(ORIGINAL);
+  });
+
+  it("does not delete an outside file on the refusal path", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const victim = path.join(outside, "keep.txt");
+    fs.writeFileSync(victim, "EXTERNAL-ORIGINAL");
+    fs.symlinkSync(outside, path.join(uploadRoot, "swapped"));
+
+    await expect(
+      writeInsideUploadRoot(uploadRoot, path.join(uploadRoot, "swapped", "keep.txt"), Buffer.from("PAY")),
+    ).rejects.toThrow();
+
+    // Cleanup must be identity-proved, never a blind unlink of the old path.
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(victim, "utf8")).toBe("EXTERNAL-ORIGINAL");
+  });
+
+  it("still overwrites an existing file inside the root completely", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const target = path.join(uploadRoot, "lesson", "page.webp");
+
+    await writeInsideUploadRoot(uploadRoot, target, Buffer.from("MUCH-LONGER-PAYLOAD"));
+    // A shorter payload must leave no tail: the real storage contract.
+    await writeInsideUploadRoot(uploadRoot, target, Buffer.from("HI"));
+    expect(fs.readFileSync(target, "utf8")).toBe("HI");
+    expect(fs.statSync(target).size).toBe(2);
+
+    await writeInsideUploadRoot(uploadRoot, target, Buffer.from("AGAIN-LONGER"));
+    expect(fs.readFileSync(target, "utf8")).toBe("AGAIN-LONGER");
+  });
+
+  it("writes one payload, not a splice, when the same key is written concurrently", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const target = path.join(uploadRoot, "c", "x.bin");
+    const payloads = ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7"];
+
+    await Promise.all(payloads.map((p) => writeInsideUploadRoot(uploadRoot, target, Buffer.from(p))));
+
+    // Exactly one writer wins; an interleaved multi-step write would concatenate.
+    expect(payloads).toContain(fs.readFileSync(target, "utf8"));
+  });
+});
+
+/**
+ * The damaging case, run against real concurrency.
+ *
+ * Unlike the checks above, this one is a genuine regression test: it fails on
+ * 98c7a1b (`TRUNCATED-TO-ZERO`, 2/2 runs) and passes after the fix, because the
+ * open no longer carries `O_TRUNC` before the destination is proven. It is
+ * deliberately the sharpest assertion available — an outside file must keep its
+ * bytes — rather than "the call throws", which both versions already did.
+ */
+describe("a swapped component cannot truncate an outside file", () => {
+  it("keeps the outside file's bytes under a live swap", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const { spawn } = await import("node:child_process");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-trunc-race-"));
+    const uploadRoot = path.join(base, "uploads");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+
+    const ORIGINAL = "VICTIM-DATA".repeat(30);
+    const victim = path.join(outside, "page.webp");
+    fs.writeFileSync(victim, ORIGINAL);
+
+    const swapper = path.join(base, "swapper.cjs");
+    fs.writeFileSync(
+      swapper,
+      `const fs=require("fs"),path=require("path");
+       const [root,out]=process.argv.slice(2);
+       const target=path.join(root,"swapped");
+       for(let i=0;i<90000;i++){
+         try{fs.rmSync(target,{recursive:true,force:true});}catch{}
+         try{ i%2 ? fs.mkdirSync(target) : fs.symlinkSync(out,target); }catch{}
+       }`,
+    );
+
+    const child = spawn(process.execPath, [swapper, uploadRoot, outside], { stdio: "ignore" });
+    try {
+      for (let attempt = 0; attempt < 600; attempt += 1) {
+        await writeInsideUploadRoot(
+          uploadRoot,
+          path.join(uploadRoot, "swapped", "page.webp"),
+          Buffer.from("PAYLOAD"),
+        ).catch(() => undefined);
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+
+    // Whatever the race did, the outside file is not ours to damage.
+    expect(fs.existsSync(victim)).toBe(true);
+    expect(fs.statSync(victim).size).toBe(ORIGINAL.length);
+    expect(fs.readFileSync(victim, "utf8")).toBe(ORIGINAL);
+
+    fs.rmSync(base, { recursive: true, force: true });
+  }, 60_000);
+});
+
+describe("a directory swapped for a link while writing (best-effort)", () => {
+  let base: string;
+  let uploadRoot: string;
+  let outside: string;
+  let swapper: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-swap-"));
+    uploadRoot = path.join(base, "uploads");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    // A like-for-like attacker: the swap runs in another process, so it does not
+    // merely interleave at our own `await` points.
+    swapper = path.join(base, "swapper.cjs");
+    fs.writeFileSync(
+      swapper,
+      `const fs=require("fs"),path=require("path");
+       const [root,outside]=process.argv.slice(2);
+       const target=path.join(root,"swapped");
+       for(let i=0;i<60000;i++){
+         try{fs.rmSync(target,{recursive:true,force:true});}catch{}
+         try{ i%2 ? fs.mkdirSync(target) : fs.symlinkSync(outside,target); }catch{}
+       }`,
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("never publishes our bytes outside the root", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [swapper, uploadRoot, outside], { stdio: "ignore" });
+    const target = path.join(uploadRoot, "swapped", "page.webp");
+
+    try {
+      for (let attempt = 0; attempt < 800; attempt += 1) {
+        await writeInsideUploadRoot(uploadRoot, target, Buffer.from("PAYLOAD")).catch(() => undefined);
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+
+    // The invariant: however the race landed, no file outside carries our bytes.
+    // A directory may exist there (mkdir is not atomic with the guard — see the
+    // documented limit) and a zero-length file may too, but never a payload.
+    const leaked: string[] = [];
+    for (const entry of fs.readdirSync(outside, { recursive: true })) {
+      const full = path.join(outside, String(entry));
+      const stat = fs.lstatSync(full);
+      if (stat.isFile() && fs.readFileSync(full, "utf8").includes("PAYLOAD")) leaked.push(String(entry));
+    }
+    expect(leaked).toEqual([]);
+  });
+});
+
+describe("the re-check after mkdir uses the upload root, not the directory", () => {
+  let base: string;
+  let uploadRoot: string;
+  let outside: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-recheck-"));
+    uploadRoot = path.join(base, "uploads");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "keep.txt"), "ORIGINAL-BYTES");
+    process.env.UPLOAD_DIR = uploadRoot;
+  });
+
+  afterAll(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("re-walks the chain against the upload root instead of trusting the directory", async () => {
+    const { resolveInsideUploadRoot, writeInsideUploadRoot } = await import("@/lib/storage-safe");
+
+    // (a) A link that already exists is caught by the *first* check, so it does
+    // not discriminate between the two designs — assert it anyway, because it is
+    // the case users hit.
+    const existing = path.join(uploadRoot, "existing-link");
+    fs.symlinkSync(outside, existing);
+    expect(() => resolveInsideUploadRoot(uploadRoot, path.join(existing, "page.webp"))).toThrow(
+      /symbolic link/,
+    );
+
+    // (b) The case that does discriminate: the directory is real when the first
+    // check runs, and a link by the time the second one must run. Measured as the
+    // old code measured it — the directory as its own root — the check passes and
+    // the write escapes; measured against the upload root it is refused.
+    const swapped = path.join(uploadRoot, "swapped");
+    fs.mkdirSync(swapped, { recursive: true });
+    expect(() => resolveInsideUploadRoot(uploadRoot, path.join(swapped, "page.webp"))).not.toThrow();
+    fs.rmSync(swapped, { recursive: true, force: true });
+    fs.symlinkSync(outside, swapped);
+
+    expect(() => resolveInsideUploadRoot(swapped, swapped)).not.toThrow(); // the old, vacuous form
+    expect(() => resolveInsideUploadRoot(uploadRoot, path.join(swapped, "page.webp"))).toThrow(
+      /symbolic link/,
+    );
+
+    // And the primitive refuses the same state rather than writing through it.
+    await expect(
+      writeInsideUploadRoot(uploadRoot, path.join(swapped, "page.webp"), Buffer.from("PAYLOAD")),
+    ).rejects.toThrow(/symbolic link/);
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("re-checks the target itself, so a linked final component cannot ride along", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    // A directory-only check cannot see a symlinked final component; the guard is
+    // applied to the full target, and `O_NOFOLLOW` backs it up at the syscall.
+    const dir = path.join(uploadRoot, "final");
+    fs.mkdirSync(dir, { recursive: true });
+    const link = path.join(dir, "page.webp");
+    fs.symlinkSync(path.join(outside, "keep.txt"), link);
+
+    await expect(writeInsideUploadRoot(uploadRoot, link, Buffer.from("PAYLOAD"))).rejects.toThrow(
+      /symbolic link/,
+    );
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+  });
+
+  it("still writes when every component is real", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const target = path.join(uploadRoot, "plain", "deep", "ok.bin");
+    await writeInsideUploadRoot(uploadRoot, target, Buffer.from("OK"));
+    expect(fs.readFileSync(target, "utf8")).toBe("OK");
+  });
+});
+
+/**
+ * Descriptor leaks.
+ *
+ * Every read and write opens up to three descriptors (root, parent, file). A
+ * missing `close` in a `finally` is invisible in behaviour but fatal in
+ * production: a long-running server exhausts its descriptor table and then fails
+ * every operation. Measured on the process's own descriptor directory rather
+ * than inferred from the code.
+ */
+describe("descriptor bookkeeping", () => {
+  function fdNamespacePath(): string {
+    return fs.existsSync("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd";
+  }
+  function openDescriptors(): number {
+    return fs.readdirSync(fdNamespacePath()).length;
+  }
+
+  it("does not grow the descriptor table across many reads and writes", async () => {
+    const storage = await import("@/lib/storage");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fdleak-"));
+    const previous = process.env.UPLOAD_DIR;
+    process.env.UPLOAD_DIR = path.join(base, "uploads");
+    try {
+      await storage.writeKey("lesson/page.webp", Buffer.from("X"));
+      const baseline = openDescriptors();
+
+      for (let i = 0; i < 300; i += 1) await storage.readKey("lesson/page.webp");
+      const afterReads = openDescriptors();
+      expect(afterReads - baseline).toBeLessThanOrEqual(1);
+
+      for (let i = 0; i < 150; i += 1) await storage.writeKey("lesson/page.webp", Buffer.from("Y"));
+      expect(openDescriptors() - afterReads).toBeLessThanOrEqual(1);
+
+      for (let i = 0; i < 150; i += 1) await storage.deleteKey("lesson/page.webp");
+      expect(openDescriptors() - afterReads).toBeLessThanOrEqual(1);
+    } finally {
+      if (previous === undefined) delete process.env.UPLOAD_DIR;
+      else process.env.UPLOAD_DIR = previous;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("does not leak when a write fails after opening the root", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fdleak2-"));
+    const root = path.join(base, "uploads");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(root, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    // A link where a directory must be: the walk refuses, after the root is open.
+    fs.symlinkSync(outside, path.join(root, "link"));
+    try {
+      const baseline = openDescriptors();
+      for (let i = 0; i < 200; i += 1) {
+        await writeInsideUploadRoot(root, path.join(root, "link", "x.bin"), Buffer.from("X")).catch(
+          () => undefined,
+        );
+      }
+      expect(openDescriptors() - baseline).toBeLessThanOrEqual(1);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+/**
+ * A FIFO where a media file is expected must not hang the process.
+ *
+ * Opening a FIFO blocks until the other end appears. `O_NONBLOCK` makes the open
+ * return immediately so `fstat` can refuse the entry, instead of the request
+ * hanging forever on an attacker-planted entry.
+ */
+describe("special files are refused, not waited on", () => {
+  const canMkfifo = spawnSync("mkfifo", ["--version"], { encoding: "utf8" }).status === 0;
+
+  it.skipIf(!canMkfifo)("refuses a FIFO at a media name without blocking", async () => {
+    const storage = await import("@/lib/storage");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fifo-"));
+    const uploads = path.join(base, "uploads");
+    fs.mkdirSync(path.join(uploads, "lesson"), { recursive: true });
+    const fifo = path.join(uploads, "lesson", "page.webp");
+    expect(spawnSync("mkfifo", [fifo], { encoding: "utf8" }).status).toBe(0);
+
+    const previous = process.env.UPLOAD_DIR;
+    process.env.UPLOAD_DIR = uploads;
+    try {
+      // The assertion is that this resolves at all: without O_NONBLOCK the open
+      // would block forever and the test would time out instead of failing cleanly.
+      const result = await storage.readKey("lesson/page.webp");
+      expect(result).toBeNull(); // a FIFO is not served
+    } finally {
+      if (previous === undefined) delete process.env.UPLOAD_DIR;
+      else process.env.UPLOAD_DIR = previous;
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.skipIf(!canMkfifo)("refuses a FIFO in readFileAt", async () => {
+    const { openDir, readFileAt } = await import("@/lib/dirfd");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "math7-fifo2-"));
+    expect(spawnSync("mkfifo", [path.join(dir, "page.webp")], { encoding: "utf8" }).status).toBe(0);
+    const handle = openDir(dir);
+    try {
+      // Returns or throws promptly; the `it` timeout is the real assertion.
+      expect(() => readFileAt(handle, "page.webp")).toThrow(/FIFO/i);
+    } finally {
+      handle.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
