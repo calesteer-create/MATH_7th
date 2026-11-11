@@ -408,6 +408,32 @@ describe("media:sync canonicalises CMS-written paths", () => {
     // …but nothing was written, for either lesson.
     expect(fs.readFileSync(path.join(root, "content", "lessons", "8.json"), "utf8")).toBe(before8);
     expect(fs.readFileSync(path.join(root, "content", "lessons", "9.json"), "utf8")).toBe(before9);
+    // The thumbnail is a write too: an aborted run must not leave one behind
+    // while reporting that it wrote nothing.
+    expect(fs.existsSync(path.join(root, "public", "media", "lessons", "8", "thumbs"))).toBe(false);
+  }, 120_000);
+
+  it("writes the thumbnail before the JSON, and only once the tree is clean", async () => {
+    // Lesson 11 has a real image but no thumbnail yet: both artifacts are
+    // pending at the verdict, so the run must commit them together.
+    await seedWithStoredPath(11, "/media/lessons/11/page-01.webp");
+
+    const result = runSync();
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("wrote 1 lesson file(s)");
+
+    const thumb = path.join(root, "public", "media", "lessons", "11", "thumbs", "page-01.webp");
+    expect(fs.existsSync(thumb)).toBe(true);
+    expect((await sharp(fs.readFileSync(thumb)).metadata()).format).toBe("webp");
+    expect(
+      (JSON.parse(fs.readFileSync(path.join(root, "content", "lessons", "11.json"), "utf8")) as {
+        images: Array<Record<string, unknown>>;
+      }).images[0]!["thumb"],
+    ).toBe("thumbs/page-01.webp");
+    // The tree the run just committed validates with no help from the runner.
+    expect(
+      validateContentTree(path.join(root, "content"), path.join(root, "public", "media")).errors,
+    ).toEqual([]);
   }, 120_000);
 
   it("never renames, moves or deletes a source file while canonicalising", async () => {

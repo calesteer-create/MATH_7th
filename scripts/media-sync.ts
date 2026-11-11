@@ -107,6 +107,12 @@ async function main(): Promise<void> {
   const changedLessons: LessonContent[] = [];
   /** Writes held back until every lesson has been validated. */
   const pendingWrites: Array<{ file: string; lesson: LessonContent }> = [];
+  /**
+   * Thumbnails are held back for the same reason as the JSON: a run that aborts
+   * because one record cannot be repaired must leave the tree byte-identical,
+   * not merely un-canonicalised. `--dry-run` never fills this (see below).
+   */
+  const pendingThumbs: Array<{ path: string; buffer: Buffer }> = [];
 
   for (const entry of readLessons(paths.contentRoot)) {
     const lesson = entry.value;
@@ -177,10 +183,7 @@ async function main(): Promise<void> {
           .webp({ quality: THUMB_QUALITY, effort: 4 })
           .toBuffer();
         summary.thumbnailsCreated += 1;
-        if (write) {
-          fs.mkdirSync(path.dirname(thumbPath), { recursive: true });
-          fs.writeFileSync(thumbPath, thumbBuffer);
-        }
+        if (write) pendingThumbs.push({ path: thumbPath, buffer: thumbBuffer });
       }
       if (
         file !== image.file ||
@@ -277,15 +280,38 @@ async function main(): Promise<void> {
     !write && unfixable === 0 && needsWork
       ? validation.errors.every((issue) => REPAIRABLE_CODES.has(issue.code))
       : false;
-  const shown = pendingDerivedFieldErrors ? validation.warnings : validation.errors;
+  // A write run validates against the pending records, but the thumbnails they
+  // promise are still buffered in memory (see `pendingThumbs`) — so validation
+  // legitimately reports them as missing on disk. Those exact issues are the
+  // ones this run is about to satisfy, so they are excused by name, not by
+  // dropping the code wholesale.
+  // The message is `missing thumbnail lessons/<id>/<thumb>`; build the same
+  // string from the buffered path so the match is exact.
+  const deferredThumbs = new Set(
+    pendingThumbs.map(
+      (thumb) =>
+        `missing thumbnail ${path.relative(paths.mediaRoot, thumb.path).split(path.sep).join("/")}`,
+    ),
+  );
+  const verdictErrors = write
+    ? validation.errors.filter(
+        (issue) => !(issue.code === "IMAGE_THUMB_NOT_FOUND" && deferredThumbs.has(issue.message)),
+      )
+    : validation.errors;
+  const deferredThumbCount = validation.errors.length - verdictErrors.length;
+
+  const shown = pendingDerivedFieldErrors ? validation.warnings : verdictErrors;
   for (const issue of shown.slice(0, 10)) {
     console.log(`   [${issue.code}] ${issue.path} — ${issue.message}`);
   }
   if (pendingDerivedFieldErrors) {
     console.log("   (derived-field errors above are exactly what a write run repairs)");
   }
+  if (deferredThumbCount > 0) {
+    console.log(`   (${deferredThumbCount} missing thumbnail(s) are created by this run)`);
+  }
 
-  const contentBroken = validation.errors.length > 0 && !pendingDerivedFieldErrors;
+  const contentBroken = verdictErrors.length > 0 && !pendingDerivedFieldErrors;
 
   if (options.check && needsWork) {
     console.error("\n✗ media:sync --check — the tree is out of sync; run `npm run media:sync`.");
@@ -304,7 +330,13 @@ async function main(): Promise<void> {
     return;
   }
   // Only now — after every lesson passed its checks and the tree validated
-  // cleanly — is any JSON rewritten. One pass, no partial state.
+  // cleanly — is anything written. Thumbnails first, because an in-memory
+  // override already claims `thumb` exists while the bytes are still pending.
+  // One pass, no partial state.
+  for (const thumb of pendingThumbs) {
+    fs.mkdirSync(path.dirname(thumb.path), { recursive: true });
+    fs.writeFileSync(thumb.path, thumb.buffer);
+  }
   for (const pending of pendingWrites) {
     writeJson(path.join(paths.contentRoot, "lessons", pending.file), pending.lesson);
   }
