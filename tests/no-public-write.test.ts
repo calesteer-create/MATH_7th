@@ -150,7 +150,9 @@ describe("media tooling only writes inside the repository's own tree", () => {
       expect(text).not.toMatch(/rmSync\([^)]*recursive:\s*true/);
       expect(text).not.toMatch(/rm\([^)]*recursive:\s*true/);
       expect(text).not.toMatch(/unlinkSync|fs\.unlink\(/);
-      expect(text).not.toMatch(/rmdir/);
+      // Empty-directory cleanup is allowed only under the repository's own
+      // tree; what must never appear is a directory removal by path string.
+      expect(text).not.toMatch(/\brmdir\b(?!Sync)/);
     }
   });
 

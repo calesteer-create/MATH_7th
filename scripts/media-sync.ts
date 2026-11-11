@@ -27,7 +27,7 @@ import { THUMB_MAX_EDGE, THUMB_QUALITY, detectMime } from "../src/media/format";
 import { sha256Hex } from "../src/media/process";
 import { canonicalMediaFile, isLegalMediaName } from "../src/media/naming";
 import { buildReferenceIndex, collectedQuizReferences } from "../src/media/sync-helpers";
-import { defaultPaths, nowIso, readLessons, readQuizFiles, writeJson } from "../src/media/tree";
+import { defaultPaths, makeDirsTracked, nowIso, readLessons, readQuizFiles, rollbackWrites, writeJson } from "../src/media/tree";
 import { validateContentTree } from "../src/content/validate";
 import type { LessonContent, LessonImageContent } from "../src/content/model";
 
@@ -332,13 +332,40 @@ async function main(): Promise<void> {
   // Only now — after every lesson passed its checks and the tree validated
   // cleanly — is anything written. Thumbnails first, because an in-memory
   // override already claims `thumb` exists while the bytes are still pending.
-  // One pass, no partial state.
-  for (const thumb of pendingThumbs) {
-    fs.mkdirSync(path.dirname(thumb.path), { recursive: true });
-    fs.writeFileSync(thumb.path, thumb.buffer);
-  }
-  for (const pending of pendingWrites) {
-    writeJson(path.join(paths.contentRoot, "lessons", pending.file), pending.lesson);
+  //
+  // Writing can still fail *after* this point (read-only record, full disk,
+  // process killed). A clean verdict is not a transaction, so the commit phase
+  // is guarded too: if any write throws, every file this run created or
+  // overwrote is restored, so the tree is byte-identical to how it was found
+  // rather than "canonicalised but with a thumbnail nobody references".
+  const createdFiles: string[] = [];
+  const createdDirectories: string[] = [];
+  const overwrittenFiles: Array<{ path: string; previous: Buffer }> = [];
+  const rememberFile = (target: string): void => {
+    if (!fs.existsSync(target)) {
+      createdFiles.push(target);
+      return;
+    }
+    overwrittenFiles.push({ path: target, previous: fs.readFileSync(target) });
+  };
+  try {
+    for (const thumb of pendingThumbs) {
+      rememberFile(thumb.path);
+      makeDirsTracked(path.dirname(thumb.path), createdDirectories);
+      fs.writeFileSync(thumb.path, thumb.buffer);
+    }
+    for (const pending of pendingWrites) {
+      const target = path.join(paths.contentRoot, "lessons", pending.file);
+      rememberFile(target);
+      writeJson(target, pending.lesson);
+    }
+  } catch (error) {
+    const restored = rollbackWrites(createdFiles, overwrittenFiles, createdDirectories);
+    console.error(
+      `\n✗ writing failed (${(error as Error).message}); ` +
+        `rolled back ${restored.created} new and ${restored.restored} overwritten file(s) — the tree is unchanged`,
+    );
+    process.exit(1);
   }
   if (pendingWrites.length > 0) {
     console.log(`\n  wrote ${pendingWrites.length} lesson file(s)`);

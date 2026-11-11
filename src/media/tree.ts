@@ -51,9 +51,90 @@ export function readLesson(contentRoot: string, lessonId: number): { file: strin
 }
 
 /** Writes JSON with a trailing newline, creating the parent directory. */
+/**
+ * Writes JSON atomically: the payload goes to a sibling temporary file which is
+ * then renamed over the target. A crash or a failing write can therefore never
+ * leave a truncated or half-encoded record — the target is either the old bytes
+ * or the new ones. The temporary file is removed if anything goes wrong.
+ */
 export function writeJson(target: string, value: unknown): void {
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const temporary = `${target}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.renameSync(temporary, target);
+  } catch (error) {
+    // Never let cleanup mask the real failure: on a read-only directory even
+    // removing the temporary file is refused, and the caller needs the cause.
+    try {
+      fs.rmSync(temporary, { force: true });
+    } catch {
+      /* the original error is the one that matters */
+    }
+    throw error;
+  }
+}
+
+/**
+ * Undoes the files a failed commit phase touched: deletes what it created and
+ * restores the previous bytes of what it overwrote. A file whose bytes already
+ * match is left alone, so this is safe to call after a partially applied batch.
+ */
+export function rollbackWrites(
+  createdFiles: string[],
+  overwrittenFiles: Array<{ path: string; previous: Buffer }>,
+  createdDirectories: string[] = [],
+): { created: number; restored: number } {
+  let created = 0;
+  let restored = 0;
+  for (const target of [...createdFiles].reverse()) {
+    try {
+      fs.rmSync(target, { force: true });
+      created += 1;
+    } catch {
+      /* reported by the shortfall in the counts */
+    }
+  }
+  for (const file of [...overwrittenFiles].reverse()) {
+    try {
+      const current = fs.existsSync(file.path) ? fs.readFileSync(file.path) : null;
+      if (current !== null && current.equals(file.previous)) continue;
+      fs.writeFileSync(file.path, file.previous);
+      restored += 1;
+    } catch {
+      /* as above */
+    }
+  }
+  // Directories the run created are removed too, deepest first, but only if
+  // they are empty: leaving `thumbs/` behind would be a visible leftover even
+  // though every file in it was undone.
+  for (const dir of [...createdDirectories].reverse()) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      /* not empty or already gone — either way, nothing to do */
+    }
+  }
+  return { created, restored };
+}
+
+/**
+ * `mkdir -p` that records which directories it actually created, so a failed
+ * commit can remove exactly those and nothing that was already there.
+ */
+export function makeDirsTracked(dir: string, created: string[]): void {
+  const missing: string[] = [];
+  let current = dir;
+  while (!fs.existsSync(current)) {
+    missing.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  for (const target of [...missing].reverse()) {
+    fs.mkdirSync(target);
+    created.push(target);
+  }
 }
 
 export function writeLesson(contentRoot: string, lesson: LessonContent): string {

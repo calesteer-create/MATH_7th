@@ -311,7 +311,8 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
    `npm run media:sync` ثم `npm run media:sync -- --check` على شجرة المسودات.
    إن ظهر `unrecognised image path` فالصورة ليست WebP أو في مجلد درس آخر: أعد
    رفعها ولا تُعدّل الاسم يدويًا. وإذا فشل التشغيل فلن يكتب شيئًا إطلاقًا — لا
-   JSON ولا مصغّرة — فأعد تشغيله بعد معالجة سبب الفشل.
+   JSON ولا مصغّرة — وسيخبرك صراحةً عند فشل الكتابة نفسها: `rolling back … the
+   tree is unchanged`. أعد تشغيله بعد معالجة سبب الفشل.
 7. عندها فقط: حدّث `ADMIN_STATUS.verifiedAgainstPrivateRepo` في
    `src/media/cms-config.ts` و`docs/ADMIN.md` بالتاريخ.
 

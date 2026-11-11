@@ -14,6 +14,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { validateContentTree } from "@/content/validate";
+import { rollbackWrites, writeJson as writeJsonAtomic } from "@/media/tree";
 
 let root = "";
 
@@ -103,6 +104,27 @@ async function seedCmsUploadedImage(lessonId: number): Promise<Buffer> {
   );
   return buffer;
 }
+
+/** Every file under the tree, with its bytes — the only honest "unchanged". */
+function snapshotTree(base: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      out[path.relative(base, full)] = fs.readFileSync(full).toString("base64");
+    }
+  };
+  walk(path.join(base, "content"));
+  walk(path.join(base, "public"));
+  return out;
+}
+
+/** Writing a read-only directory is refused; root ignores the mode bits. */
+const canTestPermissions = typeof process.getuid === "function" && process.getuid() !== 0;
 
 describe("media:sync repairs a CMS-uploaded image", () => {
   it("fills sha256/width/height and creates the missing thumbnail", async () => {
@@ -454,4 +476,175 @@ describe("media:sync canonicalises CMS-written paths", () => {
     expect(listAfter.filter((name) => name !== "thumbs")).toEqual(listBefore);
     expect(fs.readFileSync(path.join(dir, "page-01.webp")).equals(buffer)).toBe(true);
   }, 120_000);
+});
+
+/**
+ * A clean validation verdict is not a transaction. These cover the other half:
+ * the writes themselves failing after the verdict, and the requirement that the
+ * tree ends up byte-identical either way.
+ */
+/**
+ * A clean validation verdict is not a transaction. These cover the other half:
+ * the writes themselves failing after the verdict, and the requirement that the
+ * tree ends up byte-identical either way.
+ *
+ * The failure is induced with a read-only *directory* plus a read-only *record*
+ * file. Either alone is not enough: an existing file can be truncated without
+ * write permission on its directory, and a directory-only restriction still
+ * allows `rename(2)` over an existing entry. Together they make the record
+ * genuinely unwritable while `public/media/` stays writable, so the thumbnail is
+ * created first and the JSON write then fails — the exact ordering under test.
+ */
+describe("media:sync is atomic when the writes themselves fail", () => {
+  /** A canonical-name record missing its derived fields: thumbnail + rewrite. */
+  async function seedNeedingDerivedFields(lessonId: number, isLast: boolean): Promise<Buffer> {
+    const dir = path.join(root, "public", "media", "lessons", String(lessonId));
+    fs.mkdirSync(dir, { recursive: true });
+    const buffer = await webp(900, 1200);
+    fs.writeFileSync(path.join(dir, "page-01.webp"), buffer);
+    const record = lesson(lessonId, 1, [{ position: 1, file: "page-01.webp", width: null, height: null }]);
+    // Distinct positions and exactly one "last in unit": otherwise validation
+    // fails first and the run aborts before writing, which would make these
+    // tests pass without ever reaching the write phase.
+    record.position = lessonId;
+    record.isLastInUnit = isLast;
+    writeJson(path.join(root, "content", "lessons", `${lessonId}.json`), record);
+    return buffer;
+  }
+
+  /** Makes the given records unwritable while keeping media/ writable. */
+  function withUnwritableRecords(ids: number[], body: () => void): void {
+    const lessonsDir = path.join(root, "content", "lessons");
+    for (const id of ids) fs.chmodSync(path.join(lessonsDir, `${id}.json`), 0o444);
+    fs.chmodSync(lessonsDir, 0o555);
+    try {
+      body();
+    } finally {
+      fs.chmodSync(lessonsDir, 0o755);
+      for (const id of ids) fs.chmodSync(path.join(lessonsDir, `${id}.json`), 0o644);
+    }
+  }
+
+  it("leaves no orphan thumbnail and no partial JSON when a record cannot be written", async () => {
+    await seedNeedingDerivedFields(12, true);
+    const before = snapshotTree(root);
+    if (!canTestPermissions) return; // root ignores the mode bits
+
+    withUnwritableRecords([12], () => {
+      const result = runSync();
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("writing failed");
+      expect(result.stderr).toContain("the tree is unchanged");
+    });
+
+    // Byte-for-byte: the thumbnail the run created is gone, the JSON is
+    // untouched, and no temporary file was left behind.
+    expect(snapshotTree(root)).toEqual(before);
+    expect(fs.existsSync(path.join(root, "public", "media", "lessons", "12", "thumbs"))).toBe(false);
+  }, 120_000);
+
+  it("rolls back every file it wrote, not just the last one", async () => {
+    // Two lessons each need a thumbnail, so two files are created before the
+    // first JSON write fails: the rollback must undo both, not just the last.
+    await seedNeedingDerivedFields(13, false);
+    await seedNeedingDerivedFields(14, true);
+    const before = snapshotTree(root);
+    if (!canTestPermissions) return;
+
+    withUnwritableRecords([13, 14], () => {
+      expect(runSync().status).toBe(1);
+    });
+
+    expect(snapshotTree(root)).toEqual(before);
+    for (const id of ["13", "14"]) {
+      expect(fs.existsSync(path.join(root, "public", "media", "lessons", id, "thumbs"))).toBe(false);
+    }
+  }, 120_000);
+
+  it("never leaves a half-written record behind (writes are atomic)", () => {
+    // A read-only file only fails *before* anything is truncated, so it cannot
+    // tell an atomic write from a plain one. A file-size limit (RLIMIT_FSIZE)
+    // fails *mid-write*, which is the case that can leave a corrupted record:
+    // run in a child process under `ulimit -f 1` (512-byte files).
+    const dir = path.join(root, "content", "lessons");
+    fs.mkdirSync(dir, { recursive: true });
+    const script = path.join(root, "write-probe.mjs");
+    fs.writeFileSync(
+      script,
+      [
+        `import fs from "node:fs";`,
+        `const target = process.argv[2];`,
+        `const payload = "x".repeat(5000);`,
+        `try {`,
+        `  fs.writeFileSync(target, payload);`,
+        `} catch (error) {`,
+        `  process.exit(error.code === "EFBIG" ? 3 : 4);`,
+        `}`,
+        `process.exit(0);`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    // 1) The plain write really does fail mid-write and really does truncate.
+    const plain = path.join(dir, "plain.json");
+    fs.writeFileSync(plain, "ORIGINAL\n");
+    const plainRun = spawnSync("sh", ["-c", `ulimit -f 1; "${process.execPath}" "${script}" "${plain}"`], {
+      encoding: "utf8",
+    });
+    expect(plainRun.status).toBe(3); // EFBIG — the limit fired
+    // ...and the record was left holding a partial payload instead of the
+    // original 9 bytes. (The exact size depends on the write chunking.)
+    expect(fs.statSync(plain).size).toBeGreaterThan(Buffer.byteLength("ORIGINAL\n"));
+    expect(fs.readFileSync(plain, "utf8")).not.toBe("ORIGINAL\n");
+
+    // 2) A 5 KB lesson record written through writeJson, under the same limit.
+    const atomic = path.join(dir, "atomic.json");
+    writeJson(atomic, { id: 1, payload: "ORIGINAL" });
+    const original = fs.readFileSync(atomic);
+    const script2 = path.join(root, "atomic-probe.mjs");
+    fs.writeFileSync(
+      script2,
+      [
+        `import { writeJson } from "${path.join(process.cwd(), "src/media/tree.ts").replace(/\\/g, "/")}";`,
+        `const target = process.argv[2];`,
+        `try { writeJson(target, { id: 2, payload: "x".repeat(5000) }); }`,
+        `catch (error) { process.exit(error.code === "EFBIG" ? 3 : 4); }`,
+        `process.exit(0);`,
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const atomicRun = spawnSync(
+      "sh",
+      ["-c", `ulimit -f 1; "${process.execPath}" --import tsx "${script2}" "${atomic}"`],
+      { encoding: "utf8", cwd: process.cwd() },
+    );
+    expect(atomicRun.status).toBe(3); // the same limit fired
+    // 3) ...yet the record kept its old bytes, and no temp file survived.
+    expect(fs.readFileSync(atomic).equals(original)).toBe(true);
+    expect(fs.readdirSync(dir).filter((name) => name.includes(".tmp-"))).toEqual([]);
+  }, 120_000);
+
+  it("rolls back created and overwritten files, and is a no-op when bytes already match", () => {
+    const created = path.join(root, "content", "lessons", "created.json");
+    const overwritten = path.join(root, "content", "lessons", "overwritten.json");
+    writeJson(created, { created: true });
+    writeJson(overwritten, { state: "after" });
+    const previous = Buffer.from(JSON.stringify({ state: "before" }, null, 2) + "\n", "utf8");
+    // A file the run created but that already has the right bytes.
+    const untouched = path.join(root, "content", "lessons", "untouched.json");
+    writeJson(untouched, { state: "same" });
+
+    const result = rollbackWrites(
+      [created],
+      [
+        { path: overwritten, previous },
+        { path: untouched, previous: fs.readFileSync(untouched) },
+      ],
+    );
+
+    expect(result).toEqual({ created: 1, restored: 1 });
+    expect(fs.existsSync(created)).toBe(false);
+    expect(fs.readFileSync(overwritten, "utf8")).toBe(previous.toString("utf8"));
+    expect(fs.readFileSync(untouched, "utf8")).toBe('{\n  "state": "same"\n}\n');
+  });
 });
