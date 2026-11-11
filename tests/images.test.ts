@@ -1,10 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import sharp from "sharp";
 import { detectMime, storeLessonImage } from "@/lib/images";
 import { mediaRoot, readKey } from "@/lib/storage";
+import fsSync from "node:fs";
+import * as fsModule from "node:fs/promises";
 
 let tmp: string;
 
@@ -316,5 +318,88 @@ describe("upload storage with a symlinked ancestor", () => {
     await expect(writeKey("escape/evil.bin", Buffer.from("X"))).rejects.toThrow(/symbolic link/);
     expect(fs.readdirSync(outsideDir)).toEqual(["keep.txt"]);
     expect(fs.readFileSync(path.join(outsideDir, "keep.txt"), "utf8")).toBe("ORIGINAL");
+  });
+});
+
+/**
+ * The post-`mkdir` re-check must be measured against the upload root. Passing
+ * the created directory as its own root makes the check vacuous — every path is
+ * inside itself — and hides a component that has become a symlink.
+ */
+describe("the re-check after mkdir uses the upload root, not the directory", () => {
+  let base: string;
+  let uploadRoot: string;
+  let outside: string;
+
+  beforeAll(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-recheck-"));
+    uploadRoot = path.join(base, "uploads");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "keep.txt"), "ORIGINAL-BYTES");
+    process.env.UPLOAD_DIR = uploadRoot;
+  });
+
+  afterAll(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("re-walks the chain against the upload root instead of trusting the directory", async () => {
+    const { resolveInsideUploadRoot, writeInsideUploadRoot } = await import("@/lib/storage-safe");
+
+    // (a) A link that already exists is caught by the *first* check, so it does
+    // not discriminate between the two designs — assert it anyway, because it is
+    // the case users hit.
+    const existing = path.join(uploadRoot, "existing-link");
+    fs.symlinkSync(outside, existing);
+    expect(() => resolveInsideUploadRoot(uploadRoot, path.join(existing, "page.webp"))).toThrow(
+      /symbolic link/,
+    );
+
+    // (b) The case that does discriminate: the directory is real when the first
+    // check runs, and a link by the time the second one must run. Measured as the
+    // old code measured it — the directory as its own root — the check passes and
+    // the write escapes; measured against the upload root it is refused.
+    const swapped = path.join(uploadRoot, "swapped");
+    fs.mkdirSync(swapped, { recursive: true });
+    expect(() => resolveInsideUploadRoot(uploadRoot, path.join(swapped, "page.webp"))).not.toThrow();
+    fs.rmSync(swapped, { recursive: true, force: true });
+    fs.symlinkSync(outside, swapped);
+
+    expect(() => resolveInsideUploadRoot(swapped, swapped)).not.toThrow(); // the old, vacuous form
+    expect(() => resolveInsideUploadRoot(uploadRoot, path.join(swapped, "page.webp"))).toThrow(
+      /symbolic link/,
+    );
+
+    // And the primitive refuses the same state rather than writing through it.
+    await expect(
+      writeInsideUploadRoot(uploadRoot, path.join(swapped, "page.webp"), Buffer.from("PAYLOAD")),
+    ).rejects.toThrow(/symbolic link/);
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+  });
+
+  it("re-checks the target itself, so a linked final component cannot ride along", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    // A directory-only check cannot see a symlinked final component; the guard is
+    // applied to the full target, and `O_NOFOLLOW` backs it up at the syscall.
+    const dir = path.join(uploadRoot, "final");
+    fs.mkdirSync(dir, { recursive: true });
+    const link = path.join(dir, "page.webp");
+    fs.symlinkSync(path.join(outside, "keep.txt"), link);
+
+    await expect(writeInsideUploadRoot(uploadRoot, link, Buffer.from("PAYLOAD"))).rejects.toThrow(
+      /symbolic link/,
+    );
+    expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe("ORIGINAL-BYTES");
+    expect(fs.readdirSync(outside)).toEqual(["keep.txt"]);
+  });
+
+  it("still writes when every component is real", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const target = path.join(uploadRoot, "plain", "deep", "ok.bin");
+    await writeInsideUploadRoot(uploadRoot, target, Buffer.from("OK"));
+    expect(fs.readFileSync(target, "utf8")).toBe("OK");
   });
 });

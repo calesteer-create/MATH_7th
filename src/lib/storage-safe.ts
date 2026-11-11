@@ -10,9 +10,17 @@
  * component in `open(2)`/`unlink(2)`, so a path that merely *looks* contained
  * still lands outside. Each component below the root is checked with `lstat`,
  * the final component is opened with `O_NOFOLLOW`, and the check is repeated as
- * close to the syscall as this API allows (see `resolveInside` for the
- * documented limit: a concurrent swap between check and use is narrowed, not
- * impossible, without dirfd-relative openat).
+ * close to the syscall as this API allows.
+ *
+ * **What this does not guarantee** (see the TOCTOU note in
+ * docs/CONTENT_MODEL.md): every check here is separated from its use by a
+ * window. `mkdir({recursive: true})` is *not* atomic with respect to the guard
+ * — it follows a symlinked directory component, so if a component is swapped
+ * for a link after the last check and before the mkdir, the directories are
+ * created at the link's target. The subsequent re-check (measured against the
+ * upload root) then *detects* the escape and nothing is written, but an empty
+ * directory tree may already exist outside. Closing that fully needs
+ * `openat`/`mkdirat` relative to a directory fd, which Node does not expose.
  *
  * This module is deliberately dependency-light so importing it never pulls in
  * the media-tooling code (and its `sharp` dependency) at request time.
@@ -117,13 +125,19 @@ export async function writeInsideUploadRoot(root: string, target: string, data: 
   const safeTarget = resolveInsideUploadRoot(root, target);
   const directory = path.dirname(safeTarget);
   await fs.mkdir(directory, { recursive: true });
-  // Re-checked in the namespace of the path we are about to use, so a symlinked
-  // root is not mistaken for an escape.
-  resolveInsideUploadRoot(directory, directory);
+
+  // Re-verified against the *upload root*, never against `directory`: passing
+  // the directory as its own root is a vacuous check (any path is inside
+  // itself), so a component that became a symlink after `mkdir` would sail
+  // through. Both the parent chain and the full target are re-walked, which also
+  // catches a symlink at the final component.
+  resolveInsideUploadRoot(root, safeTarget);
 
   const flags =
     fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | fsSync.constants.O_NOFOLLOW;
-  resolveInsideUploadRoot(directory, directory);
+  // Again as close to the open as this API allows. `O_NOFOLLOW` then stops the
+  // final component from being a link at the instant of the syscall.
+  resolveInsideUploadRoot(root, safeTarget);
   const handle = await fs.open(safeTarget, flags, 0o644);
   try {
     await handle.writeFile(data);
