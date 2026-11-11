@@ -1,12 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import sharp from "sharp";
 import { detectMime, storeLessonImage } from "@/lib/images";
 import { mediaRoot, readKey } from "@/lib/storage";
-import fsSync from "node:fs";
-import * as fsModule from "node:fs/promises";
 
 let tmp: string;
 
@@ -326,6 +324,75 @@ describe("upload storage with a symlinked ancestor", () => {
  * the created directory as its own root makes the check vacuous — every path is
  * inside itself — and hides a component that has become a symlink.
  */
+/**
+ * Concurrency evidence, deliberately labelled as such.
+ *
+ * This is **not** a regression test in the strict sense: it asserts an invariant
+ * ("no payload byte of ours ever lands outside the root") rather than a
+ * difference from a previous commit, and the invariant is only probabilistically
+ * exercised. Passing it does NOT prove the race is closed — Node exposes no
+ * dirfd-relative `openat`, so a swap that wins the window remains possible. It
+ * exists so a *worsening* of the guard fails the suite instead of shipping
+ * silently. If it fails, treat it as a genuine escape, not a flake.
+ */
+describe("a directory swapped for a link while writing (best-effort)", () => {
+  let base: string;
+  let uploadRoot: string;
+  let outside: string;
+  let swapper: string;
+
+  beforeEach(() => {
+    base = fs.mkdtempSync(path.join(os.tmpdir(), "math7-swap-"));
+    uploadRoot = path.join(base, "uploads");
+    outside = path.join(base, "outside");
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    // A like-for-like attacker: the swap runs in another process, so it does not
+    // merely interleave at our own `await` points.
+    swapper = path.join(base, "swapper.cjs");
+    fs.writeFileSync(
+      swapper,
+      `const fs=require("fs"),path=require("path");
+       const [root,outside]=process.argv.slice(2);
+       const target=path.join(root,"swapped");
+       for(let i=0;i<60000;i++){
+         try{fs.rmSync(target,{recursive:true,force:true});}catch{}
+         try{ i%2 ? fs.mkdirSync(target) : fs.symlinkSync(outside,target); }catch{}
+       }`,
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  it("never publishes our bytes outside the root", async () => {
+    const { writeInsideUploadRoot } = await import("@/lib/storage-safe");
+    const { spawn } = await import("node:child_process");
+    const child = spawn(process.execPath, [swapper, uploadRoot, outside], { stdio: "ignore" });
+    const target = path.join(uploadRoot, "swapped", "page.webp");
+
+    try {
+      for (let attempt = 0; attempt < 800; attempt += 1) {
+        await writeInsideUploadRoot(uploadRoot, target, Buffer.from("PAYLOAD")).catch(() => undefined);
+      }
+    } finally {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("close", resolve));
+    }
+
+    // The invariant: however the race landed, no file outside carries our bytes.
+    // A directory may exist there (mkdir is not atomic with the guard — see the
+    // documented limit) and a zero-length file may too, but never a payload.
+    const leaked: string[] = [];
+    for (const entry of fs.readdirSync(outside, { recursive: true })) {
+      const full = path.join(outside, String(entry));
+      const stat = fs.lstatSync(full);
+      if (stat.isFile() && fs.readFileSync(full, "utf8").includes("PAYLOAD")) leaked.push(String(entry));
+    }
+    expect(leaked).toEqual([]);
+  });
+});
+
 describe("the re-check after mkdir uses the upload root, not the directory", () => {
   let base: string;
   let uploadRoot: string;

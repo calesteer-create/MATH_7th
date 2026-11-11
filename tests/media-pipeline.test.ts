@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import sharp from "sharp";
 import { MediaError, inspectWebp, processSourceImage, sha256Hex } from "@/media/process";
 import { checkDeletion, buildReferenceIndex, collectQuizSourceImages, referencedFiles } from "@/media/references";
-import { importImageIntoLesson, listLessonMediaFiles } from "@/media/import";
+import { fileSha256, importImageIntoLesson, listLessonMediaFiles } from "@/media/import";
 import { UnsafePathError, resolveInside, writeFileInside, writeJson } from "@/media/tree";
 import type { LessonImageContent } from "@/content/model";
 import { validateLesson } from "@/content/validate";
@@ -125,6 +125,66 @@ describe("processSourceImage — conversion and metadata strip", () => {
 
   it("rejects an image below the minimum dimensions", async () => {
     await expect(processSourceImage(await makeJpeg(40, 40))).rejects.toBeInstanceOf(MediaError);
+  });
+});
+
+describe("media reads never cross mediaRoot", () => {
+  let root: string;
+  let mediaRoot: string;
+  let outside: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "math7-read-guard-"));
+    mediaRoot = path.join(root, "public", "media");
+    outside = path.join(root, "outside");
+    fs.mkdirSync(path.join(mediaRoot, "lessons"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    // A WebP the outside world owns; a read would consume these very bytes.
+    fs.writeFileSync(path.join(outside, "secret.webp"), Buffer.from("OUTSIDE-WEBP-BYTES"));
+  });
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it("refuses to list a lesson directory that is a link out of mediaRoot", () => {
+    // lessons/3 is a link; `readdir` would follow it and enumerate outside.
+    fs.symlinkSync(outside, path.join(mediaRoot, "lessons", "3"));
+    expect(() => listLessonMediaFiles(mediaRoot, 3)).toThrow(UnsafePathError);
+  });
+
+  it("refuses to hash a path outside mediaRoot before reading a byte", () => {
+    // Prove the refusal precedes the read, not merely that it happens later:
+    // the fd is never opened, so a read attempt would show up as a stat/read.
+    const victim = path.join(outside, "secret.webp");
+    const statBefore = fs.statSync(victim);
+
+    expect(fileSha256(victim, mediaRoot)).toBeNull();
+
+    // Nothing was consumed: same inode, same bytes, same times.
+    const statAfter = fs.statSync(victim);
+    expect(statAfter.ino).toBe(statBefore.ino);
+    expect(statAfter.atimeMs).toBe(statBefore.atimeMs);
+    expect(fs.readFileSync(victim).toString()).toBe("OUTSIDE-WEBP-BYTES");
+  });
+
+  it("refuses when the lesson folder is a link, before import reads it", async () => {
+    fs.symlinkSync(outside, path.join(mediaRoot, "lessons", "3"));
+    const source = await makeJpeg(600, 800);
+
+    // The failure is the *read* guard on the listing, not a later write refusal.
+    await expect(importImageIntoLesson({ mediaRoot, lessonId: 3, source })).rejects.toBeInstanceOf(
+      UnsafePathError,
+    );
+    expect(fs.readdirSync(outside)).toEqual(["secret.webp"]);
+  });
+
+  it("still lists and hashes real files inside mediaRoot", () => {
+    const dir = path.join(mediaRoot, "lessons", "3");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "page-01.webp"), Buffer.from("REAL"));
+
+    expect(listLessonMediaFiles(mediaRoot, 3)).toEqual(["page-01.webp"]);
+    expect(fileSha256(path.join(dir, "page-01.webp"), mediaRoot)).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 

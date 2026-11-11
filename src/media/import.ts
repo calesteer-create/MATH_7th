@@ -63,9 +63,16 @@ export function assertLessonId(lessonId: number): void {
   }
 }
 
-/** Reads `<mediaRoot>/lessons/<id>/*.webp` (not recursive, ignores thumbs/). */
+/**
+ * Reads `<mediaRoot>/lessons/<id>/*.webp` (not recursive, ignores thumbs/).
+ *
+ * The path is proved safe *before* the directory is touched: `readdir` follows a
+ * symlinked component, so a lesson folder that is a link out of `mediaRoot`
+ * would otherwise enumerate — and then hash — files outside the tree. Reading is
+ * a different boundary from writing, and it needs its own guard.
+ */
 export function listLessonMediaFiles(mediaRoot: string, lessonId: number): string[] {
-  const dir = lessonMediaDir(mediaRoot, lessonId);
+  const dir = resolveInside(mediaRoot, lessonMediaDir(mediaRoot, lessonId));
   if (!fs.existsSync(dir)) return [];
   return fs
     .readdirSync(dir, { withFileTypes: true })
@@ -74,10 +81,39 @@ export function listLessonMediaFiles(mediaRoot: string, lessonId: number): strin
     .sort();
 }
 
-/** sha256 of an existing file, or null when it is missing/unreadable. */
-export function fileSha256(file: string): string | null {
+/**
+ * sha256 of an existing file, or null when it is missing/unreadable.
+ *
+ * When a `root` is given (every internal caller), the path is verified to stay
+ * inside it before a byte is read, and the *read* itself is then re-verified:
+ * `O_NOFOLLOW` protects the final component, and the resolved path is compared
+ * against the root afterwards so a component swapped in the interim cannot make
+ * this hash a file outside the tree. Without a root this is a plain hash and
+ * must not be handed an unverified path.
+ */
+export function fileSha256(file: string, root?: string): string | null {
+  if (root === undefined) {
+    try {
+      return sha256Hex(fs.readFileSync(file));
+    } catch {
+      return null;
+    }
+  }
+  let safe: string;
   try {
-    return sha256Hex(fs.readFileSync(file));
+    safe = resolveInside(root, file);
+    // O_NOFOLLOW: the name we hash must not itself be a link.
+    const fd = fs.openSync(safe, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      // The open resolved every directory component afresh; if the result is not
+      // where the guard said it was, a component changed between the check and
+      // the syscall. Nothing outside the root is ever hashed.
+      const actual = fs.realpathSync(safe);
+      if (actual !== safe) throw new UnsafePathError(`${safe} resolved to ${actual}`);
+      return sha256Hex(fs.readFileSync(fd));
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     return null;
   }
@@ -99,7 +135,7 @@ export async function importImageIntoLesson(options: ImportOptions): Promise<Imp
 
   // 1. Same content already stored? Reuse the name (idempotent re-import).
   const onDisk = listLessonMediaFiles(mediaRoot, lessonId);
-  const reuse = onDisk.find((name) => fileSha256(path.join(dir, name)) === processed.sha256);
+  const reuse = onDisk.find((name) => fileSha256(path.join(dir, name), mediaRoot) === processed.sha256);
   const reused = reuse !== undefined;
   const record = existing.find((image) => image.sha256 === processed.sha256);
 

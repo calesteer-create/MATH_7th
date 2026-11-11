@@ -3,24 +3,34 @@
  *
  * `src/lib/storage.ts` keeps its public behaviour; the primitives below are the
  * ones that touch the filesystem. They exist so a symlink planted inside the
- * upload root cannot redirect a write or a delete to somewhere else — the same
- * rule Phase 2's media tooling enforces via `src/media/tree.ts#resolveInside`.
+ * upload root cannot redirect a write or a delete to somewhere else, on the same
+ * component policy Phase 2's media tooling enforces via
+ * `src/media/tree.ts#resolveInside`: **every** component below the root is
+ * checked with `lstat` and any symlink — directory or file, first or last — is
+ * refused. The root itself is the one exception, resolved once through
+ * `realpath`, because the operator names it explicitly.
  *
  * Why not `resolve` + `startsWith`: the kernel follows a symlinked *directory*
  * component in `open(2)`/`unlink(2)`, so a path that merely *looks* contained
- * still lands outside. Each component below the root is checked with `lstat`,
- * the final component is opened with `O_NOFOLLOW`, and the check is repeated as
- * close to the syscall as this API allows.
+ * still lands outside. `O_NOFOLLOW` is not a substitute for this walk either: it
+ * constrains only the final component, so a link in a parent directory is
+ * traversed by the kernel regardless of the flags.
  *
  * **What this does not guarantee** (see the TOCTOU note in
- * docs/CONTENT_MODEL.md): every check here is separated from its use by a
- * window. `mkdir({recursive: true})` is *not* atomic with respect to the guard
- * — it follows a symlinked directory component, so if a component is swapped
- * for a link after the last check and before the mkdir, the directories are
- * created at the link's target. The subsequent re-check (measured against the
- * upload root) then *detects* the escape and nothing is written, but an empty
- * directory tree may already exist outside. Closing that fully needs
- * `openat`/`mkdirat` relative to a directory fd, which Node does not expose.
+ * docs/CONTENT_MODEL.md). Every check below is separated from its use by a
+ * window, and Node exposes no dirfd-relative `openat`/`mkdirat`:
+ *
+ * - `mkdir({recursive: true})` follows a symlinked component, so a component
+ *   swapped between the last check and the call causes the directories to be
+ *   created at the link's target. The re-check that follows *detects* this and
+ *   refuses the write, but the empty directory tree may already exist outside.
+ * - A component swapped between the pre-open check and `open(2)` is caught
+ *   afterwards by `realpath` on the opened path, before any byte is written —
+ *   which limits the damage to an empty file created at the link target, and
+ *   that file is removed on the refusal path.
+ * - A swap that happens *after* the open is not detectable through these APIs.
+ *   The guarantee is therefore "a validated path that is still valid at the
+ *   moment it is observed", not "no concurrent mutation can ever escape".
  *
  * This module is deliberately dependency-light so importing it never pulls in
  * the media-tooling code (and its `sharp` dependency) at request time.
@@ -140,9 +150,46 @@ export async function writeInsideUploadRoot(root: string, target: string, data: 
   resolveInsideUploadRoot(root, safeTarget);
   const handle = await fs.open(safeTarget, flags, 0o644);
   try {
+    // The last defence, and the only one that observes what the *kernel* did:
+    // `realpath` re-walks the whole chain after the open. If a directory
+    // component was swapped for a link between the check above and the open, the
+    // descriptor points somewhere the guard never approved, and this rejects it
+    // before a single byte is written. The empty/truncated file the open created
+    // at that path is removed below, so nothing of ours is left outside the root.
+    await assertOpenedInsideRoot(root, safeTarget);
     await handle.writeFile(data);
-  } finally {
+  } catch (error) {
     await handle.close();
+    // Cleaning up must never replace the real cause with its own failure.
+    try {
+      const stat = await fs.lstat(safeTarget).catch(() => null);
+      if (stat !== null && stat.isFile()) await fs.unlink(safeTarget);
+    } catch {
+      /* the refusal is what the caller needs to see */
+    }
+    throw error;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Proves the path the guard validated is still the path the filesystem resolves.
+ *
+ * `realpath` is the only check that sees the result of the kernel's own walk, so
+ * it catches a component swapped *before* the open — the case `lstat` walks and
+ * `O_NOFOLLOW` both miss, because `O_NOFOLLOW` constrains the final component
+ * only. It cannot catch a swap that happens *after* the open; nothing in Node
+ * can, since there is no dirfd-relative access. This narrows the window, it does
+ * not close it, and the docs say so.
+ */
+async function assertOpenedInsideRoot(root: string, safeTarget: string): Promise<void> {
+  const resolvedRoot = resolveExistingPrefix(path.resolve(root));
+  const actual = await fs.realpath(safeTarget);
+  const under = path.relative(resolvedRoot, actual);
+  const escapes = under === ".." || under.startsWith(`..${path.sep}`) || path.isAbsolute(under);
+  if (escapes) {
+    throw new UnsafeStoragePathError(`${safeTarget} resolves to ${actual}, outside ${resolvedRoot}`);
   }
 }
 
