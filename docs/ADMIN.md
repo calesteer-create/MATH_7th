@@ -107,8 +107,9 @@ mount(App, { target: document.querySelector('#nc-root') ?? document.body, props:
   `createCommitOnBranch(expectedHeadOid: …)` — نفس ما يستخدمه Sveltia.
 - `expectedHeadOid` هو حماية GitHub من الكتابة المتزامنة: إذا تغيّر رأس الفرع
   بين القراءة والكتابة يرفض GitHub الـcommit بدل أن يطمس تعديلًا آخر.
-- **لا شيء** في المسودات يؤدي إلى نشر عام: لا يوجد Workflow في المستودع العام
-  يشير إلى المسودات (`tests/no-public-write.test.ts` يتحقق من ذلك بنيويًا).
+- **لا شيء** في المسودات يؤدي إلى نشر عام: يوجد Workflow نشر Pages في المستودع
+  العام، لكنه يبني من `main` العام فقط ولا يشير إلى المسودات ولا يقرأها
+  (`tests/no-public-write.test.ts` يتحقق من ذلك بنيويًا).
 - الصور المرفوعة من المتصفح تُحوَّل إلى WebP قبل الرفع
   (`media_libraries.all.transformations.raster_image.format: webp`)، وWebP
   لا يحمل حاوية EXIF/GPS، فالحذف بنيوي.
@@ -297,11 +298,14 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
 2. أنشئ **Fine-grained PAT** مقصورًا على ذلك المستودع بصلاحية
    `Contents: Read and write` (و`Metadata: Read` تُضاف تلقائيًا). لا تشاركني إياه.
 3. شغّل `npm run admin:verify-github` وارفع/احفظ الناتج عندك.
-4. افتح النسخة الثابتة: `npm run build:static && npm run preview:static` ثم
+4. افتح النسخة الثابتة الخام محليًا: `npm run build:static && npm run preview:static` ثم
    `http://localhost:4173/MATH_7th/admin/`. (على خادم Next لا يوجد مسار `/admin/`
    للوحة Sveltia: الـmiddleware يحوّله إلى `/{locale}/admin` أي لوحة الخادم
    المختلفة. الصفحة الثابتة متاحة هناك على `/admin/index.html` فقط، وتقرأ
    الإعداد من `public/admin/config.yml` نفسه — وهو مناسب للفحص لا للتجربة الكاملة.)
+   **هذا فحص محلي لـ`out/` الخام فقط.** خط النشر يشغّل `pages:prepare` الذي يستبعد
+   `admin/` من `pages-dist/`، لذلك `/MATH_7th/admin/` على GitHub Pages يجب أن يُجيب
+   404 ولا يُنشر محرر Sveltia في هذه المرحلة.
    سجّل الدخول بالتوكن، وافتح وحدة واحدة، **عدّلها واحفظها**.
 5. تأكد أن commit ظهر في `MATH_7th-drafts` على `main`، وأن الصور وصلت WebP.
 6. **تحقّق من القيمة المخزَّنة في `images[].file`**: المتوقع
@@ -363,9 +367,10 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
   تحقق آلي في `tests/no-public-write.test.ts`.
 - الصفحة تُحمّل Sveltia من `unpkg` بإصدار مثبّت وبصمة SRI؛ أي تغيير في الـCDN
   يوقف التحميل بدلًا من تشغيل كود مختلف.
-- الموقع العام (Pages) لا يعرض لوحة الإدارة: مسار `/admin/` في نسخة Pages هو
-  صفحة ثابتة توضيحية فقط (بانر التجربة + إرشادات)، **وليست** محررًا متصلًا
-  بالمستودع.
+- الموقع العام (Pages) لا يعرض لوحة الإدارة في هذه المرحلة: `pages:prepare`
+  يستبعد `admin/` من Artifact النهائي، و`pages:audit` يفشل إذا ظهر مسار إداري
+  أو مرجع خادمي ممنوع. لذلك `/MATH_7th/admin/` على Pages يجب أن يُجيب 404.
+  صفحة Sveltia التجريبية موجودة فقط في `out/` الخام للمعاينة المحلية، ولا تُرفع.
 
 ### 6.1 ما هو محمي بوصف ملفات، وما هو خارج هذا الضمان
 
@@ -456,6 +461,6 @@ fine-grained. الحقل `permissions` في `GET /repos/{o}/{r}` يصف وصول
 | `tests/admin-verify-github.test.ts` | تسلسل Sveltia كاملًا على المحاكي، عدم لمس `main`، رفض المستودع العام، تنظيف الفرع، CLI |
 | `tests/draft-safety.test.ts` | ملكية الفرع، رفض أي مستودع `private !== true`، عدم قابلية التجاوز، شروط الكتابة، وست حالات لدليل الفرع: غياب مؤكد / فرع موجود / 403 / 5xx أو شبكة / إجابة ناقصة / لا كتابة في كل الحالات الفاشلة |
 | `tests/admin-config.test.ts` | الوجهة المثبتة: `DRAFT_REPO` لا يغيّرها، ولا يُكتب الملف عند الرفض |
-| `tests/no-public-write.test.ts` | لا كتابة للعام، لا Workflow نشر، لا حذف، لا أسرار، لا توكن من argv |
+| `tests/no-public-write.test.ts` | لا كتابة للعام، نشر Pages من `main` فقط وبصلاحيات دنيا، لا حذف، لا أسرار، لا توكن من argv |
 | `tests/images.test.ts` | عدّ الواصفات لا ينمو عبر قراءات/كتابات/حذوفات متكررة، ولا عند رفض كتابة بعد فتح الجذر |
 | `tests/media-pipeline.test.ts` | ملكية الملف المؤقت (لا حذف لملف لم نُنشئه)، الاستعادة على واصف الملف نفسه، وفحص مساحة الأسماء عملية بعملية |
