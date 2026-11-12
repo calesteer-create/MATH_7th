@@ -8,6 +8,8 @@
     "dev": "next dev -H 0.0.0.0 -p 3000",
     "build": "next build",
     "build:static": "node scripts/build-static.mjs",
+    "pages:prepare": "node scripts/pages-artifact.mjs prepare",
+    "pages:audit": "node scripts/pages-artifact.mjs audit",
     "preview:static": "node scripts/preview-static.mjs",
     "start": "next start -H 0.0.0.0 -p 3000",
     "guard": "node scripts/guard.mjs",

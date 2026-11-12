@@ -20,7 +20,8 @@
 | عارض الدرس (تكبير/تحريك/تنقّل/لمس) | ✅ منفَّذ |
 | تحديد «آخر درس في الوحدة» | ✅ منفَّذ |
 | **تصدير ثابت لـ GitHub Pages** (`/MATH_7th/`) | ✅ منفَّذ ومُختبَر — [docs/STATIC_EXPORT.md](docs/STATIC_EXPORT.md) |
-| **لوحة إدارة مسودات على Sveltia CMS + استيراد صور محلي** | ⚠️ منفَّذة لكن **غير معتمدة** — [docs/ADMIN.md](docs/ADMIN.md) |
+| **خط نشر GitHub Pages الآمن** (من `main` فقط + تدقيق Artifact) | ✅ منفَّذ — [docs/STATIC_EXPORT.md](docs/STATIC_EXPORT.md#خط-النشر-آمن-github-pages) |
+| **لوحة إدارة مسودات على Sveltia CMS + استيراد صور محلي** | ⚠️ منفَّذة لكن **غير معتمدة**، ولا تُنشر على Pages — [docs/ADMIN.md](docs/ADMIN.md) |
 | **توليد الاختبارات آليًا** | ⏳ المرحلة التالية |
 | **حل الاختبارات والتصحيح** | ⏳ المرحلة التالية |
 
@@ -73,8 +74,10 @@ npm run admin:verify-github     # يتحقق من مستودع المسودات 
 ```bash
 npm run dev           # خادم التطوير
 npm run build         # بناء الإنتاج (خادم كامل: API + لوحة الإدارة + الوسائط)
-npm run build:static  # تصدير ثابت إلى out/ لـ GitHub Pages (انظر docs/STATIC_EXPORT.md)
-npm run preview:static # معاينة التصدير محليًا كما يخدمه GitHub Pages — ‎http://localhost:4173/MATH_7th/
+npm run build:static  # تصدير ثابت خام إلى out/ (انظر docs/STATIC_EXPORT.md)
+npm run pages:prepare # تجهيز Artifact النشر في pages-dist/ واستبعاد admin/
+npm run pages:audit   # تدقيق Artifact النهائي؛ يفشل عند أي محتوى/مسار غير مسموح
+npm run preview:static # معاينة out/ الخام محليًا — ‎http://localhost:4173/MATH_7th/
 npm start             # تشغيل الإنتاج
 npm run check         # الحارس + فحص الأنواع + الاختبارات
 npm run guard         # منع خصائص الاتجاه الفيزيائية ونداءات التنسيق الخام
@@ -139,8 +142,8 @@ src/
 ├─ i18n/                        routing · request · messages/{ar,en}.json
 └─ lib/                         auth · format · images · storage · queries · base-path · render-mode
 
-scripts/                        build-static · preview-static · clean-stale-types · guard · migrate
-docs/                           CONTENT_MODEL.md · STATIC_EXPORT.md (التصدير لـ GitHub Pages)
+scripts/                        build-static · pages-artifact · preview-static · clean-stale-types · guard · migrate
+docs/                           CONTENT_MODEL.md · STATIC_EXPORT.md (التصدير والنشر الآمن) · ADMIN.md
 ```
 
 ---
@@ -169,28 +172,35 @@ tar czf uploads-$(date +%F).tar.gz data/uploads
 ## الاختبارات
 
 ```
-tests/format.test.ts     الأرقام الغربية + التقويم الميلادي + توقيت دمشق
-tests/schema.test.ts     تطابق SQL مع Drizzle + قيود المنهاج
-tests/password.test.ts   التجزئة والتحقق
-tests/auth-token.test.ts توقيع الجلسة ورفض التزوير والانتهاء
-tests/images.test.ts     كشف الصيغة + المعالجة + حذف EXIF
-tests/content-model.test.ts  التحقق من نموذج المحتوى JSON (علاقات، وسائط، اختبارات)
-tests/static-export.test.ts  بناء التصدير الثابت فعليًا (محتوى فارغ + مزروع) +
-                             سلامة المسارات والأصول تحت /MATH_7th/ + زحف روابط
-                             كامل عبر preview:static + إخفاء المسودات + 404
-tests/server-mode.test.ts    بناء الخادم وتشغيله: Proxy · عرض فوري بعد الإدخال ·
-                             404 والمسودات · الدخول وrequireOwner · الرفع والوسائط ·
-                             تنفيذ Server Action ورفضه بلا جلسة
-tests/render-mode.test.ts    علامات الوضع: BASE_PATH وrenderPerRequest في الوضعين
+tests/format.test.ts          الأرقام الغربية + التقويم الميلادي + توقيت دمشق
+tests/schema.test.ts          تطابق SQL مع Drizzle + قيود المنهاج
+tests/password.test.ts        التجزئة والتحقق
+tests/auth-token.test.ts      توقيع الجلسة ورفض التزوير والانتهاء
+tests/images.test.ts          كشف الصيغة + المعالجة + حذف EXIF
+tests/content-model.test.ts   التحقق من نموذج المحتوى JSON (علاقات، وسائط، اختبارات)
+tests/static-export.test.ts   بناء التصدير الثابت فعليًا (محتوى فارغ + مزروع) +
+                              سلامة المسارات والأصول تحت /MATH_7th/ + زحف روابط
+                              كامل عبر preview:static + إخفاء المسودات + 404 +
+                              تدقيق Artifact الحقيقي واستبعاد admin/ والمسارات الخادمية
+tests/pages-artifact.test.ts  بوابة prepare/audit على fixtures مؤقتة: رفض admin/API/DB/
+                              env/المخفي/الروابط الرمزية/المحتوى الحساس/المراجع الخادمية،
+                              وفحص .nojekyll و_next/ وحدود الحجم و404 عبر خادم يشبه Pages
+tests/no-public-write.test.ts حارس الكتابة العامة وبنية Workflow: CI للقراءة فقط،
+                              Pages من main فقط، صلاحيات النشر محصورة في deploy،
+                              Actions مثبتة، لا Secrets/PAT/مستودع مسودات
+tests/server-mode.test.ts     بناء الخادم وتشغيله: Proxy · عرض فوري بعد الإدخال ·
+                              404 والمسودات · الدخول وrequireOwner · الرفع والوسائط ·
+                              تنفيذ Server Action ورفضه بلا جلسة
+tests/render-mode.test.ts     علامات الوضع: BASE_PATH وrenderPerRequest في الوضعين
 ```
 
 ```
-Test Files  9 passed (9)
-     Tests  93 passed (93)
+Test Files  18 passed (18)
+     Tests  470 passed (470)
 ```
 
 ملفّا `static-export` و`server-mode` يبنيان ويُشغِّلان Next فعليًا داخل الاختبار
-(ضمن مسارات مؤقتة — لا يمسّان `data/` في المستودع)، لذلك يُشغَّل ملفات
+(ضمن مسارات مؤقتة — لا يمسّان `data/` في المستودع)، لذلك تُشغَّل ملفات
 الاختبار تسلسليًا (`fileParallelism: false` في `vitest.config.ts`).
 
 ---

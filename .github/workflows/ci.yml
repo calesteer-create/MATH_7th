@@ -19,13 +19,17 @@ jobs:
     name: Verify application
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
@@ -37,7 +41,7 @@ jobs:
         run: npm run guard
 
       - name: Validate content model
-        run: npm run content:validate
+        run: npm run content:validate -- --strict
 
       - name: Check the generated admin config is up to date
         run: npm run admin:config:check
@@ -50,3 +54,12 @@ jobs:
 
       - name: Build production app
         run: npm run build
+
+      - name: Build static export
+        run: npm run build:static
+
+      - name: Prepare Pages artifact
+        run: npm run pages:prepare
+
+      - name: Audit Pages artifact
+        run: npm run pages:audit

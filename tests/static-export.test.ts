@@ -26,6 +26,7 @@ import { migrate } from "../scripts/migrate";
 
 const ROOT = process.cwd();
 const OUT = path.join(ROOT, "out");
+const PAGES_DIST = path.join(ROOT, "pages-dist");
 const BASE = "/MATH_7th";
 
 /** Prefixes that only exist behind the Node server (documented limitation). */
@@ -51,6 +52,14 @@ function runBuild(): void {
       `build:static failed (exit ${res.status})\n${res.stdout ?? ""}\n${res.stderr ?? ""}`,
     );
   }
+}
+
+function runPagesArtifact(command: "prepare" | "audit", cwd = ROOT) {
+  return spawnSync(process.execPath, [path.join(ROOT, "scripts", "pages-artifact.mjs"), command], {
+    cwd,
+    encoding: "utf8",
+    timeout: 60_000,
+  });
 }
 
 function seedContent(): void {
@@ -299,6 +308,35 @@ describe("static export — empty content", () => {
   it("keeps every URL under /MATH_7th/", () => {
     expect(basePathViolations()).toEqual([]);
   });
+
+  it("prepares and audits the exact upload artifact without admin or server-only paths", () => {
+    const prepared = runPagesArtifact("prepare");
+    expect(prepared.status, `${prepared.stdout}\n${prepared.stderr}`).toBe(0);
+    const audited = runPagesArtifact("audit");
+    expect(audited.status, `${audited.stdout}\n${audited.stderr}`).toBe(0);
+
+    const artifactFiles = walk(PAGES_DIST).map((file) => path.relative(PAGES_DIST, file));
+    const exportFiles = walk(OUT)
+      .map((file) => path.relative(OUT, file))
+      .filter((rel) => !rel.startsWith("admin/"));
+    expect(artifactFiles.sort()).toEqual(exportFiles.sort());
+
+    expect(fs.existsSync(path.join(PAGES_DIST, ".nojekyll"))).toBe(true);
+    expect(fs.existsSync(path.join(PAGES_DIST, "index.html"))).toBe(true);
+    expect(fs.existsSync(path.join(PAGES_DIST, "404.html"))).toBe(true);
+    expect(fs.existsSync(path.join(PAGES_DIST, "ar/index.html"))).toBe(true);
+    expect(fs.existsSync(path.join(PAGES_DIST, "en/index.html"))).toBe(true);
+    expect(artifactFiles.some((rel) => rel.startsWith("_next/"))).toBe(true);
+
+    for (const rel of artifactFiles) {
+      expect(rel, `server-only or sensitive path leaked: ${rel}`).not.toMatch(
+        /(^|\/)(admin|api|data)(\/|$)|(^|\/)media\/i(\/|$)|(^|\/)\.env|\.db(?:[-_]|$)/i,
+      );
+      const hidden = rel.split("/").some((segment) => segment.startsWith("."));
+      if (hidden) expect(rel).toBe(".nojekyll");
+      expect(fs.lstatSync(path.join(PAGES_DIST, rel)).isSymbolicLink(), `symlink leaked: ${rel}`).toBe(false);
+    }
+  });
 });
 
 // ── 2. seeded content (temp database — never the repository's data/) ──────
@@ -344,6 +382,20 @@ describe("static export — seeded content", () => {
     const media = [...html.matchAll(/src="([^"]*\/media\/[^"]*)"/g)].map((m) => m[1]!);
     expect(media.length).toBeGreaterThan(0);
     for (const url of media) expect(url.startsWith(`${BASE}/media/`)).toBe(true);
+  });
+
+  it("fails closed instead of preparing an artifact that references server-only media", () => {
+    // The static-image source is a separate, deferred phase. Until then, a
+    // seeded export with /media/i/ URLs must not become a public artifact.
+    const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "math7-pages-seeded-"));
+    try {
+      fs.cpSync(OUT, path.join(isolated, "out"), { recursive: true });
+      const res = runPagesArtifact("prepare", isolated);
+      expect(res.status, `${res.stdout}\n${res.stderr}`).not.toBe(0);
+      expect(`${res.stdout}\n${res.stderr}`).toMatch(/server-only route reference|forbidden server-only/);
+    } finally {
+      fs.rmSync(isolated, { recursive: true, force: true });
+    }
   });
 
   it("keeps hreflang alternates, RTL/LTR and the base path intact", () => {

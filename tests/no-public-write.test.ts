@@ -17,7 +17,13 @@ const ROOT = process.cwd();
 
 function walk(dir: string, filter: (file: string) => boolean, out: string[] = []): string[] {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.name === "node_modules" || entry.name === ".git" || entry.name === ".next" || entry.name === "out") {
+    if (
+      entry.name === "node_modules" ||
+      entry.name === ".git" ||
+      entry.name === ".next" ||
+      entry.name === "out" ||
+      entry.name === "pages-dist"
+    ) {
       continue;
     }
     const full = path.join(dir, entry.name);
@@ -105,35 +111,154 @@ describe("no code path writes to the public repository", () => {
   });
 });
 
-describe("no publish workflow exists in this PR", () => {
+describe("deployment workflows are isolated, main-only and least-privilege", () => {
   const workflowDir = path.join(ROOT, ".github", "workflows");
-  const workflows = fs.existsSync(workflowDir) ? fs.readdirSync(workflowDir) : [];
+  const workflows = fs.existsSync(workflowDir) ? fs.readdirSync(workflowDir).sort() : [];
 
-  it("keeps exactly the CI workflow", () => {
-    expect(workflows.sort()).toEqual(["ci.yml"]);
+  /** Verified official action tags -> commit SHAs (read from GitHub before pinning). */
+  const PINNED_ACTIONS: Record<string, string> = {
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1", // v7.0.1
+    "actions/setup-node": "949feb2413d6458794dcd2491c4babbbce0c15c1", // v7.1.0
+    "actions/upload-pages-artifact": "fc324d3547104276b827a68afc52ff2a11cc49c9", // v5.0.0
+    "actions/deploy-pages": "368f82528645a54fb793d4d04e342629a3f51346", // v5.0.1
+  };
+
+  function readWorkflow(name: string): string {
+    return fs.readFileSync(path.join(workflowDir, name), "utf8");
+  }
+
+  function parseWorkflow(name: string): Record<string, unknown> {
+    return YAML.parse(readWorkflow(name)) as Record<string, unknown>;
+  }
+
+  function usesOf(workflow: Record<string, unknown>): string[] {
+    const jobs = workflow.jobs as Record<string, { steps?: Array<{ uses?: string }> }>;
+    return Object.values(jobs).flatMap((job) => (job.steps ?? []).map((step) => step.uses ?? "")).filter(Boolean);
+  }
+
+  function stepsOf(workflow: Record<string, unknown>): Array<{ uses?: string; with?: Record<string, unknown> }> {
+    const jobs = workflow.jobs as Record<string, { steps?: Array<{ uses?: string; with?: Record<string, unknown> }> }>;
+    return Object.values(jobs).flatMap((job) => job.steps ?? []);
+  }
+
+  it("keeps exactly the CI and Pages workflows", () => {
+    expect(workflows).toEqual(["ci.yml", "pages.yml"]);
   });
 
-  it("has no deploy/pages/publish job", () => {
-    const ci = fs.readFileSync(path.join(workflowDir, "ci.yml"), "utf8");
+  it("keeps CI read-only and unable to deploy", () => {
+    const ci = readWorkflow("ci.yml");
     for (const forbidden of [
       /deploy-pages/,
       /actions\/deploy-pages/,
       /upload-pages-artifact/,
       /pages:\s*write/,
+      /id-token:\s*write/,
       /gh-pages/,
       /peaceiris\/actions-gh-pages/,
     ]) {
       expect(forbidden.test(ci)).toBe(false);
     }
-    // And the CI permissions stay read-only.
     expect(ci).toMatch(/permissions:\s*\n\s*contents:\s*read/);
+    const parsed = parseWorkflow("ci.yml");
+    expect(parsed.permissions).toEqual({ contents: "read" });
+    const jobs = parsed.jobs as Record<string, { permissions?: unknown }>;
+    for (const job of Object.values(jobs)) {
+      const permissions = (job.permissions ?? { contents: "read" }) as Record<string, string>;
+      expect(permissions).toEqual({ contents: "read" });
+    }
   });
 
-  it("does not mention the drafts repository in any workflow", () => {
+  it("does not mention the private editorial repository in any workflow", () => {
     for (const workflow of workflows) {
-      const text = fs.readFileSync(path.join(workflowDir, workflow), "utf8");
+      const text = readWorkflow(workflow);
       expect(text).not.toContain(DRAFT_REPO_DEFAULT);
       expect(text.toLowerCase()).not.toContain("draft");
+    }
+  });
+
+  it("triggers Pages only from main and never from pull requests", () => {
+    const pages = parseWorkflow("pages.yml");
+    const on = (pages.on ?? pages["true"]) as Record<string, unknown>;
+    expect(Object.keys(on).sort()).toEqual(["push", "workflow_dispatch"]);
+    expect(on.push).toEqual({ branches: ["main"] });
+    expect(pages.permissions).toEqual({ contents: "read" });
+    expect(pages.concurrency).toEqual({ group: "pages", "cancel-in-progress": false });
+
+    const jobs = pages.jobs as Record<string, { if?: string }>;
+    expect(Object.keys(jobs).sort()).toEqual(["build", "deploy"]);
+    for (const job of Object.values(jobs)) {
+      expect(job.if).toBe("github.ref == 'refs/heads/main'");
+    }
+  });
+
+  it("confines Pages write permissions to the deploy job", () => {
+    const pages = parseWorkflow("pages.yml");
+    const jobs = pages.jobs as Record<
+      string,
+      { permissions?: Record<string, string>; needs?: string | string[]; environment?: { name?: string } }
+    >;
+    const build = jobs.build!;
+    const deploy = jobs.deploy!;
+    expect(build.permissions).toEqual({ contents: "read" });
+    expect(deploy.permissions).toEqual({ pages: "write", "id-token": "write" });
+    expect(deploy.needs).toBe("build");
+    expect(deploy.environment?.name).toBe("github-pages");
+  });
+
+  it("uses only official actions pinned to the verified commit SHAs", () => {
+    for (const workflow of workflows) {
+      for (const uses of usesOf(parseWorkflow(workflow))) {
+        const match = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)@([a-f0-9]{40})$/.exec(uses);
+        expect(match, `unpinned or non-official action: ${uses}`).not.toBeNull();
+        const action = match![1]!;
+        const sha = match![2]!;
+        expect(Object.keys(PINNED_ACTIONS)).toContain(action);
+        expect(sha).toBe(PINNED_ACTIONS[action]!);
+      }
+    }
+  });
+
+  it("uploads only the audited artifact and keeps .nojekyll", () => {
+    const pages = parseWorkflow("pages.yml");
+    const jobs = pages.jobs as Record<string, { steps: Array<{ name?: string; run?: string; uses?: string; with?: Record<string, unknown> }> }>;
+    const buildSteps = jobs.build!.steps;
+    const stepText = (step: { name?: string; run?: string; uses?: string }) =>
+      `${step.name ?? ""}\n${step.run ?? ""}\n${step.uses ?? ""}`;
+    const prepare = buildSteps.findIndex((step) => stepText(step).includes("pages:prepare"));
+    const audit = buildSteps.findIndex((step) => stepText(step).includes("pages:audit"));
+    const upload = buildSteps.findIndex((step) => step.uses?.startsWith("actions/upload-pages-artifact@"));
+    expect(prepare).toBeGreaterThanOrEqual(0);
+    expect(audit).toBeGreaterThan(prepare);
+    expect(upload).toBeGreaterThan(audit);
+    expect(buildSteps[upload]!.with).toMatchObject({
+      path: "pages-dist",
+      "include-hidden-files": true,
+    });
+
+    const deploySteps = jobs.deploy!.steps;
+    expect(deploySteps).toHaveLength(1);
+    expect(deploySteps[0]!.uses).toMatch(/^actions\/deploy-pages@[a-f0-9]{40}$/);
+  });
+
+  it("reads no Secrets or PATs in any workflow", () => {
+    for (const workflow of workflows) {
+      const text = readWorkflow(workflow);
+      expect(text).not.toMatch(/secrets\./i);
+      expect(text).not.toMatch(/github\.token/i);
+      expect(text).not.toMatch(/\bpat\b/i);
+      expect(text).not.toMatch(/personal_access_token/i);
+    }
+  });
+
+  it("does not persist checkout credentials into the build workspace", () => {
+    for (const workflow of workflows) {
+      const checkouts = stepsOf(parseWorkflow(workflow)).filter((step) =>
+        step.uses?.startsWith("actions/checkout@"),
+      );
+      expect(checkouts.length).toBeGreaterThan(0);
+      for (const step of checkouts) {
+        expect(step.with?.["persist-credentials"]).toBe(false);
+      }
     }
   });
 });
