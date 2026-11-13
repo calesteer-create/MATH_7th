@@ -10,42 +10,62 @@
 @theme {
   --font-sans: "Readex Pro Variable", "Segoe UI", ui-sans-serif, system-ui, sans-serif;
 
-  /* Surfaces — deep, calm, low-chroma so textbook scans stay the brightest thing on screen */
-  --color-ink-950: #05080f;
-  --color-ink-900: #080d17;
-  --color-ink-850: #0b1220;
-  --color-ink-800: #101a2b;
-  --color-ink-750: #16223a;
-  --color-ink-700: #1d2c49;
+  /* Surfaces — lifted off near-black so the interface reads bright and alive,
+     while staying dark enough that textbook scans remain the focus.
+     Every text token below is verified ≥ 4.5:1 against both the page
+     background (ink-950) and the raised card surface (ink-800). */
+  --color-ink-950: #0a1020;
+  --color-ink-900: #0f1729;
+  --color-ink-850: #131d33;
+  --color-ink-800: #18243d;
+  --color-ink-750: #1f2e4d;
+  --color-ink-700: #27395e;
 
-  --color-line: #1b2740;
-  --color-line-soft: #141d31;
+  --color-line: #26355a;
+  --color-line-soft: #1c2742;
 
-  --color-mist: #e8eefb;
-  --color-muted: #93a3c0;
-  --color-faint: #64748f;
+  --color-mist: #f2f6ff;
+  --color-muted: #a9b8d4;
+  --color-faint: #7d8dab;
 
-  /* Brand */
-  --color-brand-300: #5ff0d4;
-  --color-brand-400: #2fdfc0;
-  --color-brand-500: #16c3a6;
-  --color-brand-600: #0e9e88;
-  --color-gold-400: #f5c451;
+  /* Brand — brighter, higher-chroma teal */
+  --color-brand-300: #6ffbdd;
+  --color-brand-400: #34edcb;
+  --color-brand-500: #14d4b4;
+  --color-brand-600: #0fb499;
+  --color-gold-400: #ffd166;
 
-  /* Per-unit accents — one per unit, keeps identity consistent but pages distinct */
-  --color-unit-teal: #16c3a6;
-  --color-unit-sky: #3ba3f5;
-  --color-unit-indigo: #7c7cf5;
-  --color-unit-violet: #a86ef0;
-  --color-unit-rose: #f0679b;
-  --color-unit-amber: #f0a83c;
-  --color-unit-emerald: #46c46f;
-  --color-unit-cyan: #2ec5d8;
+  /* WhatsApp brand green (official) + an accessible on-dark variant */
+  --color-whatsapp: #25d366;
+  --color-whatsapp-bright: #4ce68a;
 
   --radius-card: 1.25rem;
 
+  /* Fixed contact bars. The bottom bar is `position: fixed`, so the shell
+     reserves exactly this much space (plus the device safe-area inset) to
+     guarantee it can never cover the footer or a lesson navigation button.
+     The top bar is in normal flow inside the sticky stack, so it needs no
+     reservation — it occupies its own height. */
+  --contact-top-h: 2.25rem;
+  --contact-bottom-h: 4rem;
+
   --animate-rise: rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
   --animate-fade: fade 0.35s ease both;
+}
+
+/* Emitted unconditionally: these are consumed through `var(--color-unit-*)`
+   in inline styles, which the utility scanner cannot see. Without `static`
+   Tailwind v4 tree-shakes them and every unit accent falls back to white. */
+@theme static {
+  /* Per-unit accents — one per unit, keeps identity consistent but pages distinct */
+  --color-unit-teal: #14d4b4;
+  --color-unit-sky: #4fb3ff;
+  --color-unit-indigo: #8f8fff;
+  --color-unit-violet: #b882ff;
+  --color-unit-rose: #ff77a9;
+  --color-unit-amber: #ffb44d;
+  --color-unit-emerald: #52d97f;
+  --color-unit-cyan: #3ad4e8;
 }
 
 @keyframes rise {
@@ -65,6 +85,10 @@
   html {
     -webkit-text-size-adjust: 100%;
     scroll-behavior: smooth;
+    /* Anchor jumps (skip-link → #main) must land below the sticky stack,
+       not underneath it. */
+    scroll-padding-block-start: calc(var(--contact-top-h) + 4rem + 0.75rem);
+    scroll-padding-block-end: calc(var(--contact-bottom-h) + env(safe-area-inset-bottom, 0px));
   }
 
   body {
@@ -105,10 +129,47 @@
   .card-surface {
     background-image: linear-gradient(
       160deg,
-      color-mix(in oklab, var(--color-ink-800) 92%, white 8%),
+      color-mix(in oklab, var(--color-ink-800) 88%, white 12%),
       var(--color-ink-900)
     );
     border: 1px solid var(--color-line);
+  }
+
+  /* ── Fixed WhatsApp contact bars ────────────────────────────────────────
+     Top: in normal flow, inside SiteShell's sticky stack, so it scrolls away
+     from nothing and never overlaps the header or the mobile menu.
+     Bottom: genuinely fixed, with its height reserved by `.contact-reserve`
+     so no content, footer line or navigation button can sit underneath it.
+     Its z-index sits below the sticky header stack (z-40) so that, on a very
+     short viewport, an open mobile menu paints over the bar instead of being
+     clipped by it. Both use logical properties only — they mirror in RTL. */
+  .contact-bar-top {
+    block-size: var(--contact-top-h);
+    background-image: linear-gradient(
+      90deg,
+      color-mix(in oklab, var(--color-whatsapp) 14%, var(--color-ink-900)),
+      var(--color-ink-900) 55%,
+      color-mix(in oklab, var(--color-brand-500) 12%, var(--color-ink-900))
+    );
+    border-block-end: 1px solid var(--color-line-soft);
+  }
+
+  .contact-bar-bottom {
+    position: fixed;
+    inset-inline: 0;
+    inset-block-end: 0;
+    z-index: 30;
+    block-size: calc(var(--contact-bottom-h) + env(safe-area-inset-bottom, 0px));
+    padding-block-end: env(safe-area-inset-bottom, 0px);
+    background-color: color-mix(in oklab, var(--color-ink-900) 88%, transparent);
+    border-block-start: 1px solid var(--color-line);
+    backdrop-filter: blur(16px);
+    box-shadow: 0 -12px 32px -20px rgb(0 0 0 / 0.8);
+  }
+
+  /* Reserved space for the fixed bottom bar — applied to the page wrapper. */
+  .contact-reserve {
+    padding-block-end: calc(var(--contact-bottom-h) + env(safe-area-inset-bottom, 0px));
   }
 
   .hairline {
