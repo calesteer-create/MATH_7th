@@ -113,7 +113,7 @@ export default async function LessonPage({
 
       <section className="mt-10 grid gap-4 sm:grid-cols-2">
         <div className="card-surface rounded-2xl p-6">
-          <h2 className="text-lg font-bold text-mist">{t("quizTitle")}</h2>
+          <h2 className="text-lg font-bold text-white">{t("quizTitle")}</h2>
           <p className="mt-1 text-sm text-muted">{t("quizNotReady")}</p>
           <div className="mt-4">
             <Badge tone="neutral">{t("quizNotReady")}</Badge>

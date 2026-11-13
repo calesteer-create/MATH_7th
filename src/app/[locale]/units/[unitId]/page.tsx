@@ -92,8 +92,10 @@ export default async function UnitPage({
         </div>
       </header>
 
-      <section className="mt-10">
-        <h2 className="mb-5 text-xl font-bold text-mist">{t("lessonsTitle")}</h2>
+      <section className="mt-10" style={{ ["--accent" as string]: `var(--color-unit-${accent})` }}>
+        <h2 className="mb-5 border-s-2 border-[var(--accent)] ps-3 text-xl font-bold text-white">
+          {t("lessonsTitle")}
+        </h2>
 
         {lessons.length === 0 ? (
           <EmptyState title={t("noLessonsTitle")} body={t("noLessonsBody")} />
@@ -102,7 +104,11 @@ export default async function UnitPage({
             {lessons.map((lesson, i) => {
               const isLast = lesson.isLastInUnit === 1;
               return (
-                <li key={lesson.id} className="animate-rise" style={{ animationDelay: `${i * 40}ms` }}>
+                // `min-w-0` lets the grid item shrink below its content's
+                // min-content width. Without it a long Arabic title plus the
+                // "last lesson" badge sized the track wider than the viewport
+                // and the page scrolled sideways on a phone.
+                <li key={lesson.id} className="animate-rise min-w-0" style={{ animationDelay: `${i * 40}ms` }}>
                   <Link
                     href={`/lessons/${lesson.id}`}
                     className="card-surface group flex items-center gap-4 rounded-2xl p-4 transition-all hover:-translate-y-0.5 hover:border-white/20 sm:p-5"
@@ -147,7 +153,7 @@ export default async function UnitPage({
           )}
         >
           <div>
-            <h2 className="text-lg font-bold text-mist">{t("quizTitle")}</h2>
+            <h2 className="text-lg font-bold text-white">{t("quizTitle")}</h2>
             <p className="mt-1 text-sm text-muted">
               {complete ? t("quizSubtitle") : t("quizNotReady")}
             </p>

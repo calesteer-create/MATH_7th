@@ -302,6 +302,12 @@
     "arabic": "Arabic",
     "english": "English"
   },
+  "contact": {
+    "name": "Eng. Somer Shaheen",
+    "cta": "Chat on WhatsApp",
+    "shortCta": "WhatsApp",
+    "ariaLabel": "Contact Eng. Somer Shaheen on WhatsApp at 0930215022 (opens in a new tab)"
+  },
   "footer": {
     "note": "Lesson content comes from the official textbook and is added by the platform owner.",
     "personal": "A personal educational platform."

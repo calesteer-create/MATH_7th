@@ -309,6 +309,39 @@ describe("static export — empty content", () => {
     expect(basePathViolations()).toEqual([]);
   });
 
+  it("ships both contact bars on every exported public page, in both locales", () => {
+    const pages = walk(OUT).filter(
+      (f) => f.endsWith(".html") && /(^|\/)(ar|en)\//.test(path.relative(OUT, f)),
+    );
+    expect(pages.length).toBeGreaterThan(0);
+    for (const file of pages) {
+      const html = fs.readFileSync(file, "utf8");
+      // The placeholder 404 shells are Next error pages, not site pages.
+      if (html.includes("__next_error__")) continue;
+      const rel = path.relative(OUT, file);
+      expect(html, `${rel} top bar`).toContain("contact-bar-top");
+      expect(html, `${rel} bottom bar`).toContain("contact-bar-bottom");
+      expect(html, `${rel} WhatsApp URL`).toContain("https://wa.me/963930215022");
+      expect(html, `${rel} safe new tab`).toContain('rel="noopener noreferrer"');
+      expect(html, `${rel} space reservation`).toContain("contact-reserve");
+    }
+  });
+
+  it("compiles the contact layout and the unit accents into the real stylesheet", () => {
+    const css = walk(OUT)
+      .filter((f) => f.endsWith(".css"))
+      .map((f) => fs.readFileSync(f, "utf8"))
+      .join("\n");
+    expect(css).toContain("contact-bar-top");
+    expect(css).toContain("contact-bar-bottom");
+    expect(css).toContain("contact-reserve");
+    expect(css).toContain("env(safe-area-inset-bottom");
+    // Consumed via inline `var(--color-unit-*)`: must survive tree-shaking.
+    for (const accent of ["teal", "sky", "indigo", "violet", "rose", "amber", "emerald", "cyan"]) {
+      expect(css, `--color-unit-${accent}`).toContain(`--color-unit-${accent}:`);
+    }
+  });
+
   it("prepares and audits the exact upload artifact without admin or server-only paths", () => {
     const prepared = runPagesArtifact("prepare");
     expect(prepared.status, `${prepared.stdout}\n${prepared.stderr}`).toBe(0);

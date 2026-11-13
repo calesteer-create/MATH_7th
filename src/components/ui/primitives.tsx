@@ -6,10 +6,13 @@ type ButtonSize = "sm" | "md" | "lg";
 
 const VARIANTS: Record<ButtonVariant, string> = {
   primary:
-    "bg-brand-500 text-ink-950 hover:bg-brand-400 shadow-[0_10px_30px_-12px_var(--color-brand-500)] font-semibold",
-  secondary: "card-surface text-mist hover:border-brand-500/50 hover:text-white",
-  ghost: "text-muted hover:text-mist hover:bg-white/5",
-  danger: "bg-rose-500/15 text-rose-300 hover:bg-rose-500/25 border border-rose-500/30",
+    "bg-gradient-to-b from-brand-400 to-brand-500 text-ink-950 font-semibold " +
+    "hover:from-brand-300 hover:to-brand-400 shadow-[0_10px_30px_-12px_var(--color-brand-500)]",
+  secondary:
+    "card-surface text-mist hover:border-brand-500/60 hover:text-white hover:bg-white/[0.04]",
+  ghost: "text-muted hover:text-mist hover:bg-white/[0.07]",
+  danger:
+    "bg-rose-500/18 text-rose-200 hover:bg-rose-500/28 border border-rose-400/40",
 };
 
 const SIZES: Record<ButtonSize, string> = {
@@ -67,11 +70,11 @@ export function Badge({
   className?: string;
 }) {
   const tones = {
-    neutral: "bg-white/5 text-muted border-white/10",
-    brand: "bg-brand-500/12 text-brand-300 border-brand-500/30",
-    warn: "bg-amber-400/12 text-amber-300 border-amber-400/30",
-    danger: "bg-rose-500/12 text-rose-300 border-rose-500/30",
-    success: "bg-emerald-500/12 text-emerald-300 border-emerald-500/30",
+    neutral: "bg-white/[0.07] text-muted border-white/15",
+    brand: "bg-brand-500/16 text-brand-300 border-brand-400/40",
+    warn: "bg-amber-400/16 text-amber-200 border-amber-400/40",
+    danger: "bg-rose-500/16 text-rose-200 border-rose-400/40",
+    success: "bg-emerald-500/16 text-emerald-200 border-emerald-400/40",
   } as const;
   return (
     <span
@@ -99,7 +102,7 @@ export function EmptyState({
     <div className="card-surface rounded-[var(--radius-card)] px-6 py-14 text-center">
       <div
         aria-hidden
-        className="mx-auto mb-5 grid size-14 place-items-center rounded-2xl border border-white/10 bg-white/[0.03] text-2xl text-muted"
+        className="mx-auto mb-5 grid size-14 place-items-center rounded-2xl border border-brand-400/25 bg-brand-500/10 text-2xl text-brand-300"
       >
         ◇
       </div>
@@ -120,18 +123,18 @@ export function SectionHeading({
   subtitle?: string;
 }) {
   return (
-    <header className="mb-8">
+    <header className="mb-8 border-s-2 border-brand-400/70 ps-4">
       {eyebrow ? (
-        <p className="mb-2 text-xs font-semibold text-brand-400">{eyebrow}</p>
+        <p className="mb-2 text-xs font-semibold text-brand-300">{eyebrow}</p>
       ) : null}
-      <h1 className="text-balance text-3xl font-bold text-mist sm:text-4xl">{title}</h1>
+      <h1 className="text-balance text-3xl font-bold text-white sm:text-4xl">{title}</h1>
       {subtitle ? <p className="mt-3 max-w-2xl text-base text-muted">{subtitle}</p> : null}
     </header>
   );
 }
 
 export const fieldClass =
-  "w-full rounded-xl border border-white/10 bg-ink-900 px-3.5 py-2.5 text-sm text-mist " +
-  "placeholder:text-faint transition-colors focus:border-brand-500/60 focus:outline-none";
+  "w-full rounded-xl border border-white/15 bg-ink-900 px-3.5 py-2.5 text-sm text-mist " +
+  "placeholder:text-faint transition-colors hover:border-white/25 focus:border-brand-400 focus:outline-none";
 
 export const labelClass = "mb-1.5 block text-sm font-medium text-muted";

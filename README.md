@@ -10,7 +10,8 @@
 
 | الجزء | الحالة |
 |---|---|
-| الهوية البصرية والواجهة الداكنة | ✅ منفَّذة |
+| الهوية البصرية والواجهة الداكنة | ✅ منفَّذة — لوحة ألوان أكثر إشراقًا (المرحلة 1) |
+| **شريطا تواصل واتساب ثابتان** (أعلى وأسفل كل صفحة) | ✅ منفَّذ ومُختبَر — [docs/DESIGN.md](docs/DESIGN.md) |
 | العربية (RTL) والإنجليزية (LTR) مع مبدّل لغة | ✅ منفَّذ |
 | الأرقام الغربية `0123456789` في اللغتين | ✅ منفَّذ ومُختبَر |
 | حساب المالك وحماية لوحة الإدارة | ✅ منفَّذ |
@@ -135,15 +136,17 @@ src/
 │  ├─ api/admin/                login · logout · upload (`.srv`)
 │  └─ media/i/[imageId]/[variant]   خدمة الصور مع فحص الصلاحية (`.srv`)
 ├─ components/
+│  ├─ site-shell.tsx            الغلاف العام: الغلاف اللاصق + حجز مساحة الشريط السفلي
+│  ├─ contact-bar.tsx           شريطا واتساب (أعلى وأسفل) — أيقونة SVG مضمّنة
 │  ├─ lesson/page-viewer.tsx    العارض: تكبير وتحريك وتنقّل ولمس
 │  ├─ admin/image-manager.tsx   الرفع الدفعي والترتيب
 │  └─ ui/ar-text.tsx            وسم المحتوى العربي بلغته داخل أي واجهة
 ├─ db/                          schema.ts + migrations/ (SQL يدوي)
 ├─ i18n/                        routing · request · messages/{ar,en}.json
-└─ lib/                         auth · format · images · storage · queries · base-path · render-mode
+└─ lib/                         auth · format · images · storage · queries · base-path · render-mode · contact
 
 scripts/                        build-static · pages-artifact · preview-static · clean-stale-types · guard · migrate
-docs/                           CONTENT_MODEL.md · STATIC_EXPORT.md (التصدير والنشر الآمن) · ADMIN.md
+docs/                           CONTENT_MODEL.md · STATIC_EXPORT.md (التصدير والنشر الآمن) · ADMIN.md · DESIGN.md (المرحلة 1)
 ```
 
 ---
@@ -192,11 +195,14 @@ tests/server-mode.test.ts     بناء الخادم وتشغيله: Proxy · ع�
                               404 والمسودات · الدخول وrequireOwner · الرفع والوسائط ·
                               تنفيذ Server Action ورفضه بلا جلسة
 tests/render-mode.test.ts     علامات الوضع: BASE_PATH وrenderPerRequest في الوضعين
+tests/contact-bar.test.ts     شريطا التواصل: اشتقاق رقم wa.me · العرض الفعلي باللغتين ·
+                              عقد التخطيط (حجز المساحة، safe-area، ترتيب الطبقات،
+                              خصائص منطقية) · نسب التباين AA/AAA · رموز ألوان الوحدات
 ```
 
 ```
-Test Files  18 passed (18)
-     Tests  470 passed (470)
+Test Files  19 passed (19)
+     Tests  529 passed (529)
 ```
 
 ملفّا `static-export` و`server-mode` يبنيان ويُشغِّلان Next فعليًا داخل الاختبار

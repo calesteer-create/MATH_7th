@@ -19,7 +19,10 @@ export function SiteHeader() {
   ];
 
   return (
-    <header className="sticky top-0 z-40 border-b border-line-soft bg-ink-950/80 backdrop-blur-xl">
+    // Not sticky on its own: SiteShell wraps this header together with the top
+    // contact bar in one sticky stack. A nested `sticky top-0` here would pull
+    // the header up over the contact bar while scrolling.
+    <header className="border-b border-line-soft bg-ink-950/85 backdrop-blur-xl">
       <div className="mx-auto flex h-16 max-w-6xl items-center gap-3 px-4 sm:px-6">
         <Link href="/" className="flex items-center gap-2.5" onClick={() => setOpen(false)}>
           <span
