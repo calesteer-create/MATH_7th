@@ -13,7 +13,10 @@
  * Policy:
  *   - only the public static site trees are copied;
  *   - `admin/` is deliberately excluded (Sveltia is not published in this phase);
- *   - API routes, server media routes, databases, env files and source files fail;
+ *   - API routes, databases, env files and source files fail;
+ *   - the *server* media route (`/media/i/…`) fails, while the *static* scan tree
+ *     (`media/lessons/<id>/<file>.webp`) is allowed — that is how a Pages build
+ *     serves textbook pages without a server (src/lib/scan-url.ts);
  *   - symlinks and non-regular files fail;
  *   - the only approved hidden file is the root `.nojekyll`;
  *   - text assets are scanned for private-repo markers, draft sentinels, token
@@ -31,8 +34,33 @@ const DEST_DIR = path.join(ROOT, "pages-dist");
 const BASE_PATH = "/MATH_7th";
 
 /** Root entries produced by the public Next static export. */
-const ALLOWED_ROOT_DIRS = new Set(["_next", "_not-found", "404", "ar", "en"]);
+const ALLOWED_ROOT_DIRS = new Set(["_next", "_not-found", "404", "ar", "en", "media"]);
 const ALLOWED_ROOT_FILES = new Set(["index.html", "404.html", ".nojekyll"]);
+
+/**
+ * The one static media shape that may be published.
+ *
+ * `media/lessons/<lessonId>/<file>.webp` and
+ * `media/lessons/<lessonId>/thumbs/<file>.webp` — nothing else under media/.
+ * The shape is re-checked here (not only in build-static) because this script
+ * is the last gate before bytes become public.
+ */
+const STATIC_SCAN_PATH = /^media\/lessons\/([1-9]\d{0,8})\/(?:thumbs\/)?[a-z0-9][a-z0-9-]{0,60}\.webp$/;
+
+/** Directories that may exist on the way to a scan — and nothing beyond them. */
+const STATIC_SCAN_DIR = /^media(?:\/lessons(?:\/[1-9]\d{0,8}(?:\/thumbs)?)?)?$/;
+
+function isStaticScanPath(rel) {
+  return STATIC_SCAN_PATH.test(rel);
+}
+
+/** Every ancestor directory of a path, shortest first ("media", "media/lessons", …). */
+function ancestors(rel) {
+  const parts = rel.split("/");
+  const out = [];
+  for (let i = 1; i < parts.length; i++) out.push(parts.slice(0, i).join("/"));
+  return out;
+}
 
 /** Static web assets only. Source maps, databases, configs and source files fail. */
 const ALLOWED_EXTENSIONS = new Set([
@@ -145,6 +173,13 @@ function isAllowedShape(rel, isDirectory) {
     return isDirectory ? ALLOWED_ROOT_DIRS.has(root) : ALLOWED_ROOT_FILES.has(root);
   }
   if (!ALLOWED_ROOT_DIRS.has(root)) return false;
+
+  // Static lesson scans: files must match the published scan shape exactly, and
+  // directories may only be the ancestors of such a file.
+  if (root === "media") {
+    return isDirectory ? STATIC_SCAN_DIR.test(rel) : isStaticScanPath(rel);
+  }
+
   if (isDirectory) return true;
   return ALLOWED_EXTENSIONS.has(path.posix.extname(rel).toLowerCase());
 }

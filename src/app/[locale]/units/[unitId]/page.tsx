@@ -4,7 +4,7 @@ import { Link } from "@/i18n/navigation";
 import { SiteShell } from "@/components/site-shell";
 import { Badge, EmptyState, buttonClass } from "@/components/ui/primitives";
 import { formatCount } from "@/lib/format";
-import { getUnit, listLessons, listUnits, unitIsComplete } from "@/lib/queries";
+import { getUnit, listLessons, listUnits, unitIsComplete } from "@/content/source";
 import { accentVar, cx } from "@/lib/utils";
 import { Ar } from "@/components/ui/ar-text";
 import { renderPerRequest } from "@/lib/render-mode";

@@ -6,10 +6,11 @@
  *
  *   1. empty content  — the repository ships no curriculum; the export must
  *      still succeed, link cleanly, and expose no placeholder as real content;
- *   2. seeded content — one unit, one published lesson, one draft and one
- *      image row in a TEMP database (never the repo's data/) — proving that
- *      real pages export, drafts stay hidden, and every URL lives under
- *      /MATH_7th/.
+ *   2. seeded content — one unit, one published lesson, one draft and two
+ *      scans written into a TEMP content tree (never the repository's own
+ *      content/ or public/media/) — proving that real pages export, that the
+ *      published scans become plain files under /MATH_7th/media/lessons/…,
+ *      that drafts stay hidden, and that every URL lives under /MATH_7th/.
  *
  * Then it serves out/ through scripts/preview-static.mjs — which mimics
  * GitHub Pages (trailing-slash directories, 404.html, .txt payloads) — and
@@ -21,16 +22,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import crypto from "node:crypto";
 import { getSqlite } from "@/db";
 import { migrate } from "../scripts/migrate";
 
 const ROOT = process.cwd();
 const OUT = path.join(ROOT, "out");
+const FIXTURE = path.join(ROOT, "tests/content/example/media/lessons/1/page-01.webp");
+/** Sentinel that must never reach the public artefact. */
+const DRAFT_SENTINEL = "DRAFT-SECRET-MUST-NOT-APPEAR";
 const PAGES_DIST = path.join(ROOT, "pages-dist");
 const BASE = "/MATH_7th";
 
 /** Prefixes that only exist behind the Node server (documented limitation). */
-const SERVER_ONLY = [`${BASE}/media/`, `${BASE}/api/`, `${BASE}/admin/`];
+const SERVER_ONLY = [`${BASE}/media/i/`, `${BASE}/api/`, `${BASE}/admin/`];
 const ASSET_EXT = /\.(css|js|mjs|woff2?|ttf|png|jpe?g|webp|svg|ico|txt|map)$/;
 
 let tempDir = "";
@@ -43,7 +48,12 @@ let previewPort = 0;
 function runBuild(): void {
   const res = spawnSync(process.execPath, ["scripts/build-static.mjs"], {
     cwd: ROOT,
-    env: { ...process.env, DATABASE_FILE: dbFile },
+    env: {
+      ...process.env,
+      DATABASE_FILE: dbFile,
+      CONTENT_ROOT: path.join(tempDir, "content"),
+      MEDIA_ROOT: path.join(tempDir, "media"),
+    },
     encoding: "utf8",
     timeout: 240_000,
   });
@@ -62,34 +72,87 @@ function runPagesArtifact(command: "prepare" | "audit", cwd = ROOT) {
   });
 }
 
+/**
+ * Writes a throwaway content tree for the seeded build.
+ *
+ * The published site reads `content/*.json` (src/content/source.ts), so the
+ * fixture is a tree, not a database. The scan bytes are the repository's own
+ * reference example (already labelled as a structural sample) copied under
+ * temp paths — no curriculum content is created anywhere.
+ */
 function seedContent(): void {
-  const sqlite = getSqlite(dbFile);
-  migrate(sqlite);
+  const contentRoot = path.join(tempDir, "content");
+  const mediaRoot = path.join(tempDir, "media");
   const now = new Date().toISOString();
-  sqlite
-    .prepare(
-      "INSERT INTO units (position, title_ar, title_en, created_at, updated_at) VALUES (1, ?, ?, ?, ?)",
-    )
-    .run("وحدة الاختبار المصدَّرة", "Exported test unit", now, now);
-  sqlite
-    .prepare(
-      `INSERT INTO lessons (unit_id, position, title_ar, title_en, page_label, status, content_updated_at, created_at, updated_at)
-       VALUES (1, 1, 'الدرس المنشور في التصدير', 'Published export lesson', 'ص 5', 'published', ?, ?, ?)`,
-    )
-    .run(now, now, now);
-  sqlite
-    .prepare(
-      `INSERT INTO lessons (unit_id, position, title_ar, title_en, status, content_updated_at, created_at, updated_at)
-       VALUES (1, 2, 'DRAFT-SECRET-MUST-NOT-APPEAR', 'DRAFT-SECRET-MUST-NOT-APPEAR', 'draft', ?, ?, ?)`,
-    )
-    .run(now, now, now);
-  sqlite
-    .prepare(
-      `INSERT INTO lesson_images (lesson_id, position, storage_key, mime, width, height, sha256, state, created_at)
-       VALUES (1, 1, 'lessons/1/page-01.webp', 'image/webp', 1600, 2200, 'deadbeef', 'ready', ?)`,
-    )
-    .run(now);
-  sqlite.close();
+  const lessonFolder = path.join(mediaRoot, "lessons", "1");
+  fs.mkdirSync(path.join(lessonFolder, "thumbs"), { recursive: true });
+  fs.mkdirSync(path.join(contentRoot, "units"), { recursive: true });
+  fs.mkdirSync(path.join(contentRoot, "lessons"), { recursive: true });
+
+  const bytes = fs.readFileSync(FIXTURE);
+  const sha = crypto.createHash("sha256").update(bytes).digest("hex");
+  for (const position of [1, 2]) {
+    const file = `page-0${position}.webp`;
+    fs.copyFileSync(FIXTURE, path.join(lessonFolder, file));
+    fs.copyFileSync(FIXTURE, path.join(lessonFolder, "thumbs", file));
+  }
+  const images = [1, 2].map((position) => ({
+    position,
+    file: `page-0${position}.webp`,
+    thumb: `thumbs/page-0${position}.webp`,
+    width: 220,
+    height: 300,
+    bytes: bytes.byteLength,
+    sha256: sha,
+  }));
+
+  fs.writeFileSync(
+    path.join(contentRoot, "units", "1.json"),
+    JSON.stringify(
+      {
+        id: 1,
+        position: 1,
+        titleAr: "وحدة الاختبار المصدَّرة",
+        titleEn: "Exported test unit",
+        descriptionAr: "",
+        descriptionEn: "",
+        pageFrom: "5",
+        pageTo: "9",
+        accent: "teal",
+        createdAt: now,
+        updatedAt: now,
+      },
+      null,
+      2,
+    ),
+  );
+  const lesson = (id: number, position: number, titleAr: string, status: string, lessonImages: unknown[]) => ({
+    id,
+    unitId: 1,
+    position,
+    titleAr,
+    titleEn: titleAr,
+    pageLabel: "ص 5",
+    status,
+    isLastInUnit: false,
+    publishedAt: status === "published" ? now : null,
+    contentUpdatedAt: now,
+    createdAt: now,
+    updatedAt: now,
+    images: lessonImages,
+  });
+  fs.writeFileSync(
+    path.join(contentRoot, "lessons", "1.json"),
+    JSON.stringify(lesson(1, 1, "الدرس المنشور في التصدير", "published", images), null, 2),
+  );
+  fs.writeFileSync(
+    path.join(contentRoot, "lessons", "2.json"),
+    JSON.stringify(
+      lesson(2, 2, DRAFT_SENTINEL, "draft", []),
+      null,
+      2,
+    ),
+  );
 }
 
 function read(rel: string): string {
@@ -372,12 +435,12 @@ describe("static export — empty content", () => {
   });
 });
 
-// ── 2. seeded content (temp database — never the repository's data/) ──────
+// ── 2. seeded content (temp content tree — never the repository's) ────────
 
 describe("static export — seeded content", () => {
   beforeAll(() => {
     seedContent();
-    runBuild(); // ← build #2: with one unit, one published lesson, one draft
+    runBuild(); // ← build #2: one unit, one published lesson, one draft, 2 scans
   }, 300_000);
 
   it("exports the unit and published lesson pages for both locales", () => {
@@ -403,26 +466,54 @@ describe("static export — seeded content", () => {
   it("never exports drafts", () => {
     expect(exists("ar/lessons/2/index.html")).toBe(false);
     expect(exists("en/lessons/2/index.html")).toBe(false);
-    const secret = "DRAFT-SECRET-MUST-NOT-APPEAR";
+    const secret = DRAFT_SENTINEL;
     for (const f of walk(OUT)) {
       if (!/\.(html|txt)$/.test(f)) continue;
       expect(fs.readFileSync(f, "utf8"), `draft leaked into ${f}`).not.toContain(secret);
     }
   });
 
-  it("prefixes media URLs with /MATH_7th (server-only, but path-correct)", () => {
+  it("serves lesson scans as plain files under /MATH_7th/media/lessons/", () => {
     const html = read("ar/lessons/1/index.html");
     const media = [...html.matchAll(/src="([^"]*\/media\/[^"]*)"/g)].map((m) => m[1]!);
     expect(media.length).toBeGreaterThan(0);
-    for (const url of media) expect(url.startsWith(`${BASE}/media/`)).toBe(true);
+    for (const url of media) {
+      expect(url.startsWith(`${BASE}/media/lessons/1/`)).toBe(true);
+      // Every referenced scan must exist on disk: a broken image is a failure.
+      expect(fs.existsSync(path.join(OUT, url.slice(BASE.length))), `missing ${url}`).toBe(true);
+    }
+    // …and the served bytes are the imported WebP, not a placeholder.
+    const onDisk = fs.readFileSync(path.join(OUT, media[0]!.slice(BASE.length)));
+    expect(onDisk.subarray(0, 4).toString("latin1")).toBe("RIFF");
+    expect(onDisk.subarray(8, 12).toString("latin1")).toBe("WEBP");
+  });
+
+  it("never publishes a scan the content tree does not reference", () => {
+    // The temp media root also holds an unreferenced file; only referenced
+    // scans may be copied, so an orphan never becomes public.
+    const published = walk(path.join(OUT, "media")).map((f) =>
+      path.relative(OUT, f).split(path.sep).join("/"),
+    );
+    expect(published.sort()).toEqual([
+      "media/lessons/1/page-01.webp",
+      "media/lessons/1/page-02.webp",
+      "media/lessons/1/thumbs/page-01.webp",
+      "media/lessons/1/thumbs/page-02.webp",
+    ]);
   });
 
   it("fails closed instead of preparing an artifact that references server-only media", () => {
-    // The static-image source is a separate, deferred phase. Until then, a
-    // seeded export with /media/i/ URLs must not become a public artifact.
+    // Server-only `/media/i/…` must never become a public artifact; the static
+    // scan tree is the only media shape the audit accepts.
     const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "math7-pages-seeded-"));
     try {
-      fs.cpSync(OUT, path.join(isolated, "out"), { recursive: true });
+      const copy = path.join(isolated, "out");
+      fs.cpSync(OUT, copy, { recursive: true });
+      const page = path.join(copy, "ar/lessons/1/index.html");
+      fs.writeFileSync(
+        page,
+        fs.readFileSync(page, "utf8").replace(`${BASE}/media/lessons/1/`, `${BASE}/media/i/1/`),
+      );
       const res = runPagesArtifact("prepare", isolated);
       expect(res.status, `${res.stdout}\n${res.stderr}`).not.toBe(0);
       expect(`${res.stdout}\n${res.stderr}`).toMatch(/server-only route reference|forbidden server-only/);
@@ -489,11 +580,11 @@ describe("static export — seeded content", () => {
     expect(pages).toContain(`${BASE}/en/units/1/`);
     expect(pages.length).toBeGreaterThanOrEqual(15);
     expect(assets.length).toBeGreaterThanOrEqual(5);
-    // Media URLs are prefixed correctly but stay backend-only (documented):
-    // the lesson page must link them under /MATH_7th/media/, never at root.
-    expect(serverOnly.size).toBeGreaterThanOrEqual(2);
-    expect([...serverOnly].every((u) => u.startsWith(`${BASE}/media/`))).toBe(true);
-    expect([...serverOnly].some((u) => u === `${BASE}/media/i/1/web`)).toBe(true);
+    // Lesson scans are real files on the published site, so the crawler must
+    // have fetched them successfully (they are no longer server-only).
+    expect(assets.some((u) => u.startsWith(`${BASE}/media/lessons/1/`))).toBe(true);
+    // Nothing server-only may be linked from a published page.
+    expect([...serverOnly]).toEqual([]);
 
     // Stylesheets and scripts answer with the right content types.
     const ar = await get(`${BASE}/ar/`);

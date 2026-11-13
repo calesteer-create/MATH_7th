@@ -1,7 +1,7 @@
 import { useLocale, useTranslations } from "next-intl";
 import { Link } from "@/i18n/navigation";
 import { formatCount } from "@/lib/format";
-import type { UnitWithCount } from "@/lib/queries";
+import type { PublicUnitWithCount as UnitWithCount } from "@/content/source";
 import { accentVar } from "@/lib/utils";
 import { Ar } from "@/components/ui/ar-text";
 

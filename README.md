@@ -22,6 +22,9 @@
 | تحديد «آخر درس في الوحدة» | ✅ منفَّذ |
 | **تصدير ثابت لـ GitHub Pages** (`/MATH_7th/`) | ✅ منفَّذ ومُختبَر — [docs/STATIC_EXPORT.md](docs/STATIC_EXPORT.md) |
 | **خط نشر GitHub Pages الآمن** (من `main` فقط + تدقيق Artifact) | ✅ منفَّذ — [docs/STATIC_EXPORT.md](docs/STATIC_EXPORT.md#خط-النشر-آمن-github-pages) |
+| **المحتوى المنشور من JSON في المستودع** (`content/*.json` → Pages) | ✅ منفَّذ ومُختبَر — [docs/CONTENT_MODEL.md](docs/CONTENT_MODEL.md#8-كيف-يقرأ-المحتوى-المنشور-من-الموقع) |
+| **صور صفحات الدرس على Pages** (ملفات ثابتة، بلا مسار خادم) | ✅ منفَّذ ومُختبَر — [docs/CONTENT_MODEL.md](docs/CONTENT_MODEL.md#81-صور-صفحات-الدرس-على-github-pages) |
+| **المعيار التعليمي الملزم** (الكتاب · الشرح الموسّع · دفتر الطالب · المراجعة) | 📜 موثَّق في [docs/LESSON_STANDARD.md](docs/LESSON_STANDARD.md) |
 | **لوحة إدارة مسودات على Sveltia CMS + استيراد صور محلي** | ⚠️ منفَّذة لكن **غير معتمدة**، ولا تُنشر على Pages — [docs/ADMIN.md](docs/ADMIN.md) |
 | **توليد الاختبارات آليًا** | ⏳ المرحلة التالية |
 | **حل الاختبارات والتصحيح** | ⏳ المرحلة التالية |
@@ -143,10 +146,11 @@ src/
 │  └─ ui/ar-text.tsx            وسم المحتوى العربي بلغته داخل أي واجهة
 ├─ db/                          schema.ts + migrations/ (SQL يدوي)
 ├─ i18n/                        routing · request · messages/{ar,en}.json
-└─ lib/                         auth · format · images · storage · queries · base-path · render-mode · contact
+├─ content/                     source.ts (مصدر المحتوى) · model.ts · validate.ts
+└─ lib/                         auth · format · images · storage · queries · base-path · render-mode · scan-url · contact
 
-scripts/                        build-static · pages-artifact · preview-static · clean-stale-types · guard · migrate
-docs/                           CONTENT_MODEL.md · STATIC_EXPORT.md (التصدير والنشر الآمن) · ADMIN.md · DESIGN.md (المرحلة 1)
+scripts/                        build-static · static-media (أي صورة تُنشر) · pages-artifact · preview-static · guard · migrate
+docs/                           LESSON_STANDARD.md (المعيار التعليمي) · CONTENT_MODEL.md · STATIC_EXPORT.md · ADMIN.md · DESIGN.md
 ```
 
 ---
@@ -156,7 +160,7 @@ docs/                           CONTENT_MODEL.md · STATIC_EXPORT.md (التصد
 1. **الأرقام الغربية إلزامية.** `src/lib/format.ts` يثبّت `numberingSystem: "latn"`، والحارس `npm run guard` يمنع `Intl.NumberFormat` و`toLocaleString` خارج هذا الملف. السبب: `ar-SY` يستخدم افتراضيًا الأرقام الشرقية `١٢٣٤٥٦٧٨٩`، بينما `ar` وحدها تستخدم الغربية — فلا يُعتمد على أي افتراضي.
 2. **لا خصائص اتجاه فيزيائية.** `npm run guard` يفشل عند `ml-` أو `pr-` أو `text-left` أو `row-reverse` أو `style={{ left }}`؛ البديل `ms-/me-/ps-/pe-/start-/end-`.
 3. **المحتوى العربي يحمل لغته دائمًا.** مكوّن `<Ar>` يضع `lang="ar" dir="rtl"` على كل عنوان أو وصف من محتوى المالك، حتى داخل الواجهة الإنجليزية، فلا تنطقه قارئات الشاشة حرفًا حرفًا.
-4. **الصور خاصة.** لا وصول ثابتًا (static) إلى `data/uploads`؛ كل صورة تمرّ بفحص: المنشور عام، والمسودة للمالك وحده. مفاتيح التخزين لا تظهر في HTML.
+4. **الصور خاصة على الخادم، ثابتة على Pages.** في وضع الخادم لا وصول ثابتًا إلى `data/uploads`؛ كل صورة تمرّ بفحص (المنشور عام، والمسودة للمالك وحده). وفي التصدير الثابت تُنشر صورة الدرس المنشور فقط، باسم الملف الذي يذكره `content/lessons/<id>.json`، تحت `/MATH_7th/media/lessons/…` — ولا يُنشر ملف يتيم ولا صورة ناقصة (البناء يفشل). التفاصيل في `docs/CONTENT_MODEL.md` §8.1.
 5. **EXIF يُحذف عند الرفع**، لأن صور الهاتف تحمل إحداثيات GPS.
 
 ---
