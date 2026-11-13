@@ -2,7 +2,7 @@ import { getTranslations, setRequestLocale } from "next-intl/server";
 import { SiteShell } from "@/components/site-shell";
 import { UnitCard } from "@/components/unit-card";
 import { EmptyState, SectionHeading } from "@/components/ui/primitives";
-import { listUnits } from "@/lib/queries";
+import { listUnits } from "@/content/source";
 import { renderPerRequest } from "@/lib/render-mode";
 
 export default async function UnitsPage({ params }: { params: Promise<{ locale: string }> }) {

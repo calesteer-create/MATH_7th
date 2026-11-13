@@ -5,19 +5,25 @@
  *   npm run build:static
  *
  * Steps:
- *   1. Apply database migrations (idempotent) — the public pages read units
- *      and lessons at build time so they can be prerendered into HTML.
+ *   1. Apply database migrations (idempotent). The export no longer reads
+ *      content from the database — pages read `content/*.json` through
+ *      `src/content/source.ts` — but the normal server build that shares this
+ *      checkout still needs its schema to exist.
  *   2. `next build` with NEXT_OUTPUT=export: output "export", basePath and
  *      assetPrefix "/MATH_7th", server-only `.srv` route files excluded.
- *   3. Write out/index.html — the locale redirect that the next-intl
+ *   3. Copy the published lesson scans into out/media/… so GitHub Pages serves
+ *      them as plain files (there is no `/media/i/` route on a static host).
+ *   4. Write out/index.html — the locale redirect that the next-intl
  *      middleware performs on the server can only be a static stub here.
  *
  * The result in out/ is served at /MATH_7th/ by GitHub Pages; preview the
  * exact same layout locally with `npm run preview:static`.
  */
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { staticScanCopyPlan } from "./static-media.mjs";
 
 const root = process.cwd();
 const outDir = path.join(root, "out");
@@ -57,7 +63,56 @@ const build = spawnSync(process.execPath, [nextBin, "build"], {
 if (build.error) fail(`could not start next build: ${build.error.message}`);
 if (build.status !== 0) fail("next build failed", build.status ?? 1);
 
-// ── 3. Root redirect (static stand-in for the locale middleware) ───────────
+// ── 3. Published lesson scans as plain files ──────────────────────────────
+// On GitHub Pages there is no `/media/i/<id>/<variant>` route to authorise and
+// stream a scan, so the export serves the very same WebP files the content tree
+// already names (src/lib/scan-url.ts). Only published lessons are copied, and a
+// reference without a file fails the build: a published lesson that points at a
+// scan nobody has must never ship as a broken image.
+const contentRoot = path.resolve(process.env.CONTENT_ROOT ?? path.join(root, "content"));
+const mediaRoot = path.resolve(process.env.MEDIA_ROOT ?? path.join(root, "public", "media"));
+// `unsafe` is checked first: a symlink or a non-regular file must be refused
+// before anything is written, not discovered afterwards by the artefact audit.
+const { plan, missing, invalid, unsafe } = staticScanCopyPlan(contentRoot, mediaRoot);
+if (unsafe.length > 0) {
+  fail(
+    `refusing to publish unsafe media source(s): ${unsafe
+      .map((entry) => `lesson ${entry.lessonId} ${entry.variant} "${entry.file}" — ${entry.reason}`)
+      .join(", ")} — replace the link with a real WebP file inside public/media/lessons/`,
+  );
+}
+if (invalid.length > 0) {
+  fail(
+    `published lesson(s) reference an illegal media filename: ${invalid
+      .map((entry) => `lesson ${entry.lessonId}: "${entry.file}"`)
+      .join(", ")} — run npm run content:validate`,
+  );
+}
+if (missing.length > 0) {
+  fail(
+    `published lesson(s) reference a missing scan: ${missing
+      .map((entry) => `lesson ${entry.lessonId} ${entry.variant} ${entry.file}`)
+      .join(", ")} — fix the media tree before publishing`,
+  );
+}
+for (const entry of plan) {
+  const destination = path.join(outDir, entry.relative);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  // The bytes were read through the checked descriptor (no link was followed),
+  // so they are written as-is — never re-opened from the path — and the digest
+  // is verified again after the write. A file that changed underneath the build
+  // stops it instead of publishing something nobody reviewed.
+  fs.writeFileSync(destination, entry.bytes, { flag: "w" });
+  const written = crypto.createHash("sha256").update(fs.readFileSync(destination)).digest("hex");
+  if (written !== entry.sha256) {
+    fail(`scan ${entry.relative} changed while the build was running; refusing to publish it`);
+  }
+}
+if (plan.length > 0) {
+  console.log(`✓ copied ${plan.length} published scans into out/media/lessons/`);
+}
+
+// ── 4. Root redirect (static stand-in for the locale middleware) ───────────
 // GitHub Pages serves /MATH_7th/ from out/index.html; there is no route at
 // "/", so the export writes the same redirect the middleware issues on the
 // server: default locale first (see src/i18n/routing.ts).

@@ -5,11 +5,11 @@ import { SiteShell } from "@/components/site-shell";
 import { PageViewer, type ViewerPage } from "@/components/lesson/page-viewer";
 import { Badge, EmptyState, buttonClass } from "@/components/ui/primitives";
 import { dirFor } from "@/i18n/routing";
-import { getLessonWithUnit, listLessonImages, listPublishedLessonIds } from "@/lib/queries";
+import { getLessonWithUnit, listLessonImages, listPublishedLessonIds } from "@/content/source";
 import { accentVar } from "@/lib/utils";
 import { Ar } from "@/components/ui/ar-text";
 import { renderPerRequest } from "@/lib/render-mode";
-import { BASE_PATH } from "@/lib/base-path";
+import { scanUrl } from "@/lib/scan-url";
 
 /**
  * Static export: one page per published lesson. Drafts are excluded — they
@@ -59,12 +59,14 @@ export default async function LessonPage({
   const accent = accentVar(unit.accent);
   const dir = dirFor(locale);
 
-  // Raw <img> URLs bypass the router, so the GitHub Pages prefix must be
-  // added explicitly (BASE_PATH is "" on the server, "/MATH_7th" on export).
+  // Raw <img> URLs bypass the router, so the prefix is added explicitly by
+  // scanUrl(): server build → /media/i/<id>/<variant> (authorised route),
+  // static export → /MATH_7th/media/lessons/<lessonId>/<file> (plain file,
+  // because GitHub Pages has no server route). See src/lib/scan-url.ts.
   const pages: ViewerPage[] = images.map((img) => ({
     id: img.id,
-    thumbSrc: `${BASE_PATH}/media/i/${img.id}/thumb`,
-    src: `${BASE_PATH}/media/i/${img.id}/web`,
+    thumbSrc: scanUrl({ legacyImageId: img.id, file: img.file, lessonId: lesson.id, variant: "thumb" }),
+    src: scanUrl({ legacyImageId: img.id, file: img.file, lessonId: lesson.id, variant: "web" }),
     width: img.width ?? 1600,
     height: img.height ?? 2200,
   }));

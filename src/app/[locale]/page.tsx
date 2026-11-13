@@ -4,7 +4,7 @@ import { SiteShell } from "@/components/site-shell";
 import { UnitCard } from "@/components/unit-card";
 import { EmptyState, buttonClass } from "@/components/ui/primitives";
 import { formatCount } from "@/lib/format";
-import { listUnits, overviewStats } from "@/lib/queries";
+import { listUnits, overviewStats } from "@/content/source";
 import { renderPerRequest } from "@/lib/render-mode";
 
 export default async function HomePage({ params }: { params: Promise<{ locale: string }> }) {

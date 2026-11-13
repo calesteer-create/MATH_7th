@@ -328,6 +328,68 @@ describe("pages-artifact audit fails closed", () => {
   }
 });
 
+describe("static lesson scans", () => {
+  /** A 12-byte WebP magic header — enough for the shape check, not a real image. */
+  const webp = Buffer.from("RIFF\u0004\u0000\u0000\u0000WEBP", "latin1");
+
+  it("allows the published scan tree that GitHub Pages can actually serve", () => {
+    const root = tempRoot();
+    validOut(root);
+    write(root, "out/media/lessons/3/page-01.webp", webp);
+    write(root, "out/media/lessons/3/thumbs/page-01.webp", webp);
+    const res = run(root, "prepare");
+    expect(res.status, `${res.stdout}\n${res.stderr}`).toBe(0);
+    expect(fs.existsSync(path.join(root, "pages-dist/media/lessons/3/page-01.webp"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "pages-dist/media/lessons/3/thumbs/page-01.webp"))).toBe(
+      true,
+    );
+  });
+
+  const rejected: Array<[string, string]> = [
+    ["media/lessons/3/page-01.jpg", "non-WebP scan"],
+    ["media/lessons/3/Page-01.webp", "uppercase scan name"],
+    ["media/lessons/0/page-01.webp", "lesson id 0"],
+    ["media/lessons/3/extra/page-01.webp", "filename nested below the lesson folder"],
+    ["media/lessons/3/thumbs/extra/page-01.webp", "filename nested below thumbs"],
+    ["media/lessons/3/notes.txt", "non-scan file under lessons"],
+    ["media/lessons/../escape.webp", "path traversal"],
+    ["media/i/1/web", "the server-only media route"],
+    ["media/i/1/thumb", "the server-only thumb route"],
+    ["media/units/3/page-01.webp", "unknown media namespace"],
+    ["media/lessons-drafts/3/page-01.webp", "unknown media namespace"],
+  ];
+
+  for (const [rel, label] of rejected) {
+    it(`rejects ${label} (${rel})`, () => {
+      const root = tempRoot();
+      validOut(root);
+      expect(run(root, "prepare").status).toBe(0);
+      // Written straight into the prepared artifact: the audit is the last gate.
+      write(root, `pages-dist/${rel}`, webp);
+      expectFailure(root, "audit", /disallowed artifact entry/);
+    });
+  }
+
+  it("rejects a scan-shaped directory with no files (typo'd tree)", () => {
+    const root = tempRoot();
+    validOut(root);
+    expect(run(root, "prepare").status).toBe(0);
+    fs.mkdirSync(path.join(root, "pages-dist/media/lessons/3/thumbs/deeper"), { recursive: true });
+    expectFailure(root, "audit", /disallowed artifact entry/);
+  });
+
+  it("rejects a static scan referenced through the server-only route", () => {
+    const root = tempRoot();
+    validOut(root);
+    write(
+      root,
+      "out/ar/lessons/3/index.html",
+      `<!doctype html><html lang="ar" dir="rtl"><img src="${BASE}/media/i/1/web"></html>`,
+    );
+    expectFailure(root, "prepare", /forbidden content \(server-only route reference\)/);
+  });
+});
+
 describe("prepared artifact over a Pages-like HTTP server", () => {
   it("serves the public site and answers 404 for admin, api and server media", async () => {
     const root = tempRoot();
