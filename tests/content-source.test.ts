@@ -185,9 +185,10 @@ describe("static scan copy plan", () => {
   });
 
   it("plans exactly the referenced web and thumb files", () => {
-    const { plan, missing, invalid } = staticScanCopyPlan(contentRoot, mediaRoot);
+    const { plan, missing, invalid, unsafe } = staticScanCopyPlan(contentRoot, mediaRoot);
     expect(missing).toEqual([]);
     expect(invalid).toEqual([]);
+    expect(unsafe).toEqual([]);
     expect(plan.map((entry: { relative: string }) => entry.relative).sort()).toEqual([
       "media/lessons/1/page-01.webp",
       "media/lessons/1/page-02.webp",
@@ -230,7 +231,7 @@ describe("static scan copy plan", () => {
   it("returns an empty plan for a repository with no content tree", () => {
     const empty = fs.mkdtempSync(path.join(os.tmpdir(), "math7-empty-"));
     try {
-      expect(staticScanCopyPlan(empty, empty)).toEqual({ plan: [], missing: [], invalid: [] });
+      expect(staticScanCopyPlan(empty, empty)).toEqual({ plan: [], missing: [], invalid: [], unsafe: [] });
     } finally {
       fs.rmSync(empty, { recursive: true, force: true });
     }

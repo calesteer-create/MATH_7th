@@ -20,6 +20,7 @@
  * exact same layout locally with `npm run preview:static`.
  */
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { staticScanCopyPlan } from "./static-media.mjs";
@@ -70,7 +71,16 @@ if (build.status !== 0) fail("next build failed", build.status ?? 1);
 // scan nobody has must never ship as a broken image.
 const contentRoot = path.resolve(process.env.CONTENT_ROOT ?? path.join(root, "content"));
 const mediaRoot = path.resolve(process.env.MEDIA_ROOT ?? path.join(root, "public", "media"));
-const { plan, missing, invalid } = staticScanCopyPlan(contentRoot, mediaRoot);
+// `unsafe` is checked first: a symlink or a non-regular file must be refused
+// before anything is written, not discovered afterwards by the artefact audit.
+const { plan, missing, invalid, unsafe } = staticScanCopyPlan(contentRoot, mediaRoot);
+if (unsafe.length > 0) {
+  fail(
+    `refusing to publish unsafe media source(s): ${unsafe
+      .map((entry) => `lesson ${entry.lessonId} ${entry.variant} "${entry.file}" — ${entry.reason}`)
+      .join(", ")} — replace the link with a real WebP file inside public/media/lessons/`,
+  );
+}
 if (invalid.length > 0) {
   fail(
     `published lesson(s) reference an illegal media filename: ${invalid
@@ -88,7 +98,15 @@ if (missing.length > 0) {
 for (const entry of plan) {
   const destination = path.join(outDir, entry.relative);
   fs.mkdirSync(path.dirname(destination), { recursive: true });
-  fs.copyFileSync(entry.source, destination);
+  // The bytes were read through the checked descriptor (no link was followed),
+  // so they are written as-is — never re-opened from the path — and the digest
+  // is verified again after the write. A file that changed underneath the build
+  // stops it instead of publishing something nobody reviewed.
+  fs.writeFileSync(destination, entry.bytes, { flag: "w" });
+  const written = crypto.createHash("sha256").update(fs.readFileSync(destination)).digest("hex");
+  if (written !== entry.sha256) {
+    fail(`scan ${entry.relative} changed while the build was running; refusing to publish it`);
+  }
 }
 if (plan.length > 0) {
   console.log(`✓ copied ${plan.length} published scans into out/media/lessons/`);

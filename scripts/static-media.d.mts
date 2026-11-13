@@ -11,22 +11,28 @@ export declare const MEDIA_FILE_RE: RegExp;
 export interface ScanCopyEntry {
   lessonId: number;
   variant: "web" | "thumb";
-  /** Absolute path in public/media/lessons/<id>/… */
+  /** Absolute path in public/media/lessons/<id>/… (for messages only). */
   source: string;
-  /** Path under the artefact root: media/lessons/<id>/… */
+  /** Path under the artefact root: media/lessons/<id>… */
   relative: string;
+  /** Exactly the bytes read through the checked, link-free descriptor. */
+  bytes: Buffer;
+  /** SHA-256 of `bytes`; re-verified after the write. */
+  sha256: string;
 }
 
-export interface ScanCopyPlan {
+export interface ScanPlan {
   plan: ScanCopyEntry[];
-  /** Referenced scans with no file — a published lesson must not ship without them. */
+  /** Referenced by a published lesson but absent — the build must fail. */
   missing: Array<{ lessonId: number; variant: "web" | "thumb"; file: string; source: string }>;
-  /** Referenced filenames that fail the naming rule. */
+  /** Filename breaks the naming rule — the build must fail. */
   invalid: Array<{ lessonId: number; file: string }>;
+  /** A symlink or non-regular component, or an unreadable tree — the build must fail. */
+  unsafe: Array<{ lessonId: number; variant: "web" | "thumb"; file: string; reason: string }>;
 }
 
-/** Ids of published lessons ([] when the tree does not exist yet). */
+/** Ids of published lessons read through descriptors; [] only when the tree is absent. */
 export declare function publishedLessonIds(contentRoot: string): number[];
 
-/** Every scan file that must exist in the published artefact. */
-export declare function staticScanCopyPlan(contentRoot: string, mediaRoot: string): ScanCopyPlan;
+/** Every scan that must exist in the published artefact, already verified. */
+export declare function staticScanCopyPlan(contentRoot: string, mediaRoot: string): ScanPlan;
